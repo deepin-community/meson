@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 """Abstractions for the Intel Compiler families.
 
@@ -58,7 +59,8 @@ class IntelGnuLikeCompiler(GnuLikeCompiler):
         'custom': [],
     }  # type: T.Dict[str, T.List[str]]
 
-    OPTIM_ARGS = {
+    OPTIM_ARGS: T.Dict[str, T.List[str]] = {
+        'plain': [],
         '0': ['-O0'],
         'g': ['-O0'],
         '1': ['-O1'],
@@ -66,6 +68,7 @@ class IntelGnuLikeCompiler(GnuLikeCompiler):
         '3': ['-O3'],
         's': ['-Os'],
     }
+    id = 'intel'
 
     def __init__(self) -> None:
         super().__init__()
@@ -77,7 +80,6 @@ class IntelGnuLikeCompiler(GnuLikeCompiler):
         self.base_options = {mesonlib.OptionKey(o) for o in [
             'b_pch', 'b_lundef', 'b_asneeded', 'b_pgo', 'b_coverage',
             'b_ndebug', 'b_staticpic', 'b_pie']}
-        self.id = 'intel'
         self.lang_header = 'none'
 
     def get_pch_suffix(self) -> str:
@@ -136,7 +138,8 @@ class IntelVisualStudioLikeCompiler(VisualStudioLikeCompiler):
         'custom': [],
     }  # type: T.Dict[str, T.List[str]]
 
-    OPTIM_ARGS = {
+    OPTIM_ARGS: T.Dict[str, T.List[str]] = {
+        'plain': [],
         '0': ['/Od'],
         'g': ['/Od'],
         '1': ['/O1'],
@@ -145,9 +148,7 @@ class IntelVisualStudioLikeCompiler(VisualStudioLikeCompiler):
         's': ['/Os'],
     }
 
-    def __init__(self, target: str) -> None:
-        super().__init__(target)
-        self.id = 'intel-cl'
+    id = 'intel-cl'
 
     def get_compiler_check_args(self, mode: CompileCheckMode) -> T.List[str]:
         args = super().get_compiler_check_args(mode)

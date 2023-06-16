@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 from functools import lru_cache
 import collections
@@ -20,16 +21,12 @@ import os
 import re
 import typing as T
 
-from . import mesonlib
-
 if T.TYPE_CHECKING:
     from .linkers import StaticLinker
     from .compilers import Compiler
 
-UNIXY_COMPILER_INTERNAL_LIBS = ['m', 'c', 'pthread', 'dl', 'rt']  # type: T.List[str]
-# execinfo is a compiler lib on FreeBSD and NetBSD
-if mesonlib.is_freebsd() or mesonlib.is_netbsd():
-    UNIXY_COMPILER_INTERNAL_LIBS.append('execinfo')
+# execinfo is a compiler lib on BSD
+UNIXY_COMPILER_INTERNAL_LIBS = ['m', 'c', 'pthread', 'dl', 'rt', 'execinfo']  # type: T.List[str]
 
 
 class Dedup(enum.Enum):
@@ -53,7 +50,7 @@ class Dedup(enum.Enum):
     OVERRIDDEN = 2
 
 
-class CompilerArgs(collections.abc.MutableSequence):
+class CompilerArgs(T.MutableSequence[str]):
     '''
     List-like class that manages a list of compiler arguments. Should be used
     while constructing compiler arguments from various sources. Can be
@@ -119,7 +116,7 @@ class CompilerArgs(collections.abc.MutableSequence):
     # This correctly deduplicates the entries after _can_dedup definition
     # Note: This function is designed to work without delete operations, as deletions are worsening the performance a lot.
     def flush_pre_post(self) -> None:
-        new = list()                      # type: T.List[str]
+        new = []                          # type: T.List[str]
         pre_flush_set = set()             # type: T.Set[str]
         post_flush = collections.deque()  # type: T.Deque[str]
         post_flush_set = set()            # type: T.Set[str]
@@ -201,13 +198,13 @@ class CompilerArgs(collections.abc.MutableSequence):
         """Returns whether the argument can be safely de-duped.
 
         In addition to these, we handle library arguments specially.
-        With GNU ld, we surround library arguments with -Wl,--start/end-gr -> Dedupoup
+        With GNU ld, we surround library arguments with -Wl,--start/end-group
         to recursively search for symbols in the libraries. This is not needed
         with other linkers.
         """
 
         # A standalone argument must never be deduplicated because it is
-        # defined by what comes _after_ it. Thus dedupping this:
+        # defined by what comes _after_ it. Thus deduping this:
         # -D FOO -D BAR
         # would yield either
         # -D FOO BAR
@@ -324,10 +321,10 @@ class CompilerArgs(collections.abc.MutableSequence):
         return NotImplemented
 
     def append(self, arg: str) -> None:
-        self.__iadd__([arg])
+        self += [arg]
 
     def extend(self, args: T.Iterable[str]) -> None:
-        self.__iadd__(args)
+        self += args
 
     def __repr__(self) -> str:
         self.flush_pre_post()

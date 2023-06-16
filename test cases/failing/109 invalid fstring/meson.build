@@ -1,4 +1,3 @@
-project('invalid-fstring', 'c')
+project('invalid-fstring')
 
-dict = {'key': true}
-s = f'invalid fstring: @dict@'
+z = f'invalid fstring: @foo@'

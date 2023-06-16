@@ -1,7 +1,7 @@
 # SPDX-license-identifer: Apache-2.0
-# Copyright © 2021 Intel Corporation
+# Copyright © 2021-2022 Intel Corporation
 
-project('rustmod bindgen', ['c', 'rust'])
+project('rustmod bindgen', ['c', 'rust'], meson_version : '>= 0.63')
 
 prog_bindgen = find_program('bindgen', required : false)
 if not prog_bindgen.found()
@@ -12,7 +12,7 @@ endif
 # valid. We must try to process a header file for this to work.
 #
 # See https://github.com/rust-lang/rust-bindgen/issues/1797
-result = run_command(prog_bindgen, 'include/other.h')
+result = run_command(prog_bindgen, 'include/other.h', check: false)
 if result.returncode() != 0
   error('MESON_SKIP_TEST bindgen does not seem to work')
 endif
@@ -27,7 +27,7 @@ rust = import('unstable-rust')
 gen = rust.bindgen(
   input : 'src/header.h',
   output : 'header.rs',
-  include_directories : inc,
+  include_directories : 'include',
 )
 
 # see: https://github.com/mesonbuild/meson/issues/8160
@@ -80,3 +80,4 @@ rust_bin2 = executable(
 test('generated header', rust_bin2)
 
 subdir('sub')
+subdir('dependencies')

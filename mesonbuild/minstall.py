@@ -11,24 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 from glob import glob
-from pathlib import Path
 import argparse
 import errno
 import os
-import pickle
+import selectors
 import shlex
 import shutil
 import subprocess
 import sys
 import typing as T
 
-from . import environment
-from .backend.backends import InstallData, InstallDataBase, InstallEmptyDir, TargetInstallData, ExecutableSerialisation
-from .coredata import major_versions_differ, MesonVersionMismatchException
-from .coredata import version as coredata_version
-from .mesonlib import Popen_safe, RealPathAction, is_windows
+from . import build, coredata, environment
+from .backend.backends import InstallData
+from .mesonlib import (MesonException, Popen_safe, RealPathAction, is_windows,
+                       setup_vsenv, pickle_load, is_osx, OptionKey)
 from .scripts import depfixer, destdir_join
 from .scripts.meson_exe import run_exe
 try:
@@ -39,7 +38,11 @@ except ImportError:
     main_file = None
 
 if T.TYPE_CHECKING:
-    from .mesonlib import FileMode
+    from .backend.backends import (
+            ExecutableSerialisation, InstallDataBase, InstallEmptyDir,
+            InstallSymlinkData, TargetInstallData
+    )
+    from .mesonlib import FileMode, EnvironOrDict
 
     try:
         from typing import Protocol
@@ -57,6 +60,7 @@ if T.TYPE_CHECKING:
         dry_run: bool
         skip_subprojects: str
         tags: str
+        strip: bool
 
 
 symlink_warning = '''Warning: trying to copy a symlink that points to a file. This will copy the file,
@@ -84,6 +88,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help='Do not install files from given subprojects. (Since 0.58.0)')
     parser.add_argument('--tags', default=None,
                         help='Install only targets having one of the given tags. (Since 0.60.0)')
+    parser.add_argument('--strip', action='store_true',
+                        help='Strip targets even if strip option was not set during configure. (Since 0.62.0)')
 
 class DirMaker:
     def __init__(self, lf: T.TextIO, makedirs: T.Callable[..., None]):
@@ -122,6 +128,9 @@ class DirMaker:
         for d in self.dirs:
             append_to_log(self.lf, d)
 
+
+def load_install_data(fname: str) -> InstallData:
+    return pickle_load(fname, 'InstallData', InstallData)
 
 def is_executable(path: str, follow_symlinks: bool = False) -> bool:
     '''Checks whether any of the "x" bits are set in the source file mode.'''
@@ -198,10 +207,10 @@ def set_mode(path: str, mode: T.Optional['FileMode'], default_umask: T.Union[str
         except PermissionError as e:
             print(f'{path!r}: Unable to set owner {mode.owner!r} and group {mode.group!r}: {e.strerror}, ignoring...')
         except LookupError:
-            print(f'{path!r}: Non-existent owner {mode.owner!r} or group {mode.group!r}: ignoring...')
+            print(f'{path!r}: Nonexistent owner {mode.owner!r} or group {mode.group!r}: ignoring...')
         except OSError as e:
             if e.errno == errno.EINVAL:
-                print(f'{path!r}: Non-existent numeric owner {mode.owner!r} or group {mode.group!r}: ignoring...')
+                print(f'{path!r}: Nonexistent numeric owner {mode.owner!r} or group {mode.group!r}: ignoring...')
             else:
                 raise
     # Must set permissions *after* setting owner/group otherwise the
@@ -211,7 +220,7 @@ def set_mode(path: str, mode: T.Optional['FileMode'], default_umask: T.Union[str
         try:
             set_chmod(path, mode.perms, follow_symlinks=False)
         except PermissionError as e:
-            print('{path!r}: Unable to set permissions {mode.perms_s!r}: {e.strerror}, ignoring...')
+            print(f'{path!r}: Unable to set permissions {mode.perms_s!r}: {e.strerror}, ignoring...')
     else:
         sanitize_permissions(path, default_umask)
 
@@ -224,7 +233,7 @@ def restore_selinux_contexts() -> None:
     '''
     try:
         subprocess.check_call(['selinuxenabled'])
-    except (FileNotFoundError, NotADirectoryError, PermissionError, subprocess.CalledProcessError):
+    except (FileNotFoundError, NotADirectoryError, OSError, PermissionError, subprocess.CalledProcessError):
         # If we don't have selinux or selinuxenabled returned 1, failure
         # is ignored quietly.
         return
@@ -242,31 +251,6 @@ def restore_selinux_contexts() -> None:
         print('Failed to restore SELinux context of installed files...',
               'Standard output:', out,
               'Standard error:', err, sep='\n')
-
-def apply_ldconfig(dm: DirMaker) -> None:
-    '''
-    Apply ldconfig to update the ld.so.cache.
-    '''
-    if not shutil.which('ldconfig'):
-        # If we don't have ldconfig, failure is ignored quietly.
-        return
-
-    # Try to update ld cache, it could fail if we don't have permission.
-    proc, out, err = Popen_safe(['ldconfig', '-v'])
-    if proc.returncode == 0:
-        return
-
-    # ldconfig failed, print the error only if we actually installed files in
-    # any of the directories it lookup for libraries. Otherwise quietly ignore
-    # the error.
-    for l in out.splitlines():
-        # Lines that start with a \t are libraries, not directories.
-        if not l or l[0].isspace():
-            continue
-        # Example: `/usr/lib/i386-linux-gnu/i686: (hwcap: 0x0002000000000000)`
-        if l[:l.find(':')] in dm.all_dirs:
-            print(f'Failed to apply ldconfig:\n{err}')
-            break
 
 def get_destdir_path(destdir: str, fullprefix: str, path: str) -> str:
     if os.path.isabs(path):
@@ -306,6 +290,7 @@ class Installer:
 
     def __init__(self, options: 'ArgumentType', lf: T.TextIO):
         self.did_install_something = False
+        self.printed_symlink_error = False
         self.options = options
         self.lf = lf
         self.preserved_file_count = 0
@@ -368,22 +353,20 @@ class Installer:
         if not self.dry_run and not destdir:
             restore_selinux_contexts()
 
-    def apply_ldconfig(self, dm: DirMaker, destdir: str) -> None:
-        if not self.dry_run and not destdir:
-            apply_ldconfig(dm)
-
     def Popen_safe(self, *args: T.Any, **kwargs: T.Any) -> T.Tuple[int, str, str]:
         if not self.dry_run:
             p, o, e = Popen_safe(*args, **kwargs)
             return p.returncode, o, e
         return 0, '', ''
 
-    def run_exe(self, *args: T.Any, **kwargs: T.Any) -> int:
-        if not self.dry_run:
-            return run_exe(*args, **kwargs)
+    def run_exe(self, exe: ExecutableSerialisation, extra_env: T.Optional[T.Dict[str, str]] = None) -> int:
+        if (not self.dry_run) or exe.dry_run:
+            return run_exe(exe, extra_env)
         return 0
 
-    def should_install(self, d: T.Union[TargetInstallData, InstallEmptyDir,  InstallDataBase, ExecutableSerialisation]) -> bool:
+    def should_install(self, d: T.Union[TargetInstallData, InstallEmptyDir,
+                                        InstallDataBase, InstallSymlinkData,
+                                        ExecutableSerialisation]) -> bool:
         if d.subproject and (d.subproject in self.skip_subprojects or '*' in self.skip_subprojects):
             return False
         if self.tags and d.tag not in self.tags:
@@ -408,13 +391,13 @@ class Installer:
                     makedirs: T.Optional[T.Tuple[T.Any, str]] = None) -> bool:
         outdir = os.path.split(to_file)[0]
         if not os.path.isfile(from_file) and not os.path.islink(from_file):
-            raise RuntimeError(f'Tried to install something that isn\'t a file: {from_file!r}')
+            raise MesonException(f'Tried to install something that isn\'t a file: {from_file!r}')
         # copyfile fails if the target file already exists, so remove it to
         # allow overwriting a previous install. If the target is not a file, we
         # want to give a readable error.
         if os.path.exists(to_file):
             if not os.path.isfile(to_file):
-                raise RuntimeError(f'Destination {to_file!r} already exists and is not a file')
+                raise MesonException(f'Destination {to_file!r} already exists and is not a file')
             if self.should_preserve_existing_file(from_file, to_file):
                 append_to_log(self.lf, f'# Preserving old file {to_file}\n')
                 self.preserved_file_count += 1
@@ -439,6 +422,31 @@ class Installer:
             self.copy2(from_file, to_file)
         selinux_updates.append(to_file)
         append_to_log(self.lf, to_file)
+        return True
+
+    def do_symlink(self, target: str, link: str, destdir: str, full_dst_dir: str, allow_missing: bool) -> bool:
+        abs_target = target
+        if not os.path.isabs(target):
+            abs_target = os.path.join(full_dst_dir, target)
+        elif not os.path.exists(abs_target) and not allow_missing:
+            abs_target = destdir_join(destdir, abs_target)
+        if not os.path.exists(abs_target) and not allow_missing:
+            raise MesonException(f'Tried to install symlink to missing file {abs_target}')
+        if os.path.exists(link):
+            if not os.path.islink(link):
+                raise MesonException(f'Destination {link!r} already exists and is not a symlink')
+            self.remove(link)
+        if not self.printed_symlink_error:
+            self.log(f'Installing symlink pointing to {target} to {link}')
+        try:
+            self.symlink(target, link, target_is_directory=os.path.isdir(abs_target))
+        except (NotImplementedError, OSError):
+            if not self.printed_symlink_error:
+                print("Symlink creation does not work on this platform. "
+                      "Skipping all symlinking.")
+                self.printed_symlink_error = True
+            return False
+        append_to_log(self.lf, link)
         return True
 
     def do_copydir(self, data: InstallData, src_dir: str, dst_dir: str,
@@ -472,6 +480,8 @@ class Installer:
             raise ValueError(f'dst_dir must be absolute, got {dst_dir}')
         if exclude is not None:
             exclude_files, exclude_dirs = exclude
+            exclude_files = {os.path.normpath(x) for x in exclude_files}
+            exclude_dirs = {os.path.normpath(x) for x in exclude_dirs}
         else:
             exclude_files = exclude_dirs = set()
         for root, dirs, files in os.walk(src_dir):
@@ -509,17 +519,8 @@ class Installer:
                 self.do_copyfile(abs_src, abs_dst)
                 self.set_mode(abs_dst, install_mode, data.install_umask)
 
-    @staticmethod
-    def check_installdata(obj: InstallData) -> InstallData:
-        if not isinstance(obj, InstallData) or not hasattr(obj, 'version'):
-            raise MesonVersionMismatchException('<unknown>', coredata_version)
-        if major_versions_differ(obj.version, coredata_version):
-            raise MesonVersionMismatchException(obj.version, coredata_version)
-        return obj
-
     def do_install(self, datafilename: str) -> None:
-        with open(datafilename, 'rb') as ifile:
-            d = self.check_installdata(pickle.load(ifile))
+        d = load_install_data(datafilename)
 
         destdir = self.options.destdir
         if destdir is None:
@@ -546,8 +547,8 @@ class Installer:
                 self.install_man(d, dm, destdir, fullprefix)
                 self.install_emptydir(d, dm, destdir, fullprefix)
                 self.install_data(d, dm, destdir, fullprefix)
+                self.install_symlinks(d, dm, destdir, fullprefix)
                 self.restore_selinux_contexts(destdir)
-                self.apply_ldconfig(dm, destdir)
                 self.run_install_script(d, destdir, fullprefix)
                 if not self.did_install_something:
                     self.log('Nothing to install.')
@@ -555,13 +556,51 @@ class Installer:
                     self.log('Preserved {} unchanged files, see {} for the full list'
                              .format(self.preserved_file_count, os.path.normpath(self.lf.name)))
         except PermissionError:
-            if shutil.which('pkexec') is not None and 'PKEXEC_UID' not in os.environ and destdir == '':
-                print('Installation failed due to insufficient permissions.')
-                print('Attempting to use polkit to gain elevated privileges...')
-                os.execlp('pkexec', 'pkexec', sys.executable, main_file, *sys.argv[1:],
-                          '-C', os.getcwd())
-            else:
+            if is_windows() or destdir != '' or not os.isatty(sys.stdout.fileno()) or not os.isatty(sys.stderr.fileno()):
+                # can't elevate to root except in an interactive unix environment *and* when not doing a destdir install
                 raise
+            rootcmd = os.environ.get('MESON_ROOT_CMD') or shutil.which('sudo') or shutil.which('doas')
+            pkexec = shutil.which('pkexec')
+            if rootcmd is None and pkexec is not None and 'PKEXEC_UID' not in os.environ:
+                rootcmd = pkexec
+
+            if rootcmd is not None:
+                print('Installation failed due to insufficient permissions.')
+                s = selectors.DefaultSelector()
+                s.register(sys.stdin, selectors.EVENT_READ)
+                ans = None
+                for attempt in range(5):
+                    print(f'Attempt to use {rootcmd} to gain elevated privileges? [y/n] ', end='', flush=True)
+                    if s.select(30):
+                        # we waited on sys.stdin *only*
+                        ans = sys.stdin.readline().rstrip('\n')
+                    else:
+                        print()
+                        break
+                    if ans in {'y', 'n'}:
+                        break
+                else:
+                    if ans is not None:
+                        raise MesonException('Answer not one of [y/n]')
+                if ans == 'y':
+                    os.execlp(rootcmd, rootcmd, sys.executable, main_file, *sys.argv[1:],
+                              '-C', os.getcwd(), '--no-rebuild')
+            raise
+
+    def do_strip(self, strip_bin: T.List[str], fname: str, outname: str) -> None:
+        self.log(f'Stripping target {fname!r}.')
+        if is_osx():
+            # macOS expects dynamic objects to be stripped with -x maximum.
+            # To also strip the debug info, -S must be added.
+            # See: https://www.unix.com/man-page/osx/1/strip/
+            returncode, stdo, stde = self.Popen_safe(strip_bin + ['-S', '-x', outname])
+        else:
+            returncode, stdo, stde = self.Popen_safe(strip_bin + [outname])
+        if returncode != 0:
+            print('Could not strip file.\n')
+            print(f'Stdout:\n{stdo}\n')
+            print(f'Stderr:\n{stde}\n')
+            sys.exit(1)
 
     def install_subdirs(self, d: InstallData, dm: DirMaker, destdir: str, fullprefix: str) -> None:
         for i in d.install_subdirs:
@@ -583,6 +622,16 @@ class Installer:
             if self.do_copyfile(fullfilename, outfilename, makedirs=(dm, outdir)):
                 self.did_install_something = True
             self.set_mode(outfilename, i.install_mode, d.install_umask)
+
+    def install_symlinks(self, d: InstallData, dm: DirMaker, destdir: str, fullprefix: str) -> None:
+        for s in d.symlinks:
+            if not self.should_install(s):
+                continue
+            full_dst_dir = get_destdir_path(destdir, fullprefix, s.install_path)
+            full_link_name = get_destdir_path(destdir, fullprefix, s.name)
+            dm.makedirs(full_dst_dir, exist_ok=True)
+            if self.do_symlink(s.target, full_link_name, destdir, full_dst_dir, s.allow_missing):
+                self.did_install_something = True
 
     def install_man(self, d: InstallData, dm: DirMaker, destdir: str, fullprefix: str) -> None:
         for m in d.man:
@@ -629,6 +678,8 @@ class Installer:
                }
         if self.options.quiet:
             env['MESON_INSTALL_QUIET'] = '1'
+        if self.dry_run:
+            env['MESON_INSTALL_DRY_RUN'] = '1'
 
         for i in d.install_scripts:
             if not self.should_install(i):
@@ -659,33 +710,25 @@ class Installer:
                     self.log(f'File {t.fname!r} not found, skipping')
                     continue
                 else:
-                    raise RuntimeError(f'File {t.fname!r} could not be found')
+                    raise MesonException(f'File {t.fname!r} could not be found')
             file_copied = False # not set when a directory is copied
             fname = check_for_stampfile(t.fname)
             outdir = get_destdir_path(destdir, fullprefix, t.outdir)
             outname = os.path.join(outdir, os.path.basename(fname))
             final_path = os.path.join(d.prefix, t.outdir, os.path.basename(fname))
-            aliases = t.aliases
-            should_strip = t.strip
+            should_strip = t.strip or (t.can_strip and self.options.strip)
             install_rpath = t.install_rpath
             install_name_mappings = t.install_name_mappings
             install_mode = t.install_mode
             if not os.path.exists(fname):
-                raise RuntimeError(f'File {fname!r} could not be found')
+                raise MesonException(f'File {fname!r} could not be found')
             elif os.path.isfile(fname):
                 file_copied = self.do_copyfile(fname, outname, makedirs=(dm, outdir))
-                self.set_mode(outname, install_mode, d.install_umask)
                 if should_strip and d.strip_bin is not None:
                     if fname.endswith('.jar'):
                         self.log('Not stripping jar target: {}'.format(os.path.basename(fname)))
                         continue
-                    self.log('Stripping target {!r} using {}.'.format(fname, d.strip_bin[0]))
-                    returncode, stdo, stde = self.Popen_safe(d.strip_bin + [outname])
-                    if returncode != 0:
-                        print('Could not strip file.\n')
-                        print(f'Stdout:\n{stdo}\n')
-                        print(f'Stderr:\n{stde}\n')
-                        sys.exit(1)
+                    self.do_strip(d.strip_bin, fname, outname)
                 if fname.endswith('.js'):
                     # Emscripten outputs js files and optionally a wasm file.
                     # If one was generated, install it as well.
@@ -700,21 +743,6 @@ class Installer:
                 self.do_copydir(d, fname, outname, None, install_mode, dm)
             else:
                 raise RuntimeError(f'Unknown file type for {fname!r}')
-            printed_symlink_error = False
-            for alias, to in aliases.items():
-                try:
-                    symlinkfilename = os.path.join(outdir, alias)
-                    try:
-                        self.remove(symlinkfilename)
-                    except FileNotFoundError:
-                        pass
-                    self.symlink(to, symlinkfilename)
-                    append_to_log(self.lf, symlinkfilename)
-                except (NotImplementedError, OSError):
-                    if not printed_symlink_error:
-                        print("Symlink creation does not work on this platform. "
-                              "Skipping all symlinking.")
-                        printed_symlink_error = True
             if file_copied:
                 self.did_install_something = True
                 try:
@@ -725,10 +753,14 @@ class Installer:
                         pass
                     else:
                         raise
+                # file mode needs to be set last, after strip/depfixer editing
+                self.set_mode(outname, install_mode, d.install_umask)
 
-
-def rebuild_all(wd: str) -> bool:
-    if not (Path(wd) / 'build.ninja').is_file():
+def rebuild_all(wd: str, backend: str) -> bool:
+    if backend == 'none':
+        # nothing to build...
+        return True
+    if backend != 'ninja':
         print('Only ninja backend is supported to rebuild the project before installation.')
         return True
 
@@ -737,7 +769,53 @@ def rebuild_all(wd: str) -> bool:
         print("Can't find ninja, can't rebuild test.")
         return False
 
-    ret = subprocess.run(ninja + ['-C', wd]).returncode
+    def drop_privileges() -> T.Tuple[T.Optional[EnvironOrDict], T.Optional[T.Callable[[], None]]]:
+        if not is_windows() and os.geteuid() == 0:
+            import pwd
+            env = os.environ.copy()
+
+            if os.environ.get('SUDO_USER') is not None:
+                orig_user = env.pop('SUDO_USER')
+                orig_uid = env.pop('SUDO_UID', 0)
+                orig_gid = env.pop('SUDO_GID', 0)
+                try:
+                    homedir = pwd.getpwuid(int(orig_uid)).pw_dir
+                except KeyError:
+                    # `sudo chroot` leaves behind stale variable and builds as root without a user
+                    return None, None
+            elif os.environ.get('DOAS_USER') is not None:
+                orig_user = env.pop('DOAS_USER')
+                try:
+                    pwdata = pwd.getpwnam(orig_user)
+                except KeyError:
+                    # `doas chroot` leaves behind stale variable and builds as root without a user
+                    return None, None
+                orig_uid = pwdata.pw_uid
+                orig_gid = pwdata.pw_gid
+                homedir = pwdata.pw_dir
+            else:
+                return None, None
+
+            if os.stat(os.path.join(wd, 'build.ninja')).st_uid != int(orig_uid):
+                # the entire build process is running with sudo, we can't drop privileges
+                return None, None
+
+            env['USER'] = orig_user
+            env['HOME'] = homedir
+
+            def wrapped() -> None:
+                print(f'Dropping privileges to {orig_user!r} before running ninja...')
+                if orig_gid is not None:
+                    os.setgid(int(orig_gid))
+                if orig_uid is not None:
+                    os.setuid(int(orig_uid))
+
+            return env, wrapped
+        else:
+            return None, None
+
+    env, preexec_fn = drop_privileges()
+    ret = subprocess.run(ninja + ['-C', wd], env=env, preexec_fn=preexec_fn).returncode
     if ret != 0:
         print(f'Could not rebuild {wd}')
         return False
@@ -752,7 +830,11 @@ def run(opts: 'ArgumentType') -> int:
     if not os.path.exists(os.path.join(opts.wd, datafilename)):
         sys.exit('Install data not found. Run this command in build directory root.')
     if not opts.no_rebuild:
-        if not rebuild_all(opts.wd):
+        b = build.load(opts.wd)
+        need_vsenv = T.cast('bool', b.environment.coredata.get_option(OptionKey('vsenv')))
+        setup_vsenv(need_vsenv)
+        backend = T.cast('str', b.environment.coredata.get_option(coredata.OptionKey('backend')))
+        if not rebuild_all(opts.wd, backend):
             sys.exit(-1)
     os.chdir(opts.wd)
     with open(os.path.join(log_dir, 'install-log.txt'), 'w', encoding='utf-8') as lf:

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 from .. import mparser
 from .exceptions import InvalidCode, InvalidArguments
@@ -21,10 +22,18 @@ import textwrap
 
 import typing as T
 from abc import ABCMeta
+from contextlib import AbstractContextManager
 
 if T.TYPE_CHECKING:
+    from typing_extensions import Protocol
+
     # Object holders need the actual interpreter
     from ..interpreter import Interpreter
+
+    __T = T.TypeVar('__T', bound='TYPE_var', contravariant=True)
+
+    class OperatorCall(Protocol[__T]):
+        def __call__(self, other: __T) -> 'TYPE_var': ...
 
 TV_fw_var = T.Union[str, int, bool, list, dict, 'InterpreterObject']
 TV_fw_args = T.List[T.Union[mparser.BaseNode, TV_fw_var]]
@@ -39,15 +48,10 @@ TYPE_kwargs = T.Dict[str, TYPE_var]
 TYPE_nkwargs = T.Dict[str, TYPE_nvar]
 TYPE_key_resolver = T.Callable[[mparser.BaseNode], str]
 
-if T.TYPE_CHECKING:
-    from typing_extensions import Protocol
-    __T = T.TypeVar('__T', bound=TYPE_var, contravariant=True)
-
-    class OperatorCall(Protocol[__T]):
-        def __call__(self, other: __T) -> TYPE_var: ...
+SubProject = T.NewType('SubProject', str)
 
 class InterpreterObject:
-    def __init__(self, *, subproject: T.Optional[str] = None) -> None:
+    def __init__(self, *, subproject: T.Optional['SubProject'] = None) -> None:
         self.methods: T.Dict[
             str,
             T.Callable[[T.List[TYPE_var], TYPE_kwargs], TYPE_var]
@@ -63,7 +67,7 @@ class InterpreterObject:
         # Current node set during a method call. This can be used as location
         # when printing a warning message during a method call.
         self.current_node:  mparser.BaseNode = None
-        self.subproject: str = subproject or ''
+        self.subproject = subproject or SubProject('')
 
         # Some default operators supported by all objects
         self.operators.update({
@@ -177,3 +181,7 @@ class IterableObject(metaclass=ABCMeta):
 
     def size(self) -> int:
         raise MesonBugException(f'size not implemented for {self.__class__.__name__}')
+
+class ContextManagerObject(MesonInterpreterObject, AbstractContextManager):
+    def __init__(self, subproject: 'SubProject') -> None:
+        super().__init__(subproject=subproject)

@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 from mesonbuild.templates.sampleimpl import SampleImpl
 import re
 
@@ -21,7 +23,7 @@ hello_cuda_template = '''#include <iostream>
 
 int main(int argc, char **argv) {{
     if(argc != 1) {{
-        std::cout << argv[0] <<  "takes no arguments.\\n";
+        std::cout << argv[0] << " takes no arguments.\\n";
         return 1;
     }}
     std::cout << "This is project " << PROJECT_NAME << ".\\n";

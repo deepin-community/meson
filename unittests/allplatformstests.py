@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from mesonbuild.mesonlib.universal import windows_proof_rm
 import subprocess
 import re
 import json
@@ -42,12 +41,17 @@ from mesonbuild.mesonlib import (
     BuildDirLock, MachineChoice, is_windows, is_osx, is_cygwin, is_dragonflybsd,
     is_sunos, windows_proof_rmtree, python_command, version_compare, split_args, quote_arg,
     relpath, is_linux, git, search_version, do_conf_file, do_conf_str, default_prefix,
-    MesonException, EnvironmentException, OptionKey
+    MesonException, EnvironmentException, OptionKey, ExecutableSerialisation, EnvironmentVariables,
+    windows_proof_rm
 )
+from mesonbuild.programs import ExternalProgram
 
+from mesonbuild.compilers.mixins.clang import ClangCompiler
+from mesonbuild.compilers.mixins.gnu import GnuCompiler
+from mesonbuild.compilers.mixins.intel import IntelGnuLikeCompiler
+from mesonbuild.compilers.c import VisualStudioCCompiler, ClangClCCompiler
+from mesonbuild.compilers.cpp import VisualStudioCPPCompiler, ClangClCPPCompiler
 from mesonbuild.compilers import (
-    GnuCompiler, ClangCompiler, IntelGnuLikeCompiler, VisualStudioCCompiler,
-    VisualStudioCPPCompiler, ClangClCCompiler, ClangClCPPCompiler,
     detect_static_linker, detect_c_compiler, compiler_from_language,
     detect_compiler_for
 )
@@ -60,7 +64,7 @@ from mesonbuild.scripts import destdir_join
 from mesonbuild.wrap.wrap import PackageDefinition, WrapException
 
 from run_tests import (
-    Backend, exe_suffix, get_fake_env
+    Backend, exe_suffix, get_fake_env, get_convincing_fake_env_and_cc
 )
 
 from .baseplatformtests import BasePlatformTests
@@ -83,7 +87,7 @@ def temp_filename():
         except OSError:
             pass
 
-def _git_init(project_dir):
+def git_init(project_dir):
     # If a user has git configuration init.defaultBranch set we want to override that
     with tempfile.TemporaryDirectory() as d:
         out = git(['--version'], str(d))[1]
@@ -213,9 +217,9 @@ class AllPlatformTests(BasePlatformTests):
             elif opt['name'] == 'libdir':
                 self.assertEqual(libdir, opt['value'])
 
-    def test_libdir_must_be_inside_prefix(self):
+    def test_libdir_can_be_outside_prefix(self):
         '''
-        Tests that libdir is forced to be inside prefix no matter how it is set.
+        Tests that libdir is allowed to be outside prefix.
         Must be a unit test for obvious reasons.
         '''
         testdir = os.path.join(self.common_test_dir, '1 trivial')
@@ -226,19 +230,19 @@ class AllPlatformTests(BasePlatformTests):
             args = ['--prefix', '/opt', '--libdir', '/opt/lib32']
         self.init(testdir, extra_args=args)
         self.wipe()
-        # libdir not being inside prefix is not ok
+        # libdir not being inside prefix is ok too
         if is_windows():
             args = ['--prefix', 'x:/usr', '--libdir', 'x:/opt/lib32']
         else:
             args = ['--prefix', '/usr', '--libdir', '/opt/lib32']
-        self.assertRaises(subprocess.CalledProcessError, self.init, testdir, extra_args=args)
+        self.init(testdir, extra_args=args)
         self.wipe()
-        # libdir must be inside prefix even when set via mesonconf
+        # libdir can be outside prefix even when set via mesonconf
         self.init(testdir)
         if is_windows():
-            self.assertRaises(subprocess.CalledProcessError, self.setconf, '-Dlibdir=x:/opt', False)
+            self.setconf('-Dlibdir=x:/opt', will_build=False)
         else:
-            self.assertRaises(subprocess.CalledProcessError, self.setconf, '-Dlibdir=/opt', False)
+            self.setconf('-Dlibdir=/opt', will_build=False)
 
     def test_prefix_dependent_defaults(self):
         '''
@@ -437,14 +441,15 @@ class AllPlatformTests(BasePlatformTests):
         self.init(testdir)
         intro = self.introspect('--installed')
         expected = {
-            'sub2': 'share/sub2',
-            'subdir/sub1': 'share/sub1',
-            'subdir/sub_elided': 'share',
-            'sub1': 'share/sub1',
-            'sub/sub1': 'share/sub1',
-            'sub_elided': 'share',
             'nested_elided/sub': 'share',
             'new_directory': 'share/new_directory',
+            'sub/sub1': 'share/sub1',
+            'sub1': 'share/sub1',
+            'sub2': 'share/sub2',
+            'sub3': '/usr/share/sub3',
+            'sub_elided': 'share',
+            'subdir/sub1': 'share/sub1',
+            'subdir/sub_elided': 'share',
         }
 
         self.assertEqual(len(intro), len(expected))
@@ -570,6 +575,75 @@ class AllPlatformTests(BasePlatformTests):
         self.build()
         self._run(self.mtest_command + ['--repeat=2'])
 
+    def test_verbose(self):
+        testdir = os.path.join(self.common_test_dir, '206 tap tests')
+        self.init(testdir)
+        self.build()
+        out = self._run(self.mtest_command + ['--suite', 'verbose'])
+        self.assertIn('1/1 subtest 1', out)
+
+    def test_long_output(self):
+        testdir = os.path.join(self.common_test_dir, '254 long output')
+        self.init(testdir)
+        self.build()
+        self.run_tests()
+
+        # Ensure lines are found from testlog.txt when not being verbose.
+
+        i = 1
+        with open(os.path.join(self.logdir, 'testlog.txt'), encoding='utf-8') as f:
+            line = f.readline()
+            while line and i < 100001:
+                if f'# Iteration {i} to stdout' in line:
+                    i += 1
+                line = f.readline()
+            self.assertEqual(i, 100001)
+
+            i = 1
+            while line:
+                if f'# Iteration {i} to stderr' in line:
+                    i += 1
+                line = f.readline()
+        self.assertEqual(i, 100001)
+
+        # Ensure lines are found from both testlog.txt and console when being verbose.
+
+        out = self._run(self.mtest_command + ['-v'])
+        i = 1
+        with open(os.path.join(self.logdir, 'testlog.txt'), encoding='utf-8') as f:
+            line = f.readline()
+            while line and i < 100001:
+                if f'# Iteration {i} to stdout' in line:
+                    i += 1
+                line = f.readline()
+            self.assertEqual(i, 100001)
+
+            i = 1
+            while line:
+                if f'# Iteration {i} to stderr' in line:
+                    i += 1
+                line = f.readline()
+        self.assertEqual(i, 100001)
+
+        lines = out.split('\n')
+        line_number = 0
+        i = 1
+        while line_number < len(lines) and i < 100001:
+            print('---> %s' % lines[line_number])
+            if f'# Iteration {i} to stdout' in lines[line_number]:
+                i += 1
+            line_number += 1
+        self.assertEqual(i, 100001)
+
+        line_number = 0
+        i = 1
+        while line_number < len(lines):
+            if f'# Iteration {i} to stderr' in lines[line_number]:
+                i += 1
+            line_number += 1
+        self.assertEqual(i, 100001)
+
+
     def test_testsetups(self):
         if not shutil.which('valgrind'):
             raise SkipTest('Valgrind not installed.')
@@ -585,10 +659,10 @@ class AllPlatformTests(BasePlatformTests):
                           self._run, self.mtest_command + ['--setup=valgrind'])
         with open(os.path.join(self.logdir, 'testlog-valgrind.txt'), encoding='utf-8') as f:
             vg_log = f.read()
-        self.assertFalse('TEST_ENV is set' in basic_log)
-        self.assertFalse('Memcheck' in basic_log)
-        self.assertTrue('TEST_ENV is set' in vg_log)
-        self.assertTrue('Memcheck' in vg_log)
+        self.assertNotIn('TEST_ENV is set', basic_log)
+        self.assertNotIn('Memcheck', basic_log)
+        self.assertIn('TEST_ENV is set', vg_log)
+        self.assertIn('Memcheck', vg_log)
         # Run buggy test with setup without env that will pass
         self._run(self.mtest_command + ['--setup=wrapper'])
         # Setup with no properties works
@@ -605,12 +679,12 @@ class AllPlatformTests(BasePlatformTests):
         self._run(self.mtest_command + ['--setup=good'])
         with open(os.path.join(self.logdir, 'testlog-good.txt'), encoding='utf-8') as f:
             exclude_suites_log = f.read()
-        self.assertFalse('buggy' in exclude_suites_log)
-        # --suite overrides add_test_setup(xclude_suites)
+        self.assertNotIn('buggy', exclude_suites_log)
+        # --suite overrides add_test_setup(exclude_suites)
         self._run(self.mtest_command + ['--setup=good', '--suite', 'buggy'])
         with open(os.path.join(self.logdir, 'testlog-good.txt'), encoding='utf-8') as f:
             include_suites_log = f.read()
-        self.assertTrue('buggy' in include_suites_log)
+        self.assertIn('buggy', include_suites_log)
 
     def test_testsetup_selection(self):
         testdir = os.path.join(self.unit_test_dir, '14 testsetup selection')
@@ -638,7 +712,7 @@ class AllPlatformTests(BasePlatformTests):
                           self.mtest_command + ['--setup=main:onlyinbar'])
 
     def test_testsetup_default(self):
-        testdir = os.path.join(self.unit_test_dir, '49 testsetup default')
+        testdir = os.path.join(self.unit_test_dir, '48 testsetup default')
         self.init(testdir)
         self.build()
 
@@ -657,17 +731,17 @@ class AllPlatformTests(BasePlatformTests):
         with open(os.path.join(self.logdir, 'testlog-other.txt'), encoding='utf-8') as f:
             other_log = f.read()
 
-        self.assertTrue('ENV_A is 1' in default_log)
-        self.assertTrue('ENV_B is 2' in default_log)
-        self.assertTrue('ENV_C is 2' in default_log)
+        self.assertIn('ENV_A is 1', default_log)
+        self.assertIn('ENV_B is 2', default_log)
+        self.assertIn('ENV_C is 2', default_log)
 
-        self.assertTrue('ENV_A is 1' in mydefault_log)
-        self.assertTrue('ENV_B is 2' in mydefault_log)
-        self.assertTrue('ENV_C is 2' in mydefault_log)
+        self.assertIn('ENV_A is 1', mydefault_log)
+        self.assertIn('ENV_B is 2', mydefault_log)
+        self.assertIn('ENV_C is 2', mydefault_log)
 
-        self.assertTrue('ENV_A is 1' in other_log)
-        self.assertTrue('ENV_B is 3' in other_log)
-        self.assertTrue('ENV_C is 2' in other_log)
+        self.assertIn('ENV_A is 1', other_log)
+        self.assertIn('ENV_B is 3', other_log)
+        self.assertIn('ENV_C is 2', other_log)
 
     def assertFailedTestCount(self, failure_count, command):
         try:
@@ -724,6 +798,26 @@ class AllPlatformTests(BasePlatformTests):
 
         self.assertFailedTestCount(2, self.mtest_command + ['--no-suite', 'subprjfail:fail', '--no-suite', 'subprjmix:fail'])
 
+    def test_mtest_reconfigure(self):
+        if self.backend is not Backend.ninja:
+            raise SkipTest(f'mtest can\'t rebuild with {self.backend.name!r}')
+
+        testdir = os.path.join(self.common_test_dir, '206 tap tests')
+        self.init(testdir)
+        self.utime(os.path.join(testdir, 'meson.build'))
+        o = self._run(self.mtest_command + ['--list'])
+        self.assertIn('Regenerating build files.', o)
+        self.assertIn('test_features / xfail', o)
+        o = self._run(self.mtest_command + ['--list'])
+        self.assertNotIn('Regenerating build files.', o)
+        # no real targets should have been built
+        tester = os.path.join(self.builddir, 'tester' + exe_suffix)
+        self.assertPathDoesNotExist(tester)
+        # check that we don't reconfigure if --no-rebuild is passed
+        self.utime(os.path.join(testdir, 'meson.build'))
+        o = self._run(self.mtest_command + ['--list', '--no-rebuild'])
+        self.assertNotIn('Regenerating build files.', o)
+
     def test_build_by_default(self):
         testdir = os.path.join(self.common_test_dir, '129 build by default')
         self.init(testdir)
@@ -740,6 +834,53 @@ class AllPlatformTests(BasePlatformTests):
         self.assertPathExists(exe1)
         self.build(target=('barprog' + exe_suffix))
         self.assertPathExists(exe2)
+
+    def test_build_generated_pyx_directly(self):
+        # Check that the transpile stage also includes
+        # dependencies for the compilation stage as dependencies
+        testdir = os.path.join("test cases/cython", '2 generated sources')
+        env = get_fake_env(testdir, self.builddir, self.prefix)
+        try:
+            detect_compiler_for(env, "cython", MachineChoice.HOST)
+        except EnvironmentException:
+            raise SkipTest("Cython is not installed")
+        self.init(testdir)
+        # Need to get the full target name of the pyx.c target
+        # (which is unfortunately not provided by introspection :( )
+        # We'll need to dig into the generated sources
+        targets = self.introspect('--targets')
+        name = None
+        for target in targets:
+            for target_sources in target["target_sources"]:
+                for generated_source in target_sources["generated_sources"]:
+                    if "includestuff.pyx.c" in generated_source:
+                        name = generated_source
+                        break
+        # Split the path (we only want the includestuff.cpython-blahblah.so.p/includestuff.pyx.c)
+        name = os.path.normpath(name).split(os.sep)[-2:]
+        name = os.sep.join(name)  # Glue list into a string
+        self.build(target=name)
+
+    def test_build_pyx_depfiles(self):
+        # building regularly and then touching a depfile dependency should rebuild
+        testdir = os.path.join("test cases/cython", '2 generated sources')
+        env = get_fake_env(testdir, self.builddir, self.prefix)
+        try:
+            cython = detect_compiler_for(env, "cython", MachineChoice.HOST)
+            if not version_compare(cython.version, '>=0.29.33'):
+                raise SkipTest('Cython is too old')
+        except EnvironmentException:
+            raise SkipTest("Cython is not installed")
+        self.init(testdir)
+
+        targets = self.introspect('--targets')
+        for target in targets:
+            if target['name'].startswith('simpleinclude'):
+                name = target['name']
+        self.build()
+        self.utime(os.path.join(testdir, 'simplestuff.pxi'))
+        self.assertBuildRelinkedOnlyTarget(name)
+
 
     def test_internal_include_order(self):
         if mesonbuild.environment.detect_msys2_arch() and ('MESON_RSP_THRESHOLD' in os.environ):
@@ -919,7 +1060,7 @@ class AllPlatformTests(BasePlatformTests):
             wcc = compiler_from_language(env, lang, MachineChoice.HOST)
             wlinker = detect_static_linker(env, wcc)
             # Pop it so we don't use it for the next detection
-            evalue = os.environ.pop('AR')
+            os.environ.pop('AR')
             # Must be the same type since it's a wrapper around the same exelist
             self.assertIs(type(cc), type(wcc))
             self.assertIs(type(linker), type(wlinker))
@@ -999,7 +1140,7 @@ class AllPlatformTests(BasePlatformTests):
 
     def test_preprocessor_checks_CPPFLAGS(self):
         '''
-        Test that preprocessor compiler checks read CPPFLAGS and also CFLAGS but
+        Test that preprocessor compiler checks read CPPFLAGS and also CFLAGS/CXXFLAGS but
         not LDFLAGS.
         '''
         testdir = os.path.join(self.common_test_dir, '132 get define')
@@ -1010,11 +1151,13 @@ class AllPlatformTests(BasePlatformTests):
         # % and # confuse the MSVC preprocessor
         # !, ^, *, and < confuse lcc preprocessor
         value = 'spaces and fun@$&()-=_+{}[]:;>?,./~`'
-        for env_var in ['CPPFLAGS', 'CFLAGS']:
+        for env_var in [{'CPPFLAGS'}, {'CFLAGS', 'CXXFLAGS'}]:
             env = {}
-            env[env_var] = f'-D{define}="{value}"'
+            for i in env_var:
+                env[i] = f'-D{define}="{value}"'
             env['LDFLAGS'] = '-DMESON_FAIL_VALUE=cflags-read'
             self.init(testdir, extra_args=[f'-D{define}={value}'], override_envvars=env)
+            self.new_builddir()
 
     def test_custom_target_exe_data_deterministic(self):
         testdir = os.path.join(self.common_test_dir, '109 custom target capture')
@@ -1158,7 +1301,7 @@ class AllPlatformTests(BasePlatformTests):
             raise SkipTest('Dist is only supported with Ninja')
 
         try:
-            self.dist_impl(_git_init, _git_add_all)
+            self.dist_impl(git_init, _git_add_all)
         except PermissionError:
             # When run under Windows CI, something (virus scanner?)
             # holds on to the git files so cleaning up the dir
@@ -1213,7 +1356,7 @@ class AllPlatformTests(BasePlatformTests):
                 project_dir = os.path.join(tmpdir, 'a')
                 shutil.copytree(os.path.join(self.unit_test_dir, '35 dist script'),
                                 project_dir)
-                _git_init(project_dir)
+                git_init(project_dir)
                 self.init(project_dir)
                 self.build('dist')
 
@@ -1372,7 +1515,7 @@ class AllPlatformTests(BasePlatformTests):
                 self.assertTrue(rpath.startswith('/usr/lib/gcc'))
                 self.assertEqual(len(rpath.split(':')), 1)
             else:
-                self.assertTrue(rpath is None)
+                self.assertIsNone(rpath)
 
     def test_dash_d_dedup(self):
         testdir = os.path.join(self.unit_test_dir, '9 d dedup')
@@ -1389,12 +1532,12 @@ class AllPlatformTests(BasePlatformTests):
         test. Needs to be a unit test because it accesses Meson internals.
         '''
         testdir = os.path.join(self.common_test_dir, '150 reserved targets')
-        targets = mesonbuild.coredata.FORBIDDEN_TARGET_NAMES
+        targets = set(mesonbuild.coredata.FORBIDDEN_TARGET_NAMES)
         # We don't actually define a target with this name
-        targets.pop('build.ninja')
+        targets.remove('build.ninja')
         # Remove this to avoid multiple entries with the same name
         # but different case.
-        targets.pop('PHONY')
+        targets.remove('PHONY')
         for i in targets:
             self.assertPathExists(os.path.join(testdir, i))
 
@@ -1441,13 +1584,9 @@ class AllPlatformTests(BasePlatformTests):
     def build_static_lib(self, compiler, linker, source, objectfile, outfile, extra_args=None):
         if extra_args is None:
             extra_args = []
-        if compiler.get_argument_syntax() == 'msvc':
-            link_cmd = ['lib', '/NOLOGO', '/OUT:' + outfile, objectfile]
-        else:
-            link_cmd = ['ar', 'csr', outfile, objectfile]
         link_cmd = linker.get_exelist()
         link_cmd += linker.get_always_args()
-        link_cmd += linker.get_std_link_args(False)
+        link_cmd += linker.get_std_link_args(get_fake_env(), False)
         link_cmd += linker.get_output_args(outfile)
         link_cmd += [objectfile]
         self.pbcompile(compiler, source, objectfile, extra_args=extra_args)
@@ -1503,19 +1642,113 @@ class AllPlatformTests(BasePlatformTests):
         else:
             shlibfile = os.path.join(tdir, 'libalexandria.' + shared_suffix)
         self.build_shared_lib(cc, source, objectfile, shlibfile, impfile)
+
+        if is_windows():
+            def cleanup() -> None:
+                """Clean up all the garbage MSVC writes in the source tree."""
+
+                for fname in glob(os.path.join(tdir, 'alexandria.*')):
+                    if os.path.splitext(fname)[1] not in {'.c', '.h'}:
+                        os.unlink(fname)
+            self.addCleanup(cleanup)
+        else:
+            self.addCleanup(os.unlink, shlibfile)
+
         # Run the test
-        try:
-            self.init(tdir)
+        self.init(tdir)
+        self.build()
+        self.run_tests()
+
+    def test_prebuilt_shared_lib_rpath(self) -> None:
+        (cc, _, object_suffix, shared_suffix) = self.detect_prebuild_env()
+        tdir = os.path.join(self.unit_test_dir, '17 prebuilt shared')
+        with tempfile.TemporaryDirectory() as d:
+            source = os.path.join(tdir, 'alexandria.c')
+            objectfile = os.path.join(d, 'alexandria.' + object_suffix)
+            impfile = os.path.join(d, 'alexandria.lib')
+            if cc.get_argument_syntax() == 'msvc':
+                shlibfile = os.path.join(d, 'alexandria.' + shared_suffix)
+            elif is_cygwin():
+                shlibfile = os.path.join(d, 'cygalexandria.' + shared_suffix)
+            else:
+                shlibfile = os.path.join(d, 'libalexandria.' + shared_suffix)
+            # Ensure MSVC extra files end up in the directory that gets deleted
+            # at the end
+            with chdir(d):
+                self.build_shared_lib(cc, source, objectfile, shlibfile, impfile)
+
+            # Run the test
+            self.init(tdir, extra_args=[f'-Dsearch_dir={d}'])
             self.build()
             self.run_tests()
-        finally:
-            os.unlink(shlibfile)
-            if is_windows():
-                # Clean up all the garbage MSVC writes in the
-                # source tree.
-                for fname in glob(os.path.join(tdir, 'alexandria.*')):
-                    if os.path.splitext(fname)[1] not in ['.c', '.h']:
-                        os.unlink(fname)
+
+    def test_prebuilt_shared_lib_rpath_same_prefix(self) -> None:
+        (cc, _, object_suffix, shared_suffix) = self.detect_prebuild_env()
+        orig_tdir = os.path.join(self.unit_test_dir, '17 prebuilt shared')
+
+        # Put the shared library in a location that shares a common prefix with
+        # the source directory:
+        #
+        #   .../
+        #       foo-lib/
+        #               libalexandria.so
+        #       foo/
+        #           meson.build
+        #           ...
+        #
+        # This allows us to check that the .../foo-lib/libalexandria.so path is
+        # preserved correctly when meson processes it.
+        with tempfile.TemporaryDirectory() as d:
+            libdir = os.path.join(d, 'foo-lib')
+            os.mkdir(libdir)
+
+            source = os.path.join(orig_tdir, 'alexandria.c')
+            objectfile = os.path.join(libdir, 'alexandria.' + object_suffix)
+            impfile = os.path.join(libdir, 'alexandria.lib')
+            if cc.get_argument_syntax() == 'msvc':
+                shlibfile = os.path.join(libdir, 'alexandria.' + shared_suffix)
+            elif is_cygwin():
+                shlibfile = os.path.join(libdir, 'cygalexandria.' + shared_suffix)
+            else:
+                shlibfile = os.path.join(libdir, 'libalexandria.' + shared_suffix)
+            # Ensure MSVC extra files end up in the directory that gets deleted
+            # at the end
+            with chdir(libdir):
+                self.build_shared_lib(cc, source, objectfile, shlibfile, impfile)
+
+            tdir = os.path.join(d, 'foo')
+            shutil.copytree(orig_tdir, tdir)
+
+            # Run the test
+            self.init(tdir, extra_args=[f'-Dsearch_dir={libdir}'])
+            self.build()
+            self.run_tests()
+
+    def test_underscore_prefix_detection_list(self) -> None:
+        '''
+        Test the underscore detection hardcoded lookup list
+        against what was detected in the binary.
+        '''
+        env, cc = get_convincing_fake_env_and_cc(self.builddir, self.prefix)
+        expected_uscore = cc._symbols_have_underscore_prefix_searchbin(env)
+        list_uscore = cc._symbols_have_underscore_prefix_list(env)
+        if list_uscore is not None:
+            self.assertEqual(list_uscore, expected_uscore)
+        else:
+            raise SkipTest('No match in underscore prefix list for this platform.')
+
+    def test_underscore_prefix_detection_define(self) -> None:
+        '''
+        Test the underscore detection based on compiler-defined preprocessor macro
+        against what was detected in the binary.
+        '''
+        env, cc = get_convincing_fake_env_and_cc(self.builddir, self.prefix)
+        expected_uscore = cc._symbols_have_underscore_prefix_searchbin(env)
+        define_uscore = cc._symbols_have_underscore_prefix_define(env)
+        if define_uscore is not None:
+            self.assertEqual(define_uscore, expected_uscore)
+        else:
+            raise SkipTest('Did not find the underscore prefix define __USER_LABEL_PREFIX__')
 
     @skipIfNoPkgconfig
     def test_pkgconfig_static(self):
@@ -1570,16 +1803,49 @@ class AllPlatformTests(BasePlatformTests):
         os.environ['PKG_CONFIG_LIBDIR'] = self.privatedir
         env = get_fake_env(testdir, self.builddir, self.prefix)
         kwargs = {'required': True, 'silent': True}
-        foo_dep = PkgConfigDependency('libfoo', env, kwargs)
+        foo_dep = PkgConfigDependency('libanswer', env, kwargs)
         # Ensure link_args are properly quoted
         libdir = PurePath(prefix) / PurePath(libdir)
-        link_args = ['-L' + libdir.as_posix(), '-lfoo']
+        link_args = ['-L' + libdir.as_posix(), '-lanswer']
         self.assertEqual(foo_dep.get_link_args(), link_args)
         # Ensure include args are properly quoted
         incdir = PurePath(prefix) / PurePath('include')
         cargs = ['-I' + incdir.as_posix(), '-DLIBFOO']
         # pkg-config and pkgconf does not respect the same order
         self.assertEqual(sorted(foo_dep.get_compile_args()), sorted(cargs))
+
+    @skipIfNoPkgconfig
+    def test_pkgconfig_relocatable(self):
+        '''
+        Test that it generates relocatable pkgconfig when module
+        option pkgconfig.relocatable=true.
+        '''
+        testdir_rel = os.path.join(self.common_test_dir, '44 pkgconfig-gen')
+        self.init(testdir_rel, extra_args=['-Dpkgconfig.relocatable=true'])
+
+        def check_pcfile(name, *, relocatable, levels=2):
+            with open(os.path.join(self.privatedir, name), encoding='utf-8') as f:
+                pcfile = f.read()
+                # The pkgconfig module always uses posix path regardless of platform
+                prefix_rel = PurePath('${pcfiledir}', *(['..'] * levels)).as_posix()
+                (self.assertIn if relocatable else self.assertNotIn)(
+                    f'prefix={prefix_rel}\n',
+                    pcfile)
+
+        check_pcfile('libvartest.pc', relocatable=True)
+        check_pcfile('libvartest2.pc', relocatable=True)
+
+        self.wipe()
+        self.init(testdir_rel, extra_args=['-Dpkgconfig.relocatable=false'])
+
+        check_pcfile('libvartest.pc', relocatable=False)
+        check_pcfile('libvartest2.pc', relocatable=False)
+
+        self.wipe()
+        testdir_abs = os.path.join(self.unit_test_dir, '106 pkgconfig relocatable with absolute path')
+        self.init(testdir_abs)
+
+        check_pcfile('libsimple.pc', relocatable=True, levels=3)
 
     def test_array_option_change(self):
         def get_opt():
@@ -1687,7 +1953,7 @@ class AllPlatformTests(BasePlatformTests):
 
     def test_options_with_choices_changing(self) -> None:
         """Detect when options like arrays or combos have their choices change."""
-        testdir = Path(os.path.join(self.unit_test_dir, '84 change option choices'))
+        testdir = Path(os.path.join(self.unit_test_dir, '83 change option choices'))
         options1 = str(testdir / 'meson_options.1.txt')
         options2 = str(testdir / 'meson_options.2.txt')
 
@@ -1728,6 +1994,33 @@ class AllPlatformTests(BasePlatformTests):
                 self.assertEqual(item['value'], ['b', 'c'])
                 self.assertEqual(item['choices'], ['b', 'c', 'd'])
 
+    def test_options_listed_in_build_options(self) -> None:
+        """Detect when changed options become listed in build options."""
+        testdir = os.path.join(self.unit_test_dir, '112 list build options')
+
+        out = self.init(testdir)
+        for line in out.splitlines():
+            if line.startswith('Message: Build options:'):
+                self.assertNotIn('-Dauto_features=auto', line)
+                self.assertNotIn('-Doptional=auto', line)
+
+        self.wipe()
+        self.mac_ci_delay()
+
+        out = self.init(testdir, extra_args=['-Dauto_features=disabled', '-Doptional=enabled'])
+        for line in out.splitlines():
+            if line.startswith('Message: Build options:'):
+                self.assertIn('-Dauto_features=disabled', line)
+                self.assertIn('-Doptional=enabled', line)
+
+        self.setconf('-Doptional=disabled')
+        out = self.build()
+        for line in out.splitlines():
+            if line.startswith('Message: Build options:'):
+                self.assertIn('-Dauto_features=disabled', line)
+                self.assertNotIn('-Doptional=enabled', line)
+                self.assertIn('-Doptional=disabled', line)
+
     def test_subproject_promotion(self):
         testdir = os.path.join(self.unit_test_dir, '12 promote')
         workdir = os.path.join(self.builddir, 'work')
@@ -1754,11 +2047,12 @@ class AllPlatformTests(BasePlatformTests):
         self.assertFalse(os.path.isfile(promoted_wrap))
         subprocess.check_call(self.wrap_command + ['promote', 'athing'], cwd=workdir)
         self.assertTrue(os.path.isfile(promoted_wrap))
+        self.new_builddir()  # Ensure builddir is not parent or workdir
         self.init(workdir)
         self.build()
 
     def test_subproject_promotion_wrap(self):
-        testdir = os.path.join(self.unit_test_dir, '44 promote wrap')
+        testdir = os.path.join(self.unit_test_dir, '43 promote wrap')
         workdir = os.path.join(self.builddir, 'work')
         shutil.copytree(testdir, workdir)
         spdir = os.path.join(workdir, 'subprojects')
@@ -1779,24 +2073,26 @@ class AllPlatformTests(BasePlatformTests):
             r'sub' + os.path.sep + r'meson.build:3: WARNING: Keyword argument "link_with" defined multiple times.',
             r'meson.build:6: WARNING: a warning of some sort',
             r'sub' + os.path.sep + r'meson.build:4: WARNING: subdir warning',
-            r'meson.build:7: WARNING: Module unstable-simd has no backwards or forwards compatibility and might not exist in future releases.',
+            r'meson.build:7: WARNING: Module SIMD has no backwards or forwards compatibility and might not exist in future releases.',
             r"meson.build:11: WARNING: The variable(s) 'MISSING' in the input file 'conf.in' are not present in the given configuration data.",
         ]:
-            self.assertRegex(out, re.escape(expected))
+            with self.subTest(expected):
+                self.assertRegex(out, re.escape(expected))
 
         for wd in [
             self.src_root,
             self.builddir,
             os.getcwd(),
         ]:
-            self.new_builddir()
-            out = self.init(tdir, workdir=wd)
-            expected = os.path.join(relpath(tdir, self.src_root), 'meson.build')
-            relwd = relpath(self.src_root, wd)
-            if relwd != '.':
-                expected = os.path.join(relwd, expected)
-                expected = '\n' + expected + ':'
-            self.assertIn(expected, out)
+            with self.subTest(wd):
+                self.new_builddir()
+                out = self.init(tdir, workdir=wd)
+                expected = os.path.join(relpath(tdir, self.src_root), 'meson.build')
+                relwd = relpath(self.src_root, wd)
+                if relwd != '.':
+                    expected = os.path.join(relwd, expected)
+                    expected = '\n' + expected + ':'
+                self.assertIn(expected, out)
 
     def test_error_location_path(self):
         '''Test locations in meson errors contain correct paths'''
@@ -1805,9 +2101,9 @@ class AllPlatformTests(BasePlatformTests):
         for (t, f) in [
             ('10 out of bounds', 'meson.build'),
             ('18 wrong plusassign', 'meson.build'),
-            ('60 bad option argument', 'meson_options.txt'),
-            ('98 subdir parse error', os.path.join('subdir', 'meson.build')),
-            ('99 invalid option file', 'meson_options.txt'),
+            ('59 bad option argument', 'meson_options.txt'),
+            ('97 subdir parse error', os.path.join('subdir', 'meson.build')),
+            ('98 invalid option file', 'meson_options.txt'),
         ]:
             tdir = os.path.join(self.src_root, 'test cases', 'failing', t)
 
@@ -1857,6 +2153,12 @@ class AllPlatformTests(BasePlatformTests):
 
         for lang in langs:
             for target_type in ('executable', 'library'):
+                if is_windows() and lang == 'fortran' and target_type == 'library':
+                    # non-Gfortran Windows Fortran compilers do not do shared libraries in a Fortran standard way
+                    # see "test cases/fortran/6 dynamic"
+                    fc = detect_compiler_for(env, 'fortran', MachineChoice.HOST)
+                    if fc.get_id() in {'intel-cl', 'pgi'}:
+                        continue
                 # test empty directory
                 with tempfile.TemporaryDirectory() as tmpdir:
                     self._run(self.meson_command + ['init', '--language', lang, '--type', target_type],
@@ -1924,8 +2226,10 @@ class AllPlatformTests(BasePlatformTests):
         """
         tdir = os.path.join(self.unit_test_dir, '30 shared_mod linking')
         out = self.init(tdir)
-        msg = ('WARNING: target links against shared modules. This is not '
-               'recommended as it is not supported on some platforms')
+        msg = ('''DEPRECATION: target prog links against shared module mymod, which is incorrect.
+             This will be an error in the future, so please use shared_library() for mymod instead.
+             If shared_module() was used for mymod because it has references to undefined symbols,
+             use shared_library() with `override_options: ['b_lundef=false']` instead.''')
         self.assertIn(msg, out)
 
     def test_mixed_language_linker_check(self):
@@ -1941,6 +2245,13 @@ class AllPlatformTests(BasePlatformTests):
         # cxx.links with C source
         self.assertEqual(cmds[3][0], cc)
         self.assertEqual(cmds[4][0], cxx)
+        if self.backend is Backend.ninja:
+            # updating the file to check causes a reconfigure
+            #
+            # only the ninja backend is competent enough to detect reconfigured
+            # no-op builds without build targets
+            self.utime(os.path.join(testdir, 'test.c'))
+            self.assertReconfiguredBuildIsNoop()
 
     def test_ndebug_if_release_disabled(self):
         testdir = os.path.join(self.unit_test_dir, '28 ndebug if-release')
@@ -2089,6 +2400,9 @@ class AllPlatformTests(BasePlatformTests):
         self.setconf('--warnlevel=3')
         obj = mesonbuild.coredata.load(self.builddir)
         self.assertEqual(obj.options[OptionKey('warning_level')].value, '3')
+        self.setconf('--warnlevel=everything')
+        obj = mesonbuild.coredata.load(self.builddir)
+        self.assertEqual(obj.options[OptionKey('warning_level')].value, 'everything')
         self.wipe()
 
         # But when using -D syntax, it should be 'warning_level'
@@ -2098,6 +2412,9 @@ class AllPlatformTests(BasePlatformTests):
         self.setconf('-Dwarning_level=3')
         obj = mesonbuild.coredata.load(self.builddir)
         self.assertEqual(obj.options[OptionKey('warning_level')].value, '3')
+        self.setconf('-Dwarning_level=everything')
+        obj = mesonbuild.coredata.load(self.builddir)
+        self.assertEqual(obj.options[OptionKey('warning_level')].value, 'everything')
         self.wipe()
 
         # Mixing --option and -Doption is forbidden
@@ -2240,15 +2557,15 @@ class AllPlatformTests(BasePlatformTests):
         self.wipe()
 
     def test_feature_check_usage_subprojects(self):
-        testdir = os.path.join(self.unit_test_dir, '41 featurenew subprojects')
+        testdir = os.path.join(self.unit_test_dir, '40 featurenew subprojects')
         out = self.init(testdir)
         # Parent project warns correctly
-        self.assertRegex(out, "WARNING: Project targeting '>=0.45'.*'0.47.0': dict")
+        self.assertRegex(out, "WARNING: Project targets '>=0.45'.*'0.47.0': dict")
         # Subprojects warn correctly
-        self.assertRegex(out, r"\| WARNING: Project targeting '>=0.40'.*'0.44.0': disabler")
-        self.assertRegex(out, r"\| WARNING: Project targeting '!=0.40'.*'0.44.0': disabler")
+        self.assertRegex(out, r"foo\| .*WARNING: Project targets '>=0.40'.*'0.44.0': disabler")
+        self.assertRegex(out, r"baz\| .*WARNING: Project targets '!=0.40'.*'0.44.0': disabler")
         # Subproject has a new-enough meson_version, no warning
-        self.assertNotRegex(out, "WARNING: Project targeting.*Python")
+        self.assertNotRegex(out, "WARNING: Project targets.*Python")
         # Ensure a summary is printed in the subproject and the outer project
         self.assertRegex(out, r"\| WARNING: Project specifies a minimum meson_version '>=0.40'")
         self.assertRegex(out, r"\| \* 0.44.0: {'disabler'}")
@@ -2275,7 +2592,6 @@ class AllPlatformTests(BasePlatformTests):
             self.assertEqual(f.read().strip(), b'/* #undef FOO_BAR */')
         with open(os.path.join(self.builddir, 'nosubst-nocopy2.txt'), 'rb') as f:
             self.assertEqual(f.read().strip(), b'')
-        self.assertRegex(out, r"DEPRECATION:.*\['array'\] is invalid.*dict")
 
     def test_dirs(self):
         with tempfile.TemporaryDirectory() as containing:
@@ -2323,7 +2639,7 @@ class AllPlatformTests(BasePlatformTests):
     @skipIf(is_windows(), 'Help needed with fixing this test on windows')
     def test_native_dep_pkgconfig(self):
         testdir = os.path.join(self.unit_test_dir,
-                               '46 native dep pkgconfig var')
+                               '45 native dep pkgconfig var')
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as crossfile:
             crossfile.write(textwrap.dedent(
                 '''[binaries]
@@ -2338,7 +2654,7 @@ class AllPlatformTests(BasePlatformTests):
                 endian = 'little'
                 '''.format(os.path.join(testdir, 'cross_pkgconfig.py'))))
             crossfile.flush()
-            self.meson_cross_file = crossfile.name
+            self.meson_cross_files = [crossfile.name]
 
         env = {'PKG_CONFIG_LIBDIR':  os.path.join(testdir,
                                                   'native_pkgconfig')}
@@ -2350,7 +2666,7 @@ class AllPlatformTests(BasePlatformTests):
     @skipIf(is_windows(), 'Help needed with fixing this test on windows')
     def test_pkg_config_libdir(self):
         testdir = os.path.join(self.unit_test_dir,
-                               '46 native dep pkgconfig var')
+                               '45 native dep pkgconfig var')
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as crossfile:
             crossfile.write(textwrap.dedent(
                 '''[binaries]
@@ -2366,7 +2682,7 @@ class AllPlatformTests(BasePlatformTests):
                 endian = 'little'
                 '''.format(os.path.join(testdir, 'cross_pkgconfig'))))
             crossfile.flush()
-            self.meson_cross_file = crossfile.name
+            self.meson_cross_files = [crossfile.name]
 
         env = {'PKG_CONFIG_LIBDIR':  os.path.join(testdir,
                                                   'native_pkgconfig')}
@@ -2384,7 +2700,7 @@ class AllPlatformTests(BasePlatformTests):
             pickle.dump(obj, f)
 
     def test_reconfigure(self):
-        testdir = os.path.join(self.unit_test_dir, '48 reconfigure')
+        testdir = os.path.join(self.unit_test_dir, '47 reconfigure')
         self.init(testdir, extra_args=['-Dopt1=val1', '-Dsub1:werror=true'])
         self.setconf('-Dopt2=val2')
 
@@ -2535,12 +2851,12 @@ class AllPlatformTests(BasePlatformTests):
     def test_clang_format(self):
         if self.backend is not Backend.ninja:
             raise SkipTest(f'Clang-format is for now only supported on Ninja, not {self.backend.name}')
-        testdir = os.path.join(self.unit_test_dir, '54 clang-format')
+        testdir = os.path.join(self.unit_test_dir, '53 clang-format')
 
         # Ensure that test project is in git even when running meson from tarball.
         srcdir = os.path.join(self.builddir, 'src')
         shutil.copytree(testdir, srcdir)
-        _git_init(srcdir)
+        git_init(srcdir)
         testdir = srcdir
         self.new_builddir()
 
@@ -2589,7 +2905,7 @@ class AllPlatformTests(BasePlatformTests):
             raise SkipTest('Clang-tidy breaks when ccache is used and "c++" not in path.')
         if is_osx():
             raise SkipTest('Apple ships a broken clang-tidy that chokes on -pipe.')
-        testdir = os.path.join(self.unit_test_dir, '69 clang-tidy')
+        testdir = os.path.join(self.unit_test_dir, '68 clang-tidy')
         dummydir = os.path.join(testdir, 'dummydir.h')
         self.init(testdir, override_envvars={'CXX': 'c++'})
         out = self.run_target('clang-tidy')
@@ -2597,17 +2913,17 @@ class AllPlatformTests(BasePlatformTests):
         self.assertNotIn(dummydir, out)
 
     def test_identity_cross(self):
-        testdir = os.path.join(self.unit_test_dir, '70 cross')
+        testdir = os.path.join(self.unit_test_dir, '69 cross')
         # Do a build to generate a cross file where the host is this target
         self.init(testdir, extra_args=['-Dgenerate=true'])
-        self.meson_cross_file = os.path.join(self.builddir, "crossfile")
-        self.assertTrue(os.path.exists(self.meson_cross_file))
+        self.meson_cross_files = [os.path.join(self.builddir, "crossfile")]
+        self.assertTrue(os.path.exists(self.meson_cross_files[0]))
         # Now verify that this is detected as cross
         self.new_builddir()
         self.init(testdir)
 
     def test_introspect_buildoptions_without_configured_build(self):
-        testdir = os.path.join(self.unit_test_dir, '59 introspect buildoptions')
+        testdir = os.path.join(self.unit_test_dir, '58 introspect buildoptions')
         testfile = os.path.join(testdir, 'meson.build')
         res_nb = self.introspect_directory(testfile, ['--buildoptions'] + self.meson_args)
         self.init(testdir, default_args=False)
@@ -2617,11 +2933,11 @@ class AllPlatformTests(BasePlatformTests):
         self.assertListEqual(sorted(res_nb, key=lambda x: x['name']), sorted(res_wb, key=lambda x: x['name']))
 
     def test_meson_configure_from_source_does_not_crash(self):
-        testdir = os.path.join(self.unit_test_dir, '59 introspect buildoptions')
+        testdir = os.path.join(self.unit_test_dir, '58 introspect buildoptions')
         self._run(self.mconf_command + [testdir])
 
     def test_introspect_buildoptions_cross_only(self):
-        testdir = os.path.join(self.unit_test_dir, '83 cross only introspect')
+        testdir = os.path.join(self.unit_test_dir, '82 cross only introspect')
         testfile = os.path.join(testdir, 'meson.build')
         res = self.introspect_directory(testfile, ['--buildoptions'] + self.meson_args)
         optnames = [o['name'] for o in res]
@@ -2629,8 +2945,8 @@ class AllPlatformTests(BasePlatformTests):
         self.assertNotIn('build.c_args', optnames)
 
     def test_introspect_json_flat(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
-        out = self.init(testdir, extra_args=['-Dlayout=flat'])
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
+        self.init(testdir, extra_args=['-Dlayout=flat'])
         infodir = os.path.join(self.builddir, 'meson-info')
         self.assertPathExists(infodir)
 
@@ -2642,7 +2958,7 @@ class AllPlatformTests(BasePlatformTests):
                 assert os.path.relpath(out, self.builddir).startswith('meson-out')
 
     def test_introspect_json_dump(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
         self.init(testdir)
         infodir = os.path.join(self.builddir, 'meson-info')
         self.assertPathExists(infodir)
@@ -2844,7 +3160,7 @@ class AllPlatformTests(BasePlatformTests):
         self.assertDictEqual(targets_to_find, {})
 
     def test_introspect_file_dump_equals_all(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
         self.init(testdir)
         res_all = self.introspect('--all')
         res_file = {}
@@ -2872,7 +3188,7 @@ class AllPlatformTests(BasePlatformTests):
         self.assertEqual(res_all, res_file)
 
     def test_introspect_meson_info(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
         introfile = os.path.join(self.builddir, 'meson-info', 'meson-info.json')
         self.init(testdir)
         self.assertPathExists(introfile)
@@ -2886,7 +3202,7 @@ class AllPlatformTests(BasePlatformTests):
         self.assertEqual(res1['build_files_updated'], True)
 
     def test_introspect_config_update(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
         introfile = os.path.join(self.builddir, 'meson-info', 'intro-buildoptions.json')
         self.init(testdir)
         self.assertPathExists(introfile)
@@ -2914,7 +3230,7 @@ class AllPlatformTests(BasePlatformTests):
         self.assertListEqual(res1, res2)
 
     def test_introspect_targets_from_source(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
         testfile = os.path.join(testdir, 'meson.build')
         introfile = os.path.join(self.builddir, 'meson-info', 'intro-targets.json')
         self.init(testdir)
@@ -2946,7 +3262,7 @@ class AllPlatformTests(BasePlatformTests):
         self.assertListEqual(res_nb, res_wb)
 
     def test_introspect_ast_source(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
         testfile = os.path.join(testdir, 'meson.build')
         res_nb = self.introspect_directory(testfile, ['--ast'] + self.meson_args)
 
@@ -3024,7 +3340,7 @@ class AllPlatformTests(BasePlatformTests):
             self.assertEqual(node_counter[n], c)
 
     def test_introspect_dependencies_from_source(self):
-        testdir = os.path.join(self.unit_test_dir, '57 introspection')
+        testdir = os.path.join(self.unit_test_dir, '56 introspection')
         testfile = os.path.join(testdir, 'meson.build')
         res_nb = self.introspect_directory(testfile, ['--scan-dependencies'] + self.meson_args)
         expected = [
@@ -3075,16 +3391,16 @@ class AllPlatformTests(BasePlatformTests):
 
     @skip_if_no_cmake
     def test_cmake_prefix_path(self):
-        testdir = os.path.join(self.unit_test_dir, '63 cmake_prefix_path')
+        testdir = os.path.join(self.unit_test_dir, '62 cmake_prefix_path')
         self.init(testdir, extra_args=['-Dcmake_prefix_path=' + os.path.join(testdir, 'prefix')])
 
     @skip_if_no_cmake
     def test_cmake_parser(self):
-        testdir = os.path.join(self.unit_test_dir, '64 cmake parser')
+        testdir = os.path.join(self.unit_test_dir, '63 cmake parser')
         self.init(testdir, extra_args=['-Dcmake_prefix_path=' + os.path.join(testdir, 'prefix')])
 
     def test_alias_target(self):
-        testdir = os.path.join(self.unit_test_dir, '65 alias target')
+        testdir = os.path.join(self.unit_test_dir, '64 alias target')
         self.init(testdir)
         self.build()
         self.assertPathDoesNotExist(os.path.join(self.builddir, 'prog' + exe_suffix))
@@ -3101,8 +3417,8 @@ class AllPlatformTests(BasePlatformTests):
         self._run(self.mconf_command + [self.builddir])
 
     def test_summary(self):
-        testdir = os.path.join(self.unit_test_dir, '72 summary')
-        out = self.init(testdir, extra_args=['-Denabled_opt=enabled'])
+        testdir = os.path.join(self.unit_test_dir, '71 summary')
+        out = self.init(testdir, extra_args=['-Denabled_opt=enabled', f'-Dpython={sys.executable}'])
         expected = textwrap.dedent(r'''
             Some Subproject 2.0
 
@@ -3128,17 +3444,18 @@ class AllPlatformTests(BasePlatformTests):
                 A number       : 1
                 yes            : YES
                 no             : NO
-                coma list      : a, b, c
+                comma list     : a, b, c
 
               Stuff
                 missing prog   : NO
-                existing prog  : ''' + sys.executable + '''
+                existing prog  : ''' + ExternalProgram('python3', [sys.executable], silent=True).path + '''
                 missing dep    : NO
                 external dep   : YES 1.2.3
                 internal dep   : YES
+                disabler       : NO
 
               Plugins
-                long coma list : alpha, alphacolor, apetag, audiofx, audioparsers, auparse,
+                long comma list: alpha, alphacolor, apetag, audiofx, audioparsers, auparse,
                                  autodetect, avi
 
               Subprojects
@@ -3147,19 +3464,15 @@ class AllPlatformTests(BasePlatformTests):
                 subsub         : YES
 
               User defined options
-                backend        : ''' + self.backend.name + '''
+                backend        : ''' + self.backend_name + '''
                 libdir         : lib
                 prefix         : /usr
                 enabled_opt    : enabled
+                python         : ''' + sys.executable + '''
             ''')
         expected_lines = expected.split('\n')[1:]
         out_start = out.find(expected_lines[0])
         out_lines = out[out_start:].split('\n')[:len(expected_lines)]
-        if sys.version_info < (3, 7, 0):
-            # Dictionary order is not stable in Python <3.7, so sort the lines
-            # while comparing
-            expected_lines = sorted(expected_lines)
-            out_lines = sorted(out_lines)
         for e, o in zip(expected_lines, out_lines):
             if e.startswith('    external dep'):
                 self.assertRegex(o, r'^    external dep   : (YES [0-9.]*|NO)$')
@@ -3247,7 +3560,7 @@ class AllPlatformTests(BasePlatformTests):
             self.assertPathDoesNotExist(os.path.join(self.builddir, get_exe_name('trivialprog')))
 
     def test_spurious_reconfigure_built_dep_file(self):
-        testdir = os.path.join(self.unit_test_dir, '74 dep files')
+        testdir = os.path.join(self.unit_test_dir, '73 dep files')
 
         # Regression test: Spurious reconfigure was happening when build
         # directory is inside source directory.
@@ -3344,9 +3657,21 @@ class AllPlatformTests(BasePlatformTests):
         ## Validate commands
 
         md_commands = {k for k,v in md_command_sections.items()}
-
         help_output = self._run(self.meson_command + ['--help'])
-        help_commands = {c.strip() for c in re.findall(r'usage:(?:.+)?{((?:[a-z]+,*)+?)}', help_output, re.MULTILINE|re.DOTALL)[0].split(',')}
+        # Python's argument parser might put the command list to its own line. Or it might not.
+        self.assertTrue(help_output.startswith('usage: '))
+        lines = help_output.split('\n')
+        line1 = lines[0]
+        line2 = lines[1]
+        if '{' in line1:
+            cmndline = line1
+        else:
+            self.assertIn('{', line2)
+            cmndline = line2
+        cmndstr = cmndline.split('{')[1]
+        self.assertIn('}', cmndstr)
+        help_commands = set(cmndstr.split('}')[0].split(','))
+        self.assertTrue(len(help_commands) > 0, 'Must detect some command names.')
 
         self.assertEqual(md_commands | {'help'}, help_commands, f'Doc file: `{doc_path}`')
 
@@ -3529,10 +3854,10 @@ class AllPlatformTests(BasePlatformTests):
     def test_wrap_git(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             srcdir = os.path.join(tmpdir, 'src')
-            shutil.copytree(os.path.join(self.unit_test_dir, '81 wrap-git'), srcdir)
+            shutil.copytree(os.path.join(self.unit_test_dir, '80 wrap-git'), srcdir)
             upstream = os.path.join(srcdir, 'subprojects', 'wrap_git_upstream')
             upstream_uri = Path(upstream).as_uri()
-            _git_init(upstream)
+            git_init(upstream)
             with open(os.path.join(srcdir, 'subprojects', 'wrap_git.wrap'), 'w', encoding='utf-8') as f:
                 f.write(textwrap.dedent('''
                   [wrap-git]
@@ -3540,9 +3865,31 @@ class AllPlatformTests(BasePlatformTests):
                   patch_directory = wrap_git_builddef
                   revision = master
                 '''.format(upstream_uri)))
-            self.init(srcdir)
+            out = self.init(srcdir)
             self.build()
             self.run_tests()
+
+            # Make sure the warning does not occur on the first init.
+            out_of_date_warning = 'revision may be out of date'
+            self.assertNotIn(out_of_date_warning, out)
+
+            # Change the wrap's revisions, reconfigure, and make sure it does
+            # warn on the reconfigure.
+            with open(os.path.join(srcdir, 'subprojects', 'wrap_git.wrap'), 'w', encoding='utf-8') as f:
+                f.write(textwrap.dedent('''
+                  [wrap-git]
+                  url = {}
+                  patch_directory = wrap_git_builddef
+                  revision = not-master
+                '''.format(upstream_uri)))
+            out = self.init(srcdir, extra_args='--reconfigure')
+            self.assertIn(out_of_date_warning, out)
+
+    def test_extract_objects_custom_target_no_warning(self):
+        testdir = os.path.join(self.common_test_dir, '22 object extraction')
+
+        out = self.init(testdir)
+        self.assertNotRegex(out, "WARNING:.*can't be converted to File object")
 
     def test_multi_output_custom_target_no_warning(self):
         testdir = os.path.join(self.common_test_dir, '228 custom_target source')
@@ -3555,7 +3902,7 @@ class AllPlatformTests(BasePlatformTests):
     @skipUnless(is_linux() and (re.search('^i.86$|^x86$|^x64$|^x86_64$|^amd64$', platform.processor()) is not None),
         'Requires ASM compiler for x86 or x86_64 platform currently only available on Linux CI runners')
     def test_nostdlib(self):
-        testdir = os.path.join(self.unit_test_dir, '78 nostdlib')
+        testdir = os.path.join(self.unit_test_dir, '77 nostdlib')
         machinefile = os.path.join(self.builddir, 'machine.txt')
         with open(machinefile, 'w', encoding='utf-8') as f:
             f.write(textwrap.dedent('''
@@ -3564,19 +3911,19 @@ class AllPlatformTests(BasePlatformTests):
                 '''))
 
         # Test native C stdlib
-        self.meson_native_file = machinefile
+        self.meson_native_files = [machinefile]
         self.init(testdir)
         self.build()
 
         # Test cross C stdlib
         self.new_builddir()
-        self.meson_native_file = None
-        self.meson_cross_file = machinefile
+        self.meson_native_files = []
+        self.meson_cross_files = [machinefile]
         self.init(testdir)
         self.build()
 
     def test_meson_version_compare(self):
-        testdir = os.path.join(self.unit_test_dir, '82 meson version compare')
+        testdir = os.path.join(self.unit_test_dir, '81 meson version compare')
         out = self.init(testdir)
         self.assertNotRegex(out, r'WARNING')
 
@@ -3610,7 +3957,7 @@ class AllPlatformTests(BasePlatformTests):
                 filename = foo/real.wrap
                 '''))
         with self.assertRaisesRegex(WrapException, 'wrap-redirect filename must be in the form foo/subprojects/bar.wrap'):
-            wrap = PackageDefinition(redirect_wrap)
+            PackageDefinition(redirect_wrap)
 
         # Correct redirect
         with open(redirect_wrap, 'w', encoding='utf-8') as f:
@@ -3631,7 +3978,7 @@ class AllPlatformTests(BasePlatformTests):
         # This checks a bug where if a non-meson project is used as a third
         # level (or deeper) subproject it doesn't cause a rebuild if the build
         # files for that project are changed
-        testdir = os.path.join(self.unit_test_dir, '85 nested subproject regenerate depends')
+        testdir = os.path.join(self.unit_test_dir, '84 nested subproject regenerate depends')
         cmakefile = Path(testdir) / 'subprojects' / 'sub2' / 'CMakeLists.txt'
         self.init(testdir)
         self.build()
@@ -3649,7 +3996,7 @@ class AllPlatformTests(BasePlatformTests):
         envs = {'CPPFLAGS': '-DCPPFLAG',
                 'CFLAGS': '-DCFLAG',
                 'CXXFLAGS': '-DCXXFLAG'}
-        srcdir = os.path.join(self.unit_test_dir, '89 multiple envvars')
+        srcdir = os.path.join(self.unit_test_dir, '88 multiple envvars')
         self.init(srcdir, override_envvars=envs)
         self.build()
 
@@ -3712,7 +4059,7 @@ class AllPlatformTests(BasePlatformTests):
         self.build()
 
     def test_devenv(self):
-        testdir = os.path.join(self.unit_test_dir, '91 devenv')
+        testdir = os.path.join(self.unit_test_dir, '90 devenv')
         self.init(testdir)
         self.build()
 
@@ -3721,6 +4068,33 @@ class AllPlatformTests(BasePlatformTests):
         app = os.path.join(self.builddir, 'app')
         self._run(cmd + python_command + [script])
         self.assertEqual('This is text.', self._run(cmd + [app]).strip())
+
+        cmd = self.meson_command + ['devenv', '-C', self.builddir, '--dump']
+        o = self._run(cmd)
+        expected = os.pathsep.join(['/prefix', '$TEST_C', '/suffix'])
+        self.assertIn(f'TEST_C="{expected}"', o)
+        self.assertIn('export TEST_C', o)
+
+        cmd = self.meson_command + ['devenv', '-C', self.builddir, '--dump', '--dump-format', 'sh']
+        o = self._run(cmd)
+        expected = os.pathsep.join(['/prefix', '$TEST_C', '/suffix'])
+        self.assertIn(f'TEST_C="{expected}"', o)
+        self.assertNotIn('export', o)
+
+        cmd = self.meson_command + ['devenv', '-C', self.builddir, '--dump', '--dump-format', 'vscode']
+        o = self._run(cmd)
+        expected = os.pathsep.join(['/prefix', '/suffix'])
+        self.assertIn(f'TEST_C="{expected}"', o)
+        self.assertNotIn('export', o)
+
+        fname = os.path.join(self.builddir, 'dump.env')
+        cmd = self.meson_command + ['devenv', '-C', self.builddir, '--dump', fname]
+        o = self._run(cmd)
+        self.assertEqual(o, '')
+        o = Path(fname).read_text()
+        expected = os.pathsep.join(['/prefix', '$TEST_C', '/suffix'])
+        self.assertIn(f'TEST_C="{expected}"', o)
+        self.assertIn('export TEST_C', o)
 
     def test_clang_format_check(self):
         if self.backend is not Backend.ninja:
@@ -3793,7 +4167,7 @@ class AllPlatformTests(BasePlatformTests):
                 self.assertEqual(sorted(link_args), sorted(['-flto']))
 
     def test_install_tag(self) -> None:
-        testdir = os.path.join(self.unit_test_dir, '98 install all targets')
+        testdir = os.path.join(self.unit_test_dir, '99 install all targets')
         self.init(testdir)
         self.build()
 
@@ -3835,6 +4209,11 @@ class AllPlatformTests(BasePlatformTests):
             Path(installpath, 'usr/lib/libstatic.a'),
             Path(installpath, 'usr/lib/libboth.a'),
             Path(installpath, 'usr/lib/libboth2.a'),
+            Path(installpath, 'usr/include/ct-header1.h'),
+            Path(installpath, 'usr/include/ct-header3.h'),
+            Path(installpath, 'usr/include/subdir-devel'),
+            Path(installpath, 'usr/include/custom_files'),
+            Path(installpath, 'usr/include/custom_files/data.txt'),
         }
 
         if cc.get_id() in {'msvc', 'clang-cl'}:
@@ -3846,10 +4225,14 @@ class AllPlatformTests(BasePlatformTests):
                 Path(installpath, 'usr/bin/both2.pdb'),
                 Path(installpath, 'usr/bin/bothcustom.pdb'),
                 Path(installpath, 'usr/bin/shared.pdb'),
+                Path(installpath, 'usr/bin/versioned_shared-1.pdb'),
                 Path(installpath, 'usr/lib/both.lib'),
                 Path(installpath, 'usr/lib/both2.lib'),
                 Path(installpath, 'usr/lib/bothcustom.lib'),
                 Path(installpath, 'usr/lib/shared.lib'),
+                Path(installpath, 'usr/lib/versioned_shared.lib'),
+                Path(installpath, 'usr/otherbin'),
+                Path(installpath, 'usr/otherbin/app-otherdir.pdb'),
             }
         elif is_windows() or is_cygwin():
             expected_devel |= {
@@ -3857,16 +4240,37 @@ class AllPlatformTests(BasePlatformTests):
                 Path(installpath, 'usr/lib/libboth2.dll.a'),
                 Path(installpath, 'usr/lib/libshared.dll.a'),
                 Path(installpath, 'usr/lib/libbothcustom.dll.a'),
+                Path(installpath, 'usr/lib/libversioned_shared.dll.a'),
+            }
+        else:
+            expected_devel |= {
+                Path(installpath, 'usr/' + shared_lib_name('versioned_shared')),
             }
 
         expected_runtime = expected_common | {
             Path(installpath, 'usr/bin'),
             Path(installpath, 'usr/bin/' + exe_name('app')),
+            Path(installpath, 'usr/otherbin'),
+            Path(installpath, 'usr/otherbin/' + exe_name('app-otherdir')),
             Path(installpath, 'usr/bin/' + exe_name('app2')),
             Path(installpath, 'usr/' + shared_lib_name('shared')),
             Path(installpath, 'usr/' + shared_lib_name('both')),
             Path(installpath, 'usr/' + shared_lib_name('both2')),
         }
+
+        if is_windows() or is_cygwin():
+            expected_runtime |= {
+                Path(installpath, 'usr/' + shared_lib_name('versioned_shared-1')),
+            }
+        elif is_osx():
+            expected_runtime |= {
+                Path(installpath, 'usr/' + shared_lib_name('versioned_shared.1')),
+            }
+        else:
+            expected_runtime |= {
+                Path(installpath, 'usr/' + shared_lib_name('versioned_shared') + '.1'),
+                Path(installpath, 'usr/' + shared_lib_name('versioned_shared') + '.1.2.3'),
+            }
 
         expected_custom = expected_common | {
             Path(installpath, 'usr/share'),
@@ -3877,6 +4281,8 @@ class AllPlatformTests(BasePlatformTests):
             Path(installpath, 'usr/share/out3-custom.txt'),
             Path(installpath, 'usr/share/custom_files'),
             Path(installpath, 'usr/share/custom_files/data.txt'),
+            Path(installpath, 'usr/share/excludes'),
+            Path(installpath, 'usr/share/excludes/installed.txt'),
             Path(installpath, 'usr/lib'),
             Path(installpath, 'usr/lib/libbothcustom.a'),
             Path(installpath, 'usr/' + shared_lib_name('bothcustom')),
@@ -3914,8 +4320,22 @@ class AllPlatformTests(BasePlatformTests):
         do_install('runtime,custom', expected_runtime_custom, 1)
         do_install(None, expected_all, 2)
 
+
+    def test_install_script_dry_run(self):
+        testdir = os.path.join(self.common_test_dir, '53 install script')
+        self.init(testdir)
+        self.build()
+
+        cmd = self.meson_command + ['install', '--dry-run', '--destdir', self.installdir]
+        outputs = self._run(cmd, workdir=self.builddir)
+
+        installpath = Path(self.installdir)
+        self.assertFalse((installpath / 'usr/diiba/daaba/file.dat').exists())
+        self.assertIn("DRYRUN: Writing file file.dat", outputs)
+
+
     def test_introspect_install_plan(self):
-        testdir = os.path.join(self.unit_test_dir, '98 install all targets')
+        testdir = os.path.join(self.unit_test_dir, '99 install all targets')
         introfile = os.path.join(self.builddir, 'meson-info', 'intro-install_plan.json')
         self.init(testdir)
         self.assertPathExists(introfile)
@@ -3925,9 +4345,14 @@ class AllPlatformTests(BasePlatformTests):
         env = get_fake_env(testdir, self.builddir, self.prefix)
 
         def output_name(name, type_):
-            return type_(name=name, subdir=None, subproject=None,
-                         for_machine=MachineChoice.HOST, sources=[],
-                         objects=[], environment=env, kwargs={}).filename
+            target = type_(name=name, subdir=None, subproject=None,
+                           for_machine=MachineChoice.HOST, sources=[],
+                           structured_sources=None,
+                           objects=[], environment=env, compilers=env.coredata.compilers[MachineChoice.HOST],
+                           kwargs={})
+            target.process_compilers()
+            target.process_compilers_late([])
+            return target.filename
 
         shared_lib_name = lambda name: output_name(name, SharedLibrary)
         static_lib_name = lambda name: output_name(name, StaticLibrary)
@@ -3936,11 +4361,11 @@ class AllPlatformTests(BasePlatformTests):
         expected = {
             'targets': {
                 f'{self.builddir}/out1-notag.txt': {
-                    'destination': '{prefix}/share/out1-notag.txt',
+                    'destination': '{datadir}/out1-notag.txt',
                     'tag': None,
                 },
                 f'{self.builddir}/out2-notag.txt': {
-                    'destination': '{prefix}/share/out2-notag.txt',
+                    'destination': '{datadir}/out2-notag.txt',
                     'tag': None,
                 },
                 f'{self.builddir}/libstatic.a': {
@@ -3949,6 +4374,10 @@ class AllPlatformTests(BasePlatformTests):
                 },
                 f'{self.builddir}/' + exe_name('app'): {
                     'destination': '{bindir}/' + exe_name('app'),
+                    'tag': 'runtime',
+                },
+                f'{self.builddir}/' + exe_name('app-otherdir'): {
+                    'destination': '{prefix}/otherbin/' + exe_name('app-otherdir'),
                     'tag': 'runtime',
                 },
                 f'{self.builddir}/subdir/' + exe_name('app2'): {
@@ -3984,67 +4413,67 @@ class AllPlatformTests(BasePlatformTests):
                     'tag': 'devel',
                 },
                 f'{self.builddir}/out1-custom.txt': {
-                    'destination': '{prefix}/share/out1-custom.txt',
+                    'destination': '{datadir}/out1-custom.txt',
                     'tag': 'custom',
                 },
                 f'{self.builddir}/out2-custom.txt': {
-                    'destination': '{prefix}/share/out2-custom.txt',
+                    'destination': '{datadir}/out2-custom.txt',
                     'tag': 'custom',
                 },
                 f'{self.builddir}/out3-custom.txt': {
-                    'destination': '{prefix}/share/out3-custom.txt',
+                    'destination': '{datadir}/out3-custom.txt',
                     'tag': 'custom',
                 },
                 f'{self.builddir}/subdir/out1.txt': {
-                    'destination': '{prefix}/share/out1.txt',
+                    'destination': '{datadir}/out1.txt',
                     'tag': None,
                 },
                 f'{self.builddir}/subdir/out2.txt': {
-                    'destination': '{prefix}/share/out2.txt',
+                    'destination': '{datadir}/out2.txt',
                     'tag': None,
                 },
                 f'{self.builddir}/out-devel.h': {
-                    'destination': '{prefix}/include/out-devel.h',
+                    'destination': '{includedir}/out-devel.h',
                     'tag': 'devel',
                 },
                 f'{self.builddir}/out3-notag.txt': {
-                    'destination': '{prefix}/share/out3-notag.txt',
+                    'destination': '{datadir}/out3-notag.txt',
                     'tag': None,
                 },
             },
             'configure': {
                 f'{self.builddir}/foo-notag.h': {
-                    'destination': '{prefix}/share/foo-notag.h',
+                    'destination': '{datadir}/foo-notag.h',
                     'tag': None,
                 },
                 f'{self.builddir}/foo2-devel.h': {
-                    'destination': '{prefix}/include/foo2-devel.h',
+                    'destination': '{includedir}/foo2-devel.h',
                     'tag': 'devel',
                 },
                 f'{self.builddir}/foo-custom.h': {
-                    'destination': '{prefix}/share/foo-custom.h',
+                    'destination': '{datadir}/foo-custom.h',
                     'tag': 'custom',
                 },
                 f'{self.builddir}/subdir/foo2.h': {
-                    'destination': '{prefix}/share/foo2.h',
+                    'destination': '{datadir}/foo2.h',
                     'tag': None,
                 },
             },
             'data': {
                 f'{testdir}/bar-notag.txt': {
-                    'destination': '{datadir}/share/bar-notag.txt',
+                    'destination': '{datadir}/bar-notag.txt',
                     'tag': None,
                 },
                 f'{testdir}/bar-devel.h': {
-                    'destination': '{datadir}/include/bar-devel.h',
+                    'destination': '{includedir}/bar-devel.h',
                     'tag': 'devel',
                 },
                 f'{testdir}/bar-custom.txt': {
-                    'destination': '{datadir}/share/bar-custom.txt',
+                    'destination': '{datadir}/bar-custom.txt',
                     'tag': 'custom',
                 },
                 f'{testdir}/subdir/bar2-devel.h': {
-                    'destination': '{datadir}/include/bar2-devel.h',
+                    'destination': '{includedir}/bar2-devel.h',
                     'tag': 'devel',
                 },
             },
@@ -4057,6 +4486,20 @@ class AllPlatformTests(BasePlatformTests):
                     'destination': '{includedir}/foo3-devel.h',
                     'tag': 'devel',
                 },
+            },
+            'install_subdirs': {
+                f'{testdir}/custom_files': {
+                    'destination': '{datadir}/custom_files',
+                    'tag': 'custom',
+                    'exclude_dirs': [],
+                    'exclude_files': [],
+                },
+                f'{testdir}/excludes': {
+                    'destination': '{datadir}/excludes',
+                    'tag': 'custom',
+                    'exclude_dirs': ['excluded'],
+                    'exclude_files': ['excluded.txt'],
+                }
             }
         }
 
@@ -4088,7 +4531,8 @@ class AllPlatformTests(BasePlatformTests):
         self.init(testdir, extra_args=['--werror'], override_envvars={'RUSTC': 'clippy-driver'})
         with self.assertRaises(subprocess.CalledProcessError) as cm:
             self.build()
-        self.assertIn('error: use of a blacklisted/placeholder name `foo`', cm.exception.stdout)
+        self.assertTrue('error: use of a blacklisted/placeholder name `foo`' in cm.exception.stdout or
+                        'error: use of a disallowed/placeholder name `foo`' in cm.exception.stdout)
 
     @skip_if_not_language('rust')
     def test_rust_rlib_linkage(self) -> None:
@@ -4102,7 +4546,7 @@ class AllPlatformTests(BasePlatformTests):
                 }}
             ''')
 
-        testdir = os.path.join(self.unit_test_dir, '100 rlib linkage')
+        testdir = os.path.join(self.unit_test_dir, '102 rlib linkage')
         gen_file = os.path.join(testdir, 'lib.rs')
         with open(gen_file, 'w') as f:
             f.write(template.format(0))
@@ -4122,9 +4566,87 @@ class AllPlatformTests(BasePlatformTests):
         self.assertIn('exit status 39', cm.exception.stdout)
 
     def test_custom_target_name(self):
-        testdir = os.path.join(self.unit_test_dir, '99 custom target name')
+        testdir = os.path.join(self.unit_test_dir, '100 custom target name')
         self.init(testdir)
         out = self.build()
         if self.backend is Backend.ninja:
             self.assertIn('Generating file.txt with a custom command', out)
             self.assertIn('Generating subdir/file.txt with a custom command', out)
+
+    def test_symlinked_subproject(self):
+        testdir = os.path.join(self.unit_test_dir, '107 subproject symlink')
+        subproject_dir = os.path.join(testdir, 'subprojects')
+        subproject = os.path.join(testdir, 'symlinked_subproject')
+        symlinked_subproject = os.path.join(testdir, 'subprojects', 'symlinked_subproject')
+        if not os.path.exists(subproject_dir):
+            os.mkdir(subproject_dir)
+        os.symlink(subproject, symlinked_subproject)
+        self.addCleanup(os.remove, symlinked_subproject)
+
+        self.init(testdir)
+        self.build()
+
+    def test_configure_same_noop(self):
+        testdir = os.path.join(self.unit_test_dir, '109 configure same noop')
+        args = [
+            '-Dstring=val',
+            '-Dboolean=true',
+            '-Dcombo=two',
+            '-Dinteger=7',
+            '-Darray=[\'three\']',
+            '-Dfeature=disabled',
+            '--buildtype=plain',
+            '--prefix=/abc',
+        ]
+        self.init(testdir, extra_args=args)
+
+        filename = Path(self.privatedir) / 'coredata.dat'
+
+        olddata = filename.read_bytes()
+        oldmtime = os.path.getmtime(filename)
+
+        for opt in ('-Dstring=val', '--buildtype=plain', '-Dfeature=disabled', '-Dprefix=/abc'):
+            self.setconf([opt])
+            newdata = filename.read_bytes()
+            newmtime = os.path.getmtime(filename)
+            self.assertEqual(oldmtime, newmtime)
+            self.assertEqual(olddata, newdata)
+            olddata = newdata
+            oldmtime = newmtime
+
+        for opt in ('-Dstring=abc', '--buildtype=release', '-Dfeature=enabled', '-Dprefix=/def'):
+            self.setconf([opt])
+            newdata = filename.read_bytes()
+            newmtime = os.path.getmtime(filename)
+            self.assertGreater(newmtime, oldmtime)
+            self.assertNotEqual(olddata, newdata)
+            olddata = newdata
+            oldmtime = newmtime
+
+    def test_scripts_loaded_modules(self):
+        '''
+        Simulate a wrapped command, as done for custom_target() that capture
+        output. The script will print all python modules loaded and we verify
+        that it contains only an acceptable subset. Loading too many modules
+        slows down the build when many custom targets get wrapped.
+        '''
+        es = ExecutableSerialisation(python_command + ['-c', 'exit(0)'], env=EnvironmentVariables())
+        p = Path(self.builddir, 'exe.dat')
+        with p.open('wb') as f:
+            pickle.dump(es, f)
+        cmd = self.meson_command + ['--internal', 'test_loaded_modules', '--unpickle', str(p)]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE)
+        all_modules = json.loads(p.stdout.splitlines()[0])
+        meson_modules = [m for m in all_modules if 'meson' in m]
+        expected_meson_modules = [
+            'mesonbuild',
+            'mesonbuild._pathlib',
+            'mesonbuild.utils',
+            'mesonbuild.utils.core',
+            'mesonbuild.mesonmain',
+            'mesonbuild.mlog',
+            'mesonbuild.scripts',
+            'mesonbuild.scripts.meson_exe',
+            'mesonbuild.scripts.test_loaded_modules'
+        ]
+        self.assertEqual(sorted(expected_meson_modules), sorted(meson_modules))

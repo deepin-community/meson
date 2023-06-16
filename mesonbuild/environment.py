@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import itertools
 import os, platform, re, sys, shutil
@@ -20,14 +21,12 @@ import collections
 from . import coredata
 from . import mesonlib
 from .mesonlib import (
-    MesonException, EnvironmentException, MachineChoice, Popen_safe, PerMachine,
+    MesonException, MachineChoice, Popen_safe, PerMachine,
     PerMachineDefaultable, PerThreeMachineDefaultable, split_args, quote_arg, OptionKey,
     search_version, MesonBugException
 )
 from . import mlog
-from .programs import (
-    ExternalProgram, EmptyExternalProgram
-)
+from .programs import ExternalProgram
 
 from .envconfig import (
     BinaryTable, MachineInfo, Properties, known_cpu_families, CMakeVariables,
@@ -47,16 +46,15 @@ from functools import lru_cache
 from mesonbuild import envconfig
 
 if T.TYPE_CHECKING:
+    import argparse
     from configparser import ConfigParser
 
     from .wrap.wrap import Resolver
 
+    CompilersDict = T.Dict[str, Compiler]
+
+
 build_filename = 'meson.build'
-
-CompilersDict = T.Dict[str, Compiler]
-
-if T.TYPE_CHECKING:
-    import argparse
 
 
 def _get_env_var(for_machine: MachineChoice, is_cross: bool, var_name: str) -> T.Optional[str]:
@@ -159,6 +157,10 @@ def get_llvm_tool_names(tool: str) -> T.List[str]:
     # unless it becomes a stable release.
     suffixes = [
         '', # base (no suffix)
+        '-16',  '16',
+        '-15',  '15',
+        '-14',  '14',
+        '-13',  '13',
         '-12',  '12',
         '-11',  '11',
         '-10',  '10',
@@ -173,7 +175,7 @@ def get_llvm_tool_names(tool: str) -> T.List[str]:
         '-3.7', '37',
         '-3.6', '36',
         '-3.5', '35',
-        '-13',    # Debian development snapshot
+        '-15',    # Debian development snapshot
         '-devel', # FreeBSD development snapshot
     ]
     names = []
@@ -228,22 +230,6 @@ def detect_clangformat() -> T.List[str]:
             return [path]
     return []
 
-def detect_native_windows_arch():
-    """
-    The architecture of Windows itself: x86, amd64 or arm64
-    """
-    # These env variables are always available. See:
-    # https://msdn.microsoft.com/en-us/library/aa384274(VS.85).aspx
-    # https://blogs.msdn.microsoft.com/david.wang/2006/03/27/howto-detect-process-bitness/
-    arch = os.environ.get('PROCESSOR_ARCHITEW6432', '').lower()
-    if not arch:
-        try:
-            # If this doesn't exist, something is messing with the environment
-            arch = os.environ['PROCESSOR_ARCHITECTURE'].lower()
-        except KeyError:
-            raise EnvironmentException('Unable to detect native OS architecture')
-    return arch
-
 def detect_windows_arch(compilers: CompilersDict) -> str:
     """
     Detecting the 'native' architecture of Windows is not a trivial task. We
@@ -268,7 +254,7 @@ def detect_windows_arch(compilers: CompilersDict) -> str:
     3. Otherwise, use the actual Windows architecture
 
     """
-    os_arch = detect_native_windows_arch()
+    os_arch = mesonlib.windows_detect_native_arch()
     if os_arch == 'x86':
         return os_arch
     # If we're on 64-bit Windows, 32-bit apps can be compiled without
@@ -276,7 +262,7 @@ def detect_windows_arch(compilers: CompilersDict) -> str:
     # 32-bit and pretend like we're running under WOW64. Else, return the
     # actual Windows architecture that we deduced above.
     for compiler in compilers.values():
-        if compiler.id == 'msvc' and (compiler.target == 'x86' or compiler.target == '80x86'):
+        if compiler.id == 'msvc' and (compiler.target in {'x86', '80x86'}):
             return 'x86'
         if compiler.id == 'clang-cl' and compiler.target == 'x86':
             return 'x86'
@@ -322,7 +308,7 @@ def detect_cpu_family(compilers: CompilersDict) -> str:
         trial = 'ppc64'
     elif trial.startswith(('powerpc', 'ppc')) or trial in {'macppc', 'power macintosh'}:
         trial = 'ppc'
-    elif trial in ('amd64', 'x64', 'i86pc'):
+    elif trial in {'amd64', 'x64', 'i86pc'}:
         trial = 'x86_64'
     elif trial in {'sun4u', 'sun4v'}:
         trial = 'sparc64'
@@ -369,13 +355,13 @@ def detect_cpu(compilers: CompilersDict) -> str:
     else:
         trial = platform.machine().lower()
 
-    if trial in ('amd64', 'x64', 'i86pc'):
+    if trial in {'amd64', 'x64', 'i86pc'}:
         trial = 'x86_64'
     if trial == 'x86_64':
         # Same check as above for cpu_family
         if any_compiler_has_define(compilers, '__i386__'):
             trial = 'i686' # All 64 bit cpus have at least this level of x86 support.
-    elif trial.startswith('aarch64'):
+    elif trial.startswith('aarch64') or trial.startswith('arm64'):
         # Same check as above for cpu_family
         if any_compiler_has_define(compilers, '__arm__'):
             trial = 'arm'
@@ -472,7 +458,7 @@ class Environment:
                 # If we stored previous command line options, we can recover from
                 # a broken/outdated coredata.
                 if os.path.isfile(coredata.get_cmd_line_file(self.build_dir)):
-                    mlog.warning('Regenerating configuration from scratch.')
+                    mlog.warning('Regenerating configuration from scratch.', fatal=False)
                     mlog.log('Reason:', mlog.red(str(e)))
                     coredata.read_cmd_line_file(self.build_dir, options)
                     self.create_new_coredata(options)
@@ -568,7 +554,8 @@ class Environment:
         if bt in self.options and (db in self.options or op in self.options):
             mlog.warning('Recommend using either -Dbuildtype or -Doptimization + -Ddebug. '
                          'Using both is redundant since they override each other. '
-                         'See: https://mesonbuild.com/Builtin-options.html#build-type-options')
+                         'See: https://mesonbuild.com/Builtin-options.html#build-type-options',
+                         fatal=False)
 
         exe_wrapper = self.lookup_binary_entry(MachineChoice.HOST, 'exe_wrapper')
         if exe_wrapper is not None:
@@ -656,7 +643,7 @@ class Environment:
                         _p_env = re.split(r':|;', p_env)
                     p_list = list(mesonlib.OrderedSet(_p_env))
                 elif keyname == 'pkg_config_path':
-                    p_list = list(mesonlib.OrderedSet(p_env.split(':')))
+                    p_list = list(mesonlib.OrderedSet(p_env.split(os.pathsep)))
                 else:
                     p_list = split_args(p_env)
                 p_list = [e for e in p_list if e]  # filter out any empty elements
@@ -687,12 +674,12 @@ class Environment:
                             # time) until we're instantiating that `Compiler`
                             # object. This is required so that passing
                             # `-Dc_args=` on the command line and `$CFLAGS`
-                            # have subtely different behavior. `$CFLAGS` will be
+                            # have subtly different behavior. `$CFLAGS` will be
                             # added to the linker command line if the compiler
                             # acts as a linker driver, `-Dc_args` will not.
                             #
                             # We still use the original key as the base here, as
-                            # we want to inhert the machine and the compiler
+                            # we want to inherit the machine and the compiler
                             # language
                             key = key.evolve('env_args')
                         env_opts[key].extend(p_list)
@@ -814,6 +801,10 @@ class Environment:
             return self.get_bindir()
         return self.get_libdir()
 
+    def get_jar_dir(self) -> str:
+        """Install dir for JAR files"""
+        return f"{self.get_datadir()}/java"
+
     def get_static_lib_dir(self) -> str:
         "Install dir for the static library"
         return self.get_libdir()
@@ -841,10 +832,10 @@ class Environment:
 
     def get_compiler_system_dirs(self, for_machine: MachineChoice):
         for comp in self.coredata.compilers[for_machine].values():
-            if isinstance(comp, compilers.ClangCompiler):
+            if comp.id == 'clang':
                 index = 1
                 break
-            elif isinstance(comp, compilers.GnuCompiler):
+            elif comp.id == 'gcc':
                 index = 2
                 break
         else:
@@ -864,7 +855,7 @@ class Environment:
             return value
         return not machine_info_can_run(self.machines[for_machine])
 
-    def get_exe_wrapper(self) -> ExternalProgram:
+    def get_exe_wrapper(self) -> T.Optional[ExternalProgram]:
         if not self.need_exe_wrapper():
-            return EmptyExternalProgram()
+            return None
         return self.exe_wrapper

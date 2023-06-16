@@ -14,8 +14,12 @@
 
 # This class contains the basic functionality needed to run any interpreter
 # or an interpreter-based tool.
+from __future__ import annotations
 
-from .visitor import AstVisitor
+import os
+import sys
+import typing as T
+
 from .. import mparser, mesonlib
 from .. import environment
 
@@ -26,12 +30,9 @@ from ..interpreterbase import (
     BreakRequest,
     ContinueRequest,
     default_resolve_key,
-    TYPE_nvar,
-    TYPE_nkwargs,
 )
 
 from ..interpreter import (
-    Interpreter,
     StringHolder,
     BooleanHolder,
     IntegerHolder,
@@ -40,29 +41,33 @@ from ..interpreter import (
 )
 
 from ..mparser import (
-    AndNode,
     ArgumentNode,
     ArithmeticNode,
     ArrayNode,
     AssignmentNode,
     BaseNode,
-    ComparisonNode,
     ElementaryNode,
     EmptyNode,
-    ForeachClauseNode,
     IdNode,
-    IfClauseNode,
-    IndexNode,
     MethodNode,
     NotNode,
-    OrNode,
     PlusAssignmentNode,
     TernaryNode,
-    UMinusNode,
 )
 
-import os, sys
-import typing as T
+if T.TYPE_CHECKING:
+    from .visitor import AstVisitor
+    from ..interpreter import Interpreter
+    from ..interpreterbase import TYPE_nkwargs, TYPE_nvar
+    from ..mparser import (
+        AndNode,
+        ComparisonNode,
+        ForeachClauseNode,
+        IfClauseNode,
+        IndexNode,
+        OrNode,
+        UMinusNode,
+    )
 
 class DontCareObject(MesonInterpreterObject):
     pass
@@ -103,6 +108,7 @@ class AstInterpreter(InterpreterBase):
                            'install_man': self.func_do_nothing,
                            'install_data': self.func_do_nothing,
                            'install_subdir': self.func_do_nothing,
+                           'install_symlink': self.func_do_nothing,
                            'install_emptydir': self.func_do_nothing,
                            'configuration_data': self.func_do_nothing,
                            'configure_file': self.func_do_nothing,
@@ -111,6 +117,7 @@ class AstInterpreter(InterpreterBase):
                            'add_global_arguments': self.func_do_nothing,
                            'add_global_link_arguments': self.func_do_nothing,
                            'add_project_arguments': self.func_do_nothing,
+                           'add_project_dependencies': self.func_do_nothing,
                            'add_project_link_arguments': self.func_do_nothing,
                            'message': self.func_do_nothing,
                            'generator': self.func_do_nothing,
@@ -153,6 +160,8 @@ class AstInterpreter(InterpreterBase):
                            'alias_target': self.func_do_nothing,
                            'summary': self.func_do_nothing,
                            'range': self.func_do_nothing,
+                           'structured_sources': self.func_do_nothing,
+                           'debug': self.func_do_nothing,
                            })
 
     def _unholder_args(self, args: _T, kwargs: _V) -> T.Tuple[_T, _V]:
@@ -343,7 +352,7 @@ class AstInterpreter(InterpreterBase):
             return None # Loop detected
         id_loop_detect += [node.ast_id]
 
-        # Try to evealuate the value of the node
+        # Try to evaluate the value of the node
         if isinstance(node, IdNode):
             result = quick_resolve(node)
 
@@ -356,10 +365,10 @@ class AstInterpreter(InterpreterBase):
                 result = not result
 
         elif isinstance(node, ArrayNode):
-            result = [x for x in node.args.arguments]
+            result = node.args.arguments.copy()
 
         elif isinstance(node, ArgumentNode):
-            result = [x for x in node.arguments]
+            result = node.arguments.copy()
 
         elif isinstance(node, ArithmeticNode):
             if node.operation != 'add':
@@ -377,15 +386,15 @@ class AstInterpreter(InterpreterBase):
             mkwargs = {} # type: T.Dict[str, TYPE_nvar]
             try:
                 if isinstance(src, str):
-                    result = StringHolder(src, T.cast(Interpreter, self)).method_call(node.name, margs, mkwargs)
+                    result = StringHolder(src, T.cast('Interpreter', self)).method_call(node.name, margs, mkwargs)
                 elif isinstance(src, bool):
-                    result = BooleanHolder(src, T.cast(Interpreter, self)).method_call(node.name, margs, mkwargs)
+                    result = BooleanHolder(src, T.cast('Interpreter', self)).method_call(node.name, margs, mkwargs)
                 elif isinstance(src, int):
-                    result = IntegerHolder(src, T.cast(Interpreter, self)).method_call(node.name, margs, mkwargs)
+                    result = IntegerHolder(src, T.cast('Interpreter', self)).method_call(node.name, margs, mkwargs)
                 elif isinstance(src, list):
-                    result = ArrayHolder(src, T.cast(Interpreter, self)).method_call(node.name, margs, mkwargs)
+                    result = ArrayHolder(src, T.cast('Interpreter', self)).method_call(node.name, margs, mkwargs)
                 elif isinstance(src, dict):
-                    result = DictHolder(src, T.cast(Interpreter, self)).method_call(node.name, margs, mkwargs)
+                    result = DictHolder(src, T.cast('Interpreter', self)).method_call(node.name, margs, mkwargs)
             except mesonlib.MesonException:
                 return None
 
@@ -412,7 +421,7 @@ class AstInterpreter(InterpreterBase):
         else:
             args = [args_raw]
 
-        flattend_args = []  # type: T.List[TYPE_nvar]
+        flattened_args = []  # type: T.List[TYPE_nvar]
 
         # Resolve the contents of args
         for i in args:
@@ -421,18 +430,18 @@ class AstInterpreter(InterpreterBase):
                 if resolved is not None:
                     if not isinstance(resolved, list):
                         resolved = [resolved]
-                    flattend_args += resolved
+                    flattened_args += resolved
             elif isinstance(i, (str, bool, int, float)) or include_unknown_args:
-                flattend_args += [i]
-        return flattend_args
+                flattened_args += [i]
+        return flattened_args
 
     def flatten_kwargs(self, kwargs: T.Dict[str, TYPE_nvar], include_unknown_args: bool = False) -> T.Dict[str, TYPE_nvar]:
-        flattend_kwargs = {}
+        flattened_kwargs = {}
         for key, val in kwargs.items():
             if isinstance(val, BaseNode):
                 resolved = self.resolve_node(val, include_unknown_args)
                 if resolved is not None:
-                    flattend_kwargs[key] = resolved
+                    flattened_kwargs[key] = resolved
             elif isinstance(val, (str, bool, int, float)) or include_unknown_args:
-                flattend_kwargs[key] = val
-        return flattend_kwargs
+                flattened_kwargs[key] = val
+        return flattened_kwargs

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 """Representations specific to the arm family of compilers."""
 
@@ -43,6 +44,7 @@ arm_buildtype_args = {
 }  # type: T.Dict[str, T.List[str]]
 
 arm_optimization_args = {
+    'plain': [],
     '0': ['-O0'],
     'g': ['-g'],
     '1': ['-O1'],
@@ -61,6 +63,7 @@ armclang_buildtype_args = {
 }  # type: T.Dict[str, T.List[str]]
 
 armclang_optimization_args = {
+    'plain': [],
     '0': [], # Compiler defaults to -O0
     'g': ['-g'],
     '1': ['-O1'],
@@ -74,17 +77,20 @@ class ArmCompiler(Compiler):
 
     """Functionality that is common to all ARM family compilers."""
 
+    id = 'arm'
+
     def __init__(self) -> None:
         if not self.is_cross:
             raise mesonlib.EnvironmentException('armcc supports only cross-compilation.')
-        self.id = 'arm'
         default_warn_args = []  # type: T.List[str]
         self.warn_args = {'0': [],
                           '1': default_warn_args,
                           '2': default_warn_args + [],
-                          '3': default_warn_args + []}  # type: T.Dict[str, T.List[str]]
+                          '3': default_warn_args + [],
+                          'everything': default_warn_args + []}  # type: T.Dict[str, T.List[str]]
         # Assembly
         self.can_compile_suffixes.add('s')
+        self.can_compile_suffixes.add('sx')
 
     def get_pic_args(self) -> T.List[str]:
         # FIXME: Add /ropi, /rwpi, /fpic etc. qualifiers to --apcs
@@ -136,6 +142,11 @@ class ArmCompiler(Compiler):
 
 
 class ArmclangCompiler(Compiler):
+    '''
+    This is the Keil armclang.
+    '''
+
+    id = 'armclang'
 
     def __init__(self) -> None:
         if not self.is_cross:
@@ -145,13 +156,13 @@ class ArmclangCompiler(Compiler):
             raise mesonlib.EnvironmentException(f'Unsupported Linker {self.linker.exelist}, must be armlink')
         if not mesonlib.version_compare(self.version, '==' + self.linker.version):
             raise mesonlib.EnvironmentException('armlink version does not match with compiler version')
-        self.id = 'armclang'
         self.base_options = {
             OptionKey(o) for o in
             ['b_pch', 'b_lto', 'b_pgo', 'b_sanitize', 'b_coverage',
              'b_ndebug', 'b_staticpic', 'b_colorout']}
         # Assembly
         self.can_compile_suffixes.add('s')
+        self.can_compile_suffixes.add('sx')
 
     def get_pic_args(self) -> T.List[str]:
         # PIC support is not enabled by default for ARM,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2012-2021 The Meson development team
 # Copyright © 2021 Intel Corporation
+from __future__ import annotations
 
 import os
 import typing as T
@@ -8,11 +9,11 @@ import typing as T
 from .. import mesonlib
 from .. import dependencies
 from .. import build
-from .. import mlog
+from .. import mlog, coredata
 
 from ..mesonlib import MachineChoice, OptionKey
 from ..programs import OverrideProgram, ExternalProgram
-from ..interpreter.type_checking import ENV_KW
+from ..interpreter.type_checking import ENV_KW, ENV_METHOD_KW, ENV_SEPARATOR_KW, env_convertor_with_method
 from ..interpreterbase import (MesonInterpreterObject, FeatureNew, FeatureDeprecated,
                                typed_pos_args,  noArgsFlattening, noPosargs, noKwargs,
                                typed_kwargs, KwargInfo, InterpreterException)
@@ -20,6 +21,7 @@ from .primitives import MesonVersionString
 from .type_checking import NATIVE_KW, NoneType
 
 if T.TYPE_CHECKING:
+    from typing_extensions import Literal
     from ..backend.backends import ExecutableSerialisation
     from ..compilers import Compiler
     from ..interpreterbase import TYPE_kwargs, TYPE_var
@@ -36,10 +38,15 @@ if T.TYPE_CHECKING:
 
         skip_if_destdir: bool
         install_tag: str
+        dry_run: bool
 
     class NativeKW(TypedDict):
 
         native: mesonlib.MachineChoice
+
+    class AddDevenvKW(TypedDict):
+        method: Literal['set', 'prepend', 'append']
+        separator: str
 
 
 class MesonMain(MesonInterpreterObject):
@@ -69,6 +76,7 @@ class MesonMain(MesonInterpreterObject):
                              'override_find_program': self.override_find_program_method,
                              'project_version': self.project_version_method,
                              'project_license': self.project_license_method,
+                             'project_license_files': self.project_license_files_method,
                              'version': self.version_method,
                              'project_name': self.project_name_method,
                              'get_cross_property': self.get_cross_property_method,
@@ -76,29 +84,36 @@ class MesonMain(MesonInterpreterObject):
                              'has_external_property': self.has_external_property_method,
                              'backend': self.backend_method,
                              'add_devenv': self.add_devenv_method,
+                             'build_options': self.build_options_method,
                              })
 
     def _find_source_script(
-            self, prog: T.Union[str, mesonlib.File, build.Executable, ExternalProgram],
+            self, name: str, prog: T.Union[str, mesonlib.File, build.Executable, ExternalProgram],
             args: T.List[str]) -> 'ExecutableSerialisation':
         largs: T.List[T.Union[str, build.Executable, ExternalProgram]] = []
+
         if isinstance(prog, (build.Executable, ExternalProgram)):
+            FeatureNew.single_use(f'Passing executable/found program object to script parameter of {name}',
+                                  '0.55.0', self.subproject, location=self.current_node)
             largs.append(prog)
-            largs.extend(args)
-            return self.interpreter.backend.get_executable_serialisation(largs)
-        found = self.interpreter.func_find_program({}, prog, {})
-        largs.append(found)
+        else:
+            if isinstance(prog, mesonlib.File):
+                FeatureNew.single_use(f'Passing file object to script parameter of {name}',
+                                      '0.57.0', self.subproject, location=self.current_node)
+            found = self.interpreter.find_program_impl([prog])
+            largs.append(found)
+
         largs.extend(args)
-        es = self.interpreter.backend.get_executable_serialisation(largs)
+        es = self.interpreter.backend.get_executable_serialisation(largs, verbose=True)
         es.subproject = self.interpreter.subproject
         return es
 
     def _process_script_args(
             self, name: str, args: T.Sequence[T.Union[
-                str, mesonlib.File, build.Target,
+                str, mesonlib.File, build.BuildTarget, build.CustomTarget,
                 build.CustomTargetIndex,
-                ExternalProgram, build.Executable,
-            ]], allow_built: bool = False) -> T.List[str]:
+                ExternalProgram,
+            ]]) -> T.List[str]:
         script_args = []  # T.List[str]
         new = False
         for a in args:
@@ -107,9 +122,7 @@ class MesonMain(MesonInterpreterObject):
             elif isinstance(a, mesonlib.File):
                 new = True
                 script_args.append(a.rel_to_builddir(self.interpreter.environment.source_dir))
-            elif isinstance(a, (build.Target, build.CustomTargetIndex)):
-                if not allow_built:
-                    raise InterpreterException(f'Arguments to {name} cannot be built')
+            elif isinstance(a, (build.BuildTarget, build.CustomTarget, build.CustomTargetIndex)):
                 new = True
                 script_args.extend([os.path.join(a.get_subdir(), o) for o in a.get_outputs()])
 
@@ -127,76 +140,68 @@ class MesonMain(MesonInterpreterObject):
 
         if new:
             FeatureNew.single_use(
-                f'Calling "{name}" with File, CustomTaget, Index of CustomTarget, '
+                f'Calling "{name}" with File, CustomTarget, Index of CustomTarget, '
                 'Executable, or ExternalProgram',
-                '0.55.0', self.interpreter.subproject)
+                '0.55.0', self.interpreter.subproject, location=self.current_node)
         return script_args
 
     @typed_pos_args(
         'meson.add_install_script',
         (str, mesonlib.File, build.Executable, ExternalProgram),
-        varargs=(str, mesonlib.File, build.Target, build.CustomTargetIndex, ExternalProgram)
+        varargs=(str, mesonlib.File, build.BuildTarget, build.CustomTarget, build.CustomTargetIndex, ExternalProgram)
     )
     @typed_kwargs(
         'meson.add_install_script',
         KwargInfo('skip_if_destdir', bool, default=False, since='0.57.0'),
         KwargInfo('install_tag', (str, NoneType), since='0.60.0'),
+        KwargInfo('dry_run', bool, default=False, since='1.1.0'),
     )
     def add_install_script_method(
             self,
             args: T.Tuple[T.Union[str, mesonlib.File, build.Executable, ExternalProgram],
-                          T.List[T.Union[str, mesonlib.File, build.Target, build.CustomTargetIndex, ExternalProgram]]],
+                          T.List[T.Union[str, mesonlib.File, build.BuildTarget, build.CustomTarget, build.CustomTargetIndex, ExternalProgram]]],
             kwargs: 'AddInstallScriptKW') -> None:
-        if isinstance(args[0], mesonlib.File):
-            FeatureNew.single_use('Passing file object to script parameter of add_install_script',
-                                  '0.57.0', self.interpreter.subproject)
-
-        script_args = self._process_script_args('add_install_script', args[1], allow_built=True)
-        script = self._find_source_script(args[0], script_args)
+        script_args = self._process_script_args('add_install_script', args[1])
+        script = self._find_source_script('add_install_script', args[0], script_args)
         script.skip_if_destdir = kwargs['skip_if_destdir']
         script.tag = kwargs['install_tag']
+        script.dry_run = kwargs['dry_run']
         self.build.install_scripts.append(script)
 
     @typed_pos_args(
         'meson.add_postconf_script',
         (str, mesonlib.File, ExternalProgram),
-        varargs=(str, mesonlib.File, build.CustomTarget, build.CustomTargetIndex)
+        varargs=(str, mesonlib.File, ExternalProgram)
     )
     @noKwargs
     def add_postconf_script_method(
             self,
             args: T.Tuple[T.Union[str, mesonlib.File, ExternalProgram],
-                          T.List[T.Union[str, mesonlib.File, build.CustomTarget, build.CustomTargetIndex]]],
+                          T.List[T.Union[str, mesonlib.File, ExternalProgram]]],
             kwargs: 'TYPE_kwargs') -> None:
-        if isinstance(args[0], mesonlib.File):
-            FeatureNew.single_use('Passing file object to script parameter of add_postconf_script',
-                                  '0.57.0', self.interpreter.subproject)
-        script_args = self._process_script_args('add_postconf_script', args[1], allow_built=True)
-        script = self._find_source_script(args[0], script_args)
+        script_args = self._process_script_args('add_postconf_script', args[1])
+        script = self._find_source_script('add_postconf_script', args[0], script_args)
         self.build.postconf_scripts.append(script)
 
     @typed_pos_args(
         'meson.add_dist_script',
-        (str, mesonlib.File, build.Executable, ExternalProgram),
-        varargs=(str, mesonlib.File, build.CustomTarget, build.CustomTargetIndex)
+        (str, mesonlib.File, ExternalProgram),
+        varargs=(str, mesonlib.File, ExternalProgram)
     )
     @noKwargs
     def add_dist_script_method(
             self,
-            args: T.Tuple[T.Union[str, mesonlib.File, build.Executable, ExternalProgram],
-                          T.List[T.Union[str, mesonlib.File, build.CustomTarget, build.CustomTargetIndex]]],
+            args: T.Tuple[T.Union[str, mesonlib.File, ExternalProgram],
+                          T.List[T.Union[str, mesonlib.File, ExternalProgram]]],
             kwargs: 'TYPE_kwargs') -> None:
         if args[1]:
             FeatureNew.single_use('Calling "add_dist_script" with multiple arguments',
-                                  '0.49.0', self.interpreter.subproject)
-        if isinstance(args[0], mesonlib.File):
-            FeatureNew.single_use('Passing file object to script parameter of add_dist_script',
-                                  '0.57.0', self.interpreter.subproject)
+                                  '0.49.0', self.interpreter.subproject, location=self.current_node)
         if self.interpreter.subproject != '':
             FeatureNew.single_use('Calling "add_dist_script" in a subproject',
-                                  '0.58.0', self.interpreter.subproject)
-        script_args = self._process_script_args('add_dist_script', args[1], allow_built=True)
-        script = self._find_source_script(args[0], script_args)
+                                  '0.58.0', self.interpreter.subproject, location=self.current_node)
+        script_args = self._process_script_args('add_dist_script', args[1])
+        script = self._find_source_script('add_dist_script', args[0], script_args)
         self.build.dist_scripts.append(script)
 
     @noPosargs
@@ -372,8 +377,8 @@ class MesonMain(MesonInterpreterObject):
     def _override_dependency_impl(self, name: str, dep: dependencies.Dependency, kwargs: 'FuncOverrideDependency',
                                   static: T.Optional[bool], permissive: bool = False) -> None:
         # We need the cast here as get_dep_identifier works on such a dict,
-        # which FuncOverrideDependency is, but mypy can't fgure that out
-        nkwargs = T.cast(T.Dict[str, T.Any], kwargs.copy())
+        # which FuncOverrideDependency is, but mypy can't figure that out
+        nkwargs = T.cast('T.Dict[str, T.Any]', kwargs.copy())
         if static is None:
             del nkwargs['static']
         else:
@@ -400,6 +405,12 @@ class MesonMain(MesonInterpreterObject):
     @noKwargs
     def project_license_method(self, args: T.List['TYPE_var'], kwargs: 'TYPE_kwargs') -> T.List[str]:
         return self.build.dep_manifest[self.interpreter.active_projectname].license
+
+    @FeatureNew('meson.project_license_files()', '1.1.0')
+    @noPosargs
+    @noKwargs
+    def project_license_files_method(self, args: T.List[TYPE_var], kwargs: TYPE_kwargs) -> T.List[mesonlib.File]:
+        return [l[1] for l in self.build.dep_manifest[self.interpreter.active_projectname].license_files]
 
     @noPosargs
     @noKwargs
@@ -444,13 +455,23 @@ class MesonMain(MesonInterpreterObject):
         return prop_name in self.interpreter.environment.properties[kwargs['native']]
 
     @FeatureNew('add_devenv', '0.58.0')
-    @noKwargs
+    @typed_kwargs('environment', ENV_METHOD_KW, ENV_SEPARATOR_KW.evolve(since='0.62.0'))
     @typed_pos_args('add_devenv', (str, list, dict, build.EnvironmentVariables))
-    def add_devenv_method(self, args: T.Tuple[T.Union[str, list, dict, build.EnvironmentVariables]], kwargs: 'TYPE_kwargs') -> None:
+    def add_devenv_method(self, args: T.Tuple[T.Union[str, list, dict, build.EnvironmentVariables]],
+                          kwargs: 'AddDevenvKW') -> None:
         env = args[0]
         msg = ENV_KW.validator(env)
         if msg:
             raise build.InvalidArguments(f'"add_devenv": {msg}')
-        converted = ENV_KW.convertor(env)
+        converted = env_convertor_with_method(env, kwargs['method'], kwargs['separator'])
         assert isinstance(converted, build.EnvironmentVariables)
         self.build.devenv.append(converted)
+
+    @noPosargs
+    @noKwargs
+    @FeatureNew('meson.build_options', '1.1.0')
+    def build_options_method(self, args: T.List['TYPE_var'], kwargs: 'TYPE_kwargs') -> str:
+        options = self.interpreter.user_defined_options
+        if options is None:
+            return ''
+        return coredata.format_cmd_line_options(options)

@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
+from mesonbuild.templates.valatemplates import ValaProject
 from mesonbuild.templates.fortrantemplates import FortranProject
 from mesonbuild.templates.objcpptemplates import ObjCppProject
 from mesonbuild.templates.dlangtemplates import DlangProject
@@ -36,5 +39,6 @@ def sameple_generator(options: argparse.Namespace) -> SampleImpl:
         'java': JavaProject,
         'd': DlangProject,
         'rust': RustProject,
-        'fortran': FortranProject
+        'fortran': FortranProject,
+        'vala': ValaProject
     }[options.language](options)

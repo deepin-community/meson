@@ -11,28 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import os.path
 import typing as T
 
 from .. import mlog
-from ..mesonlib import EnvironmentException, MachineChoice, version_compare, OptionKey
+from ..mesonlib import EnvironmentException, version_compare, OptionKey
 
 from .compilers import Compiler, LibType
 
 if T.TYPE_CHECKING:
     from ..envconfig import MachineInfo
     from ..environment import Environment
+    from ..mesonlib import MachineChoice
 
 class ValaCompiler(Compiler):
 
     language = 'vala'
+    id = 'valac'
 
     def __init__(self, exelist: T.List[str], version: str, for_machine: MachineChoice,
                  is_cross: bool, info: 'MachineInfo'):
-        super().__init__(exelist, version, for_machine, info, is_cross=is_cross)
+        super().__init__([], exelist, version, for_machine, info, is_cross=is_cross)
         self.version = version
-        self.id = 'valac'
         self.base_options = {OptionKey('b_colorout')}
 
     def needs_static_linker(self) -> bool:
@@ -109,7 +111,7 @@ class ValaCompiler(Compiler):
         return []
 
     def find_library(self, libname: str, env: 'Environment', extra_dirs: T.List[str],
-                     libtype: LibType = LibType.PREFER_SHARED) -> T.Optional[T.List[str]]:
+                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True) -> T.Optional[T.List[str]]:
         if extra_dirs and isinstance(extra_dirs, str):
             extra_dirs = [extra_dirs]
         # Valac always looks in the default vapi dir, so only search there if

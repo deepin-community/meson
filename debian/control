@@ -1,14 +1,13 @@
-
 Source: meson
 Maintainer: Jussi Pakkanen <jpakkane@gmail.com>
 Section: devel
 Priority: optional
-Standards-Version: 4.6.0
+Standards-Version: 4.6.2
 Homepage: https://mesonbuild.com
 X-Python3-Version: >= 3.7
 Rules-Requires-Root: no
 Build-Depends: debhelper-compat (= 13),
-  python3:any (>= 3.5),
+  python3:any (>= 3.7),
   dh-exec,
   dh-python,
   python3-setuptools,
@@ -44,7 +43,7 @@ Build-Depends: debhelper-compat (= 13),
   bison <!nocheck>,
   mono-mcs <!nocheck>,
   mono-devel <!nocheck>,
-  libwxgtk3.0-gtk3-dev <!nocheck>,
+  libwxgtk3.2-dev <!nocheck>,
   python3-gi <!nocheck>,
   gtk-doc-tools <!nocheck>,
 # Rust is not needed to build Meson, only to run a part of its test
@@ -89,6 +88,7 @@ Build-Depends: debhelper-compat (= 13),
   doxygen <!nocheck>,
   nasm <!nocheck>,
   cmake <!nocheck>,
+  clang-format <!nocheck>,
 
 Package: meson
 Architecture: all
@@ -98,7 +98,7 @@ Depends:
  ${python3:Depends},
  ninja-build(>=1.6),
  python3-pkg-resources,
- python3-distutils
+ python3-setuptools
 Recommends:
  dpkg-dev,
 Description: high-productivity build system

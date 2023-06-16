@@ -3,7 +3,7 @@
 # Print all logging info to stdout so it
 # shows up in build logs.
 export MESON_PRINT_TEST_OUTPUT=1
-
+export  DEB_BUILD_OPTIONS=nocheck
 export QT_SELECT=qt5
 
 # We're not in 1963 anymore, Toto!

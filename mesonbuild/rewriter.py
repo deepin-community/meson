@@ -22,14 +22,18 @@
 # - remove files from a target
 # - move targets
 # - reindent?
+from __future__ import annotations
 
-from .ast import IntrospectionInterpreter, build_target_functions, AstConditionLevel, AstIDGenerator, AstIndentationGenerator, AstPrinter
-from mesonbuild.mesonlib import MesonException
+from .ast import IntrospectionInterpreter, BUILD_TARGET_FUNCTIONS, AstConditionLevel, AstIDGenerator, AstIndentationGenerator, AstPrinter
+from mesonbuild.mesonlib import MesonException, setup_vsenv
 from . import mlog, environment
 from functools import wraps
-from .mparser import Token, ArrayNode, ArgumentNode, AssignmentNode, BaseNode, BooleanNode, ElementaryNode, IdNode, FunctionNode, StringNode
+from .mparser import Token, ArrayNode, ArgumentNode, AssignmentNode, BooleanNode, ElementaryNode, IdNode, FunctionNode, StringNode
 import json, os, re, sys
 import typing as T
+
+if T.TYPE_CHECKING:
+    from .mparser import BaseNode
 
 class RewriterException(MesonException):
     pass
@@ -41,12 +45,12 @@ def add_arguments(parser, formatter=None):
     subparsers = parser.add_subparsers(dest='type', title='Rewriter commands', description='Rewrite command to execute')
 
     # Target
-    tgt_parser = subparsers.add_parser('target', help='Modify a target', formatter_class=formatter)
+    tgt_parser = subparsers.add_parser('target', aliases=['tgt'], help='Modify a target', formatter_class=formatter)
     tgt_parser.add_argument('-s', '--subdir', default='', dest='subdir', help='Subdirectory of the new target (only for the "add_target" action)')
     tgt_parser.add_argument('--type', dest='tgt_type', choices=rewriter_keys['target']['target_type'][2], default='executable',
                             help='Type of the target to add (only for the "add_target" action)')
     tgt_parser.add_argument('target', help='Name or ID of the target')
-    tgt_parser.add_argument('operation', choices=['add', 'rm', 'add_target', 'rm_target', 'info'],
+    tgt_parser.add_argument('operation', choices=['add', 'rm', 'add_target', 'rm_target', 'add_extra_files', 'rm_extra_files', 'info'],
                             help='Action to execute')
     tgt_parser.add_argument('sources', nargs='*', help='Sources to add/remove')
 
@@ -60,13 +64,13 @@ def add_arguments(parser, formatter=None):
     kw_parser.add_argument('kwargs', nargs='*', help='Pairs of keyword and value')
 
     # Default options
-    def_parser = subparsers.add_parser('default-options', help='Modify the project default options', formatter_class=formatter)
+    def_parser = subparsers.add_parser('default-options', aliases=['def'], help='Modify the project default options', formatter_class=formatter)
     def_parser.add_argument('operation', choices=rewriter_keys['default_options']['operation'][2],
                             help='Action to execute')
     def_parser.add_argument('options', nargs='*', help='Key, value pairs of configuration option')
 
     # JSON file/command
-    cmd_parser = subparsers.add_parser('command', help='Execute a JSON array of commands', formatter_class=formatter)
+    cmd_parser = subparsers.add_parser('command', aliases=['cmd'], help='Execute a JSON array of commands', formatter_class=formatter)
     cmd_parser.add_argument('json', help='JSON string or file to execute')
 
 class RequiredKeys:
@@ -308,7 +312,7 @@ rewriter_keys = {
     },
     'target': {
         'target': (str, None, None),
-        'operation': (str, None, ['src_add', 'src_rm', 'target_rm', 'target_add', 'info']),
+        'operation': (str, None, ['src_add', 'src_rm', 'target_rm', 'target_add', 'extra_files_add', 'extra_files_rm', 'info']),
         'sources': (list, [], None),
         'subdir': (str, '', None),
         'target_type': (str, 'executable', ['both_libraries', 'executable', 'jar', 'library', 'shared_library', 'shared_module', 'static_library']),
@@ -395,7 +399,7 @@ class Rewriter:
         def check_list(name: str) -> T.List[BaseNode]:
             result = []
             for i in self.interpreter.targets:
-                if name == i['name'] or name == i['id']:
+                if name in {i['name'], i['id']}:
                     result += [i]
             return result
 
@@ -416,7 +420,7 @@ class Rewriter:
         if target in self.interpreter.assignments:
             node = self.interpreter.assignments[target]
             if isinstance(node, FunctionNode):
-                if node.func_name in ['executable', 'jar', 'library', 'shared_library', 'shared_module', 'static_library', 'both_libraries']:
+                if node.func_name in {'executable', 'jar', 'library', 'shared_library', 'shared_module', 'static_library', 'both_libraries'}:
                     tgt = self.interpreter.assign_vals[target]
 
         return tgt
@@ -436,7 +440,7 @@ class Rewriter:
         if dependency in self.interpreter.assignments:
             node = self.interpreter.assignments[dependency]
             if isinstance(node, FunctionNode):
-                if node.func_name in ['dependency']:
+                if node.func_name == 'dependency':
                     name = self.interpreter.flatten_args(node.args)[0]
                     dep = check_list(name)
 
@@ -565,31 +569,33 @@ class Rewriter:
 
             if key not in arg_node.kwargs:
                 arg_node.kwargs[key] = None
-            modifyer = kwargs_def[key](arg_node.kwargs[key])
-            if not modifyer.can_modify():
+            modifier = kwargs_def[key](arg_node.kwargs[key])
+            if not modifier.can_modify():
                 mlog.log('  -- Skipping', mlog.bold(key), 'because it is to complex to modify')
 
             # Apply the operation
             val_str = str(val)
             if cmd['operation'] == 'set':
                 mlog.log('  -- Setting', mlog.bold(key), 'to', mlog.yellow(val_str))
-                modifyer.set_value(val)
+                modifier.set_value(val)
             elif cmd['operation'] == 'add':
                 mlog.log('  -- Adding', mlog.yellow(val_str), 'to', mlog.bold(key))
-                modifyer.add_value(val)
+                modifier.add_value(val)
             elif cmd['operation'] == 'remove':
                 mlog.log('  -- Removing', mlog.yellow(val_str), 'from', mlog.bold(key))
-                modifyer.remove_value(val)
+                modifier.remove_value(val)
             elif cmd['operation'] == 'remove_regex':
                 mlog.log('  -- Removing all values matching', mlog.yellow(val_str), 'from', mlog.bold(key))
-                modifyer.remove_regex(val)
+                modifier.remove_regex(val)
 
             # Write back the result
-            arg_node.kwargs[key] = modifyer.get_node()
+            arg_node.kwargs[key] = modifier.get_node()
             num_changed += 1
 
         # Convert the keys back to IdNode's
         arg_node.kwargs = {IdNode(Token('', '', 0, 0, 0, None, k)): v for k, v in arg_node.kwargs.items()}
+        for k, v in arg_node.kwargs.items():
+            k.level = v.level
         if num_changed > 0 and node not in self.modified_nodes:
             self.modified_nodes += [node]
 
@@ -624,7 +630,7 @@ class Rewriter:
             args = []
             if isinstance(n, FunctionNode):
                 args = list(n.args.arguments)
-                if n.func_name in build_target_functions:
+                if n.func_name in BUILD_TARGET_FUNCTIONS:
                     args.pop(0)
             elif isinstance(n, ArrayNode):
                 args = n.args.arguments
@@ -709,6 +715,91 @@ class Rewriter:
                 if root not in self.modified_nodes:
                     self.modified_nodes += [root]
 
+        elif cmd['operation'] == 'extra_files_add':
+            tgt_function: FunctionNode = target['node']
+            mark_array = True
+            try:
+                node = target['extra_files'][0]
+            except IndexError:
+                # Specifying `extra_files` with a list that flattens to empty gives an empty
+                # target['extra_files'] list, account for that.
+                try:
+                    extra_files_key = next(k for k in tgt_function.args.kwargs.keys() if isinstance(k, IdNode) and k.value == 'extra_files')
+                    node = tgt_function.args.kwargs[extra_files_key]
+                except StopIteration:
+                    # Target has no extra_files kwarg, create one
+                    node = ArrayNode(ArgumentNode(Token('', tgt_function.filename, 0, 0, 0, None, '[]')), tgt_function.end_lineno, tgt_function.end_colno, tgt_function.end_lineno, tgt_function.end_colno)
+                    tgt_function.args.kwargs[IdNode(Token('string', tgt_function.filename, 0, 0, 0, None, 'extra_files'))] = node
+                    mark_array = False
+                    if tgt_function not in self.modified_nodes:
+                        self.modified_nodes += [tgt_function]
+                target['extra_files'] = [node]
+            if isinstance(node, IdNode):
+                node = self.interpreter.assignments[node.value]
+                target['extra_files'] = [node]
+            if not isinstance(node, ArrayNode):
+                mlog.error('Target', mlog.bold(cmd['target']), 'extra_files argument must be a list', *self.on_error())
+                return self.handle_error()
+
+            # Generate the current extra files list
+            extra_files_list = []
+            for i in target['extra_files']:
+                for j in arg_list_from_node(i):
+                    if isinstance(j, StringNode):
+                        extra_files_list += [j.value]
+
+            # Generate the new String nodes
+            to_append = []
+            for i in sorted(set(cmd['sources'])):
+                if i in extra_files_list:
+                    mlog.log('  -- Extra file', mlog.green(i), 'is already defined for the target --> skipping')
+                    continue
+                mlog.log('  -- Adding extra file', mlog.green(i), 'at',
+                         mlog.yellow(f'{node.filename}:{node.lineno}'))
+                token = Token('string', node.filename, 0, 0, 0, None, i)
+                to_append += [StringNode(token)]
+
+            # Append to the AST at the right place
+            arg_node = node.args
+            arg_node.arguments += to_append
+
+            # Mark the node as modified
+            if arg_node not in to_sort_nodes:
+                to_sort_nodes += [arg_node]
+            # If the extra_files array is newly created, don't mark it as its parent function node already is,
+            # otherwise this would cause double modification.
+            if mark_array and node not in self.modified_nodes:
+                self.modified_nodes += [node]
+
+        elif cmd['operation'] == 'extra_files_rm':
+            # Helper to find the exact string node and its parent
+            def find_node(src):
+                for i in target['extra_files']:
+                    for j in arg_list_from_node(i):
+                        if isinstance(j, StringNode):
+                            if j.value == src:
+                                return i, j
+                return None, None
+
+            for i in cmd['sources']:
+                # Try to find the node with the source string
+                root, string_node = find_node(i)
+                if root is None:
+                    mlog.warning('  -- Unable to find extra file', mlog.green(i), 'in the target')
+                    continue
+
+                # Remove the found string node from the argument list
+                arg_node = root.args
+                mlog.log('  -- Removing extra file', mlog.green(i), 'from',
+                         mlog.yellow(f'{string_node.filename}:{string_node.lineno}'))
+                arg_node.arguments.remove(string_node)
+
+                # Mark the node as modified
+                if arg_node not in to_sort_nodes and not isinstance(root, FunctionNode):
+                    to_sort_nodes += [arg_node]
+                if root not in self.modified_nodes:
+                    self.modified_nodes += [root]
+
         elif cmd['operation'] == 'target_add':
             if target is not None:
                 mlog.error('Can not add target', mlog.bold(cmd['target']), 'because it already exists', *self.on_error())
@@ -756,9 +847,15 @@ class Rewriter:
                 for j in arg_list_from_node(i):
                     if isinstance(j, StringNode):
                         src_list += [j.value]
+            extra_files_list = []
+            for i in target['extra_files']:
+                for j in arg_list_from_node(i):
+                    if isinstance(j, StringNode):
+                        extra_files_list += [j.value]
             test_data = {
                 'name': target['name'],
-                'sources': src_list
+                'sources': src_list,
+                'extra_files': extra_files_list
             }
             self.add_info('target', target['id'], test_data)
 
@@ -789,7 +886,7 @@ class Rewriter:
         # Sort based on line and column in reversed order
         work_nodes = [{'node': x, 'action': 'modify'} for x in self.modified_nodes]
         work_nodes += [{'node': x, 'action': 'rm'} for x in self.to_remove_nodes]
-        work_nodes = list(sorted(work_nodes, key=lambda x: (x['node'].lineno, x['node'].colno), reverse=True))
+        work_nodes = sorted(work_nodes, key=lambda x: (x['node'].lineno, x['node'].colno), reverse=True)
         work_nodes += [{'node': x, 'action': 'add'} for x in self.to_add_nodes]
 
         # Generating the new replacement string
@@ -857,15 +954,15 @@ class Rewriter:
                 while raw[end] != '=':
                     end += 1
                 end += 1 # Handle the '='
-                while raw[end] in [' ', '\n', '\t']:
+                while raw[end] in {' ', '\n', '\t'}:
                     end += 1
 
             files[i['file']]['raw'] = raw[:start] + i['str'] + raw[end:]
 
         for i in str_list:
-            if i['action'] in ['modify', 'rm']:
+            if i['action'] in {'modify', 'rm'}:
                 remove_node(i)
-            elif i['action'] in ['add']:
+            elif i['action'] == 'add':
                 files[i['file']]['raw'] += i['str'] + '\n'
 
         # Write the files back
@@ -879,6 +976,8 @@ target_operation_map = {
     'rm': 'src_rm',
     'add_target': 'target_add',
     'rm_target': 'target_rm',
+    'add_extra_files': 'extra_files_add',
+    'rm_extra_files': 'extra_files_rm',
     'info': 'info',
 }
 
@@ -944,6 +1043,7 @@ def run(options):
         mlog.set_quiet()
 
     try:
+        setup_vsenv()
         rewriter = Rewriter(options.sourcedir, skip_errors=options.skip)
         rewriter.analyze_meson()
 

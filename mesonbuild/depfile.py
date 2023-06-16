@@ -10,13 +10,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
-import collections
+import typing as T
 
-def parse(lines):
-    rules = []
-    targets = []
-    deps = []
+
+def parse(lines: T.Iterable[str]) -> T.List[T.Tuple[T.List[str], T.List[str]]]:
+    rules: T.List[T.Tuple[T.List[str], T.List[str]]] = []
+    targets: T.List[str] = []
+    deps: T.List[str] = []
     in_deps = False
     out = ''
     for line in lines:
@@ -32,10 +34,10 @@ def parse(lines):
                 out += c
                 escape = None
                 continue
-            if c == '\\' or c == '$':
+            if c in {'\\', '$'}:
                 escape = c
                 continue
-            elif c in (' ', '\n'):
+            elif c in {' ', '\n'}:
                 if out != '':
                     if in_deps:
                         deps.append(out)
@@ -56,12 +58,15 @@ def parse(lines):
             out += c
     return rules
 
-Target = collections.namedtuple('Target', ['deps'])
+class Target(T.NamedTuple):
+
+    deps: T.Set[str]
+
 
 class DepFile:
-    def __init__(self, lines):
+    def __init__(self, lines: T.Iterable[str]):
         rules = parse(lines)
-        depfile = {}
+        depfile: T.Dict[str, Target] = {}
         for (targets, deps) in rules:
             for target in targets:
                 t = depfile.setdefault(target, Target(deps=set()))
@@ -69,16 +74,17 @@ class DepFile:
                     t.deps.add(dep)
         self.depfile = depfile
 
-    def get_all_dependencies(self, target, visited=None):
-        deps = set()
+    def get_all_dependencies(self, name: str, visited: T.Optional[T.Set[str]] = None) -> T.List[str]:
+        deps: T.Set[str] = set()
         if not visited:
             visited = set()
-        if target in visited:
-            return set()
-        visited.add(target)
-        target = self.depfile.get(target)
+        if name in visited:
+            return []
+        visited.add(name)
+
+        target = self.depfile.get(name)
         if not target:
-            return set()
+            return []
         deps.update(target.deps)
         for dep in target.deps:
             deps.update(self.get_all_dependencies(dep, visited))
