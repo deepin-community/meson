@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import sys, os
 import subprocess
@@ -198,7 +199,7 @@ def build_gtkdoc(source_root: str, build_root: str, doc_subdir: str, src_subdirs
 
     # Make HTML documentation
     mkhtml_cmd = [options.gtkdoc_mkhtml,
-                  '--path=' + ':'.join((doc_src, abs_out)),
+                  '--path=' + os.pathsep.join((doc_src, abs_out)),
                   module,
                   ] + html_args
     if main_file:

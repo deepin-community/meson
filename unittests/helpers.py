@@ -5,17 +5,20 @@ import unittest
 import functools
 import re
 import typing as T
+import zipfile
+from pathlib import Path
 from contextlib import contextmanager
 
 from mesonbuild.compilers import detect_c_compiler, compiler_from_language
 from mesonbuild.mesonlib import (
-    MachineChoice, is_osx, is_cygwin, EnvironmentException, OptionKey, MachineChoice
+    MachineChoice, is_osx, is_cygwin, EnvironmentException, OptionKey, MachineChoice,
+    OrderedSet
 )
 from run_tests import get_fake_env
 
 
 def is_ci():
-    if 'CI' in os.environ:
+    if os.environ.get('MESON_CI_JOBNAME') not in {None, 'thirdparty'}:
         return True
     return False
 
@@ -169,4 +172,35 @@ def get_rpath(fname: str) -> T.Optional[str]:
     # nix/nixos adds a bunch of stuff to the rpath out of necessity that we
     # don't check for, so clear those
     final = ':'.join([e for e in raw.split(':') if not e.startswith('/nix')])
+    # If we didn't end up anything but nix paths, return None here
+    if not final:
+        return None
     return final
+
+def get_classpath(fname: str) -> T.Optional[str]:
+    with zipfile.ZipFile(fname) as zip:
+        with zip.open('META-INF/MANIFEST.MF') as member:
+            contents = member.read().decode().strip()
+    lines = []
+    for line in contents.splitlines():
+        if line.startswith(' '):
+            # continuation line
+            lines[-1] += line[1:]
+        else:
+            lines.append(line)
+    manifest = {
+        k.lower(): v.strip() for k, v in [l.split(':', 1) for l in lines]
+    }
+    return manifest.get('class-path')
+
+def get_path_without_cmd(cmd: str, path: str) -> str:
+    pathsep = os.pathsep
+    paths = OrderedSet([Path(p).resolve() for p in path.split(pathsep)])
+    while True:
+        full_path = shutil.which(cmd, path=path)
+        if full_path is None:
+            break
+        dirname = Path(full_path).resolve().parent
+        paths.discard(dirname)
+        path = pathsep.join([str(p) for p in paths])
+    return path

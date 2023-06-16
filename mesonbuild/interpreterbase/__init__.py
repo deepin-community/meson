@@ -18,6 +18,7 @@ __all__ = [
     'ObjectHolder',
     'IterableObject',
     'MutableInterpreterObject',
+    'ContextManagerObject',
 
     'MesonOperator',
 
@@ -57,6 +58,8 @@ __all__ = [
 
     'InterpreterBase',
 
+    'SubProject',
+
     'TV_fw_var',
     'TV_fw_args',
     'TV_fw_kwargs',
@@ -78,6 +81,7 @@ from .baseobjects import (
     ObjectHolder,
     IterableObject,
     MutableInterpreterObject,
+    ContextManagerObject,
 
     TV_fw_var,
     TV_fw_args,
@@ -90,6 +94,8 @@ from .baseobjects import (
     TYPE_nkwargs,
     TYPE_key_resolver,
     TYPE_HoldableTypes,
+
+    SubProject,
 
     HoldableTypes,
 )

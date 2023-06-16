@@ -14,6 +14,7 @@
 
 # This class contains the basic functionality needed to run any interpreter
 # or an interpreter-based tool.
+from __future__ import annotations
 
 from .common import CMakeException
 from .generator import parse_generator_expressions
@@ -26,6 +27,9 @@ from functools import lru_cache
 import re
 import json
 import textwrap
+
+if T.TYPE_CHECKING:
+    from ..environment import Environment
 
 class CMakeTraceLine:
     def __init__(self, file_str: str, line: int, func: str, args: T.List[str]) -> None:
@@ -53,17 +57,17 @@ class CMakeTarget:
                 name:        str,
                 target_type: str,
                 properties:  T.Optional[T.Dict[str, T.List[str]]] = None,
-                imported:    bool                                 = False,
-                tline:       T.Optional[CMakeTraceLine]           = None
+                imported:    bool = False,
+                tline:       T.Optional[CMakeTraceLine] = None
             ):
         if properties is None:
             properties = {}
-        self.name            = name
-        self.type            = target_type
-        self.properties      = properties
-        self.imported        = imported
-        self.tline           = tline
-        self.depends         = []      # type: T.List[str]
+        self.name = name
+        self.type = target_type
+        self.properties = properties
+        self.imported = imported
+        self.tline = tline
+        self.depends = []      # type: T.List[str]
         self.current_bin_dir = None    # type: T.Optional[Path]
         self.current_src_dir = None    # type: T.Optional[Path]
 
@@ -80,20 +84,21 @@ class CMakeTarget:
             return
         for key, val in self.properties.items():
             self.properties[key] = [x.strip() for x in val]
-            assert all([';' not in x for x in self.properties[key]])
+            assert all(';' not in x for x in self.properties[key])
 
 class CMakeGeneratorTarget(CMakeTarget):
     def __init__(self, name: str) -> None:
         super().__init__(name, 'CUSTOM', {})
         self.outputs = []        # type: T.List[Path]
+        self._outputs_str = []   # type: T.List[str]
         self.command = []        # type: T.List[T.List[str]]
         self.working_dir = None  # type: T.Optional[Path]
 
 class CMakeTraceParser:
-    def __init__(self, cmake_version: str, build_dir: Path, permissive: bool = True) -> None:
-        self.vars:                      T.Dict[str, T.List[str]]     = {}
-        self.vars_by_file: T.Dict[Path, T.Dict[str, T.List[str]]]    = {}
-        self.targets:                   T.Dict[str, CMakeTarget]     = {}
+    def __init__(self, cmake_version: str, build_dir: Path, env: 'Environment', permissive: bool = True) -> None:
+        self.vars:                      T.Dict[str, T.List[str]] = {}
+        self.vars_by_file: T.Dict[Path, T.Dict[str, T.List[str]]] = {}
+        self.targets:                   T.Dict[str, CMakeTarget] = {}
         self.cache:                     T.Dict[str, CMakeCacheEntry] = {}
 
         self.explicit_headers = set()  # type: T.Set[Path]
@@ -101,11 +106,14 @@ class CMakeTraceParser:
         # T.List of targes that were added with add_custom_command to generate files
         self.custom_targets = []  # type: T.List[CMakeGeneratorTarget]
 
+        self.env = env
         self.permissive = permissive  # type: bool
         self.cmake_version = cmake_version  # type: str
         self.trace_file = 'cmake_trace.txt'
         self.trace_file_path = build_dir / self.trace_file
         self.trace_format = 'json-v1' if version_compare(cmake_version, '>=3.17') else 'human'
+
+        self.errors: T.List[str] = []
 
         # State for delayed command execution. Delayed command execution is realised
         # with a custom CMake file that overrides some functions and adds some
@@ -129,6 +137,7 @@ class CMakeTraceParser:
             'target_link_libraries': self._cmake_target_link_libraries,
             'target_link_options': self._cmake_target_link_options,
             'add_dependencies': self._cmake_add_dependencies,
+            'message': self._cmake_message,
 
             # Special functions defined in the preload script.
             # These functions do nothing in the CMake code, but have special
@@ -137,6 +146,17 @@ class CMakeTraceParser:
             'meson_ps_reload_vars': self._meson_ps_reload_vars,
             'meson_ps_disabled_function': self._meson_ps_disabled_function,
         }  # type: T.Dict[str, T.Callable[[CMakeTraceLine], None]]
+
+        if version_compare(self.cmake_version, '<3.17.0'):
+            mlog.deprecation(textwrap.dedent(f'''\
+                CMake support for versions <3.17 is deprecated since Meson 0.62.0.
+                |
+                |   However, Meson was only able to find CMake {self.cmake_version}.
+                |
+                |   Support for all CMake versions below 3.17.0 will be removed once
+                |   newer CMake versions are more widely adopted. If you encounter
+                |   any errors please try upgrading CMake to a newer version first.
+            '''), once=True)
 
     def trace_args(self) -> T.List[str]:
         arg_map = {
@@ -182,6 +202,44 @@ class CMakeTraceParser:
             fn = self.functions.get(l.func, None)
             if fn:
                 fn(l)
+
+        # Evaluate generator expressions
+        strlist_gen:  T.Callable[[T.List[str]], T.List[str]] = lambda strlist: parse_generator_expressions(';'.join(strlist), self).split(';') if strlist else []
+        pathlist_gen: T.Callable[[T.List[str]], T.List[Path]] = lambda strlist: [Path(x) for x in parse_generator_expressions(';'.join(strlist), self).split(';')] if strlist else []
+
+        self.vars = {k: strlist_gen(v) for k, v in self.vars.items()}
+        self.vars_by_file = {
+            p: {k: strlist_gen(v) for k, v in d.items()}
+            for p, d in self.vars_by_file.items()
+        }
+        self.explicit_headers = {Path(parse_generator_expressions(str(x), self)) for x in self.explicit_headers}
+        self.cache = {
+            k: CMakeCacheEntry(
+                strlist_gen(v.value),
+                v.type
+            )
+            for k, v in self.cache.items()
+        }
+
+        for tgt in self.targets.values():
+            tgtlist_gen: T.Callable[[T.List[str], CMakeTarget], T.List[str]] = lambda strlist, t: parse_generator_expressions(';'.join(strlist), self, context_tgt=t).split(';') if strlist else []
+            tgt.name = parse_generator_expressions(tgt.name, self, context_tgt=tgt)
+            tgt.type = parse_generator_expressions(tgt.type, self, context_tgt=tgt)
+            tgt.properties = {
+                k: tgtlist_gen(v, tgt) for k, v in tgt.properties.items()
+            } if tgt.properties is not None else None
+            tgt.depends = tgtlist_gen(tgt.depends, tgt)
+
+        for ctgt in self.custom_targets:
+            ctgt.outputs = pathlist_gen(ctgt._outputs_str)
+            temp = ctgt.command
+            ctgt.command = [strlist_gen(x) for x in ctgt.command]
+            for command, src in zip(ctgt.command, temp):
+                if command[0] == "":
+                    raise CMakeException(
+                        "We evaluated the cmake variable '{}' to an empty string, which is not a valid path to an executable.".format(src[0])
+                    )
+            ctgt.working_dir = Path(parse_generator_expressions(str(ctgt.working_dir), self)) if ctgt.working_dir is not None else None
 
         # Postprocess
         for tgt in self.targets.values():
@@ -230,7 +288,7 @@ class CMakeTraceParser:
         raise CMakeException(f'CMake: {function}() {error}\n{tline}')
 
     def _cmake_set(self, tline: CMakeTraceLine) -> None:
-        """Handler for the CMake set() function in all variaties.
+        """Handler for the CMake set() function in all varieties.
 
         comes in three flavors:
         set(<var> <value> [PARENT_SCOPE])
@@ -246,10 +304,10 @@ class CMakeTraceParser:
         """
         # DOC: https://cmake.org/cmake/help/latest/command/set.html
 
-        cache_type  = None
+        cache_type = None
         cache_force = 'FORCE' in tline.args
         try:
-            cache_idx  = tline.args.index('CACHE')
+            cache_idx = tline.args.index('CACHE')
             cache_type = tline.args[cache_idx + 1]
         except (ValueError, IndexError):
             pass
@@ -366,7 +424,7 @@ class CMakeTraceParser:
         target = CMakeGeneratorTarget(name)
 
         def handle_output(key: str, target: CMakeGeneratorTarget) -> None:
-            target.outputs += [Path(key)]
+            target._outputs_str += [key]
 
         def handle_command(key: str, target: CMakeGeneratorTarget) -> None:
             if key == 'ARGS':
@@ -377,6 +435,7 @@ class CMakeTraceParser:
             target.depends += [key]
 
         working_dir = None
+
         def handle_working_dir(key: str, target: CMakeGeneratorTarget) -> None:
             nonlocal working_dir
             if working_dir is None:
@@ -408,10 +467,10 @@ class CMakeTraceParser:
         cbinary_dir = self.var_to_str('MESON_PS_CMAKE_CURRENT_BINARY_DIR')
         csource_dir = self.var_to_str('MESON_PS_CMAKE_CURRENT_SOURCE_DIR')
 
-        target.working_dir     = Path(working_dir) if working_dir else None
+        target.working_dir = Path(working_dir) if working_dir else None
         target.current_bin_dir = Path(cbinary_dir) if cbinary_dir else None
         target.current_src_dir = Path(csource_dir) if csource_dir else None
-        target.outputs = [Path(x) for x in self._guess_files([str(y) for y in target.outputs])]
+        target._outputs_str = self._guess_files(target._outputs_str)
         target.depends = self._guess_files(target.depends)
         target.command = [self._guess_files(x) for x in target.command]
 
@@ -440,7 +499,7 @@ class CMakeTraceParser:
             curr = args.pop(0)
             # XXX: APPEND_STRING is specifically *not* supposed to create a
             # list, is treating them as aliases really okay?
-            if curr == 'APPEND' or curr == 'APPEND_STRING':
+            if curr in {'APPEND', 'APPEND_STRING'}:
                 append = True
                 continue
 
@@ -450,7 +509,7 @@ class CMakeTraceParser:
             targets += curr.split(';')
 
         if not args:
-            return self._gen_exception('set_property', 'faild to parse argument list', tline)
+            return self._gen_exception('set_property', 'failed to parse argument list', tline)
 
         if len(args) == 1:
             # Tries to set property to nothing so nothing has to be done
@@ -516,7 +575,7 @@ class CMakeTraceParser:
 
             targets.append(curr)
 
-        # Now we need to try to reconsitute the original quoted format of the
+        # Now we need to try to reconstitute the original quoted format of the
         # arguments, as a property value could have spaces in it. Unlike
         # set_property() this is not context free. There are two approaches I
         # can think of, both have drawbacks:
@@ -527,7 +586,7 @@ class CMakeTraceParser:
         #
         # Neither of these is awesome for obvious reasons. I'm going to try
         # option 1 first and fall back to 2, as 1 requires less code and less
-        # synchroniztion for cmake changes.
+        # synchronization for cmake changes.
         #
         # With the JSON output format, introduced in CMake 3.17, spaces are
         # handled properly and we don't have to do either options
@@ -591,6 +650,18 @@ class CMakeTraceParser:
         # DOC: https://cmake.org/cmake/help/latest/command/target_link_libraries.html
         self._parse_common_target_options('target_link_options', 'LINK_LIBRARIES', 'INTERFACE_LINK_LIBRARIES', tline)
 
+    def _cmake_message(self, tline: CMakeTraceLine) -> None:
+        # DOC: https://cmake.org/cmake/help/latest/command/message.html
+        args = list(tline.args)
+
+        if len(args) < 1:
+            return self._gen_exception('message', 'takes at least 1 argument', tline)
+
+        if args[0].upper().strip() not in ['FATAL_ERROR', 'SEND_ERROR']:
+            return
+
+        self.errors += [' '.join(args[1:])]
+
     def _parse_common_target_options(self, func: str, private_prop: str, interface_prop: str, tline: CMakeTraceLine, ignore: T.Optional[T.List[str]] = None, paths: bool = False) -> None:
         if ignore is None:
             ignore = ['BEFORE']
@@ -612,14 +683,14 @@ class CMakeTraceParser:
             if i in ignore:
                 continue
 
-            if i in ['INTERFACE', 'LINK_INTERFACE_LIBRARIES', 'PUBLIC', 'PRIVATE', 'LINK_PUBLIC', 'LINK_PRIVATE']:
+            if i in {'INTERFACE', 'LINK_INTERFACE_LIBRARIES', 'PUBLIC', 'PRIVATE', 'LINK_PUBLIC', 'LINK_PRIVATE'}:
                 mode = i
                 continue
 
-            if mode in ['INTERFACE', 'LINK_INTERFACE_LIBRARIES', 'PUBLIC', 'LINK_PUBLIC']:
+            if mode in {'INTERFACE', 'LINK_INTERFACE_LIBRARIES', 'PUBLIC', 'LINK_PUBLIC'}:
                 interface += i.split(';')
 
-            if mode in ['PUBLIC', 'PRIVATE', 'LINK_PRIVATE']:
+            if mode in {'PUBLIC', 'PRIVATE', 'LINK_PRIVATE'}:
                 private += i.split(';')
 
         if paths:
@@ -676,9 +747,8 @@ class CMakeTraceParser:
             line = mo_file_line.group(3)
             func = mo_file_line.group(4)
             args = mo_file_line.group(5)
-            args = parse_generator_expressions(args)
             argl = args.split(' ')
-            argl = list(map(lambda x: x.strip(), argl))
+            argl = [a.strip() for a in argl]
 
             yield CMakeTraceLine(file, int(line), func, argl)
 
@@ -694,7 +764,6 @@ class CMakeTraceParser:
             args = data['args']
             for j in args:
                 assert isinstance(j, str)
-            args = [parse_generator_expressions(x) for x in args]
             yield CMakeTraceLine(data['file'], data['line'], data['cmd'], args)
 
     def _flatten_args(self, args: T.List[str]) -> T.List[str]:

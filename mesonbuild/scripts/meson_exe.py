@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import os
 import sys
@@ -20,10 +21,7 @@ import subprocess
 import typing as T
 import locale
 
-from .. import mesonlib
-from ..backend.backends import ExecutableSerialisation
-
-options = None
+from ..utils.core import ExecutableSerialisation
 
 def buildparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Custom executable wrapper for Meson. Do not run on your own, mmm\'kay?')
@@ -33,11 +31,11 @@ def buildparser() -> argparse.ArgumentParser:
     return parser
 
 def run_exe(exe: ExecutableSerialisation, extra_env: T.Optional[T.Dict[str, str]] = None) -> int:
-    if exe.exe_runner:
-        if not exe.exe_runner.found():
+    if exe.exe_wrapper:
+        if not exe.exe_wrapper.found():
             raise AssertionError('BUG: Can\'t run cross-compiled exe {!r} with not-found '
-                                 'wrapper {!r}'.format(exe.cmd_args[0], exe.exe_runner.get_path()))
-        cmd_args = exe.exe_runner.get_command() + exe.cmd_args
+                                 'wrapper {!r}'.format(exe.cmd_args[0], exe.exe_wrapper.get_path()))
+        cmd_args = exe.exe_wrapper.get_command() + exe.cmd_args
     else:
         cmd_args = exe.cmd_args
     child_env = os.environ.copy()
@@ -48,10 +46,12 @@ def run_exe(exe: ExecutableSerialisation, extra_env: T.Optional[T.Dict[str, str]
     if exe.extra_paths:
         child_env['PATH'] = (os.pathsep.join(exe.extra_paths + ['']) +
                              child_env['PATH'])
-        if exe.exe_runner and mesonlib.substring_is_in_list('wine', exe.exe_runner.get_command()):
+        if exe.exe_wrapper and any('wine' in i for i in exe.exe_wrapper.get_command()):
+            from .. import mesonlib
             child_env['WINEPATH'] = mesonlib.get_wine_shortpath(
-                exe.exe_runner.get_command(),
-                ['Z:' + p for p in exe.extra_paths] + child_env.get('WINEPATH', '').split(';')
+                exe.exe_wrapper.get_command(),
+                ['Z:' + p for p in exe.extra_paths] + child_env.get('WINEPATH', '').split(';'),
+                exe.workdir
             )
 
     stdin = None
@@ -72,7 +72,8 @@ def run_exe(exe: ExecutableSerialisation, extra_env: T.Optional[T.Dict[str, str]
 
     if p.returncode == 0xc0000135:
         # STATUS_DLL_NOT_FOUND on Windows indicating a common problem that is otherwise hard to diagnose
-        raise FileNotFoundError('due to missing DLLs')
+        strerror = 'Failed to run due to missing DLLs, with path: ' + child_env['PATH']
+        raise FileNotFoundError(p.returncode, strerror, cmd_args)
 
     if p.returncode != 0:
         if exe.pickled:
@@ -101,7 +102,6 @@ def run_exe(exe: ExecutableSerialisation, extra_env: T.Optional[T.Dict[str, str]
     return 0
 
 def run(args: T.List[str]) -> int:
-    global options
     parser = buildparser()
     options, cmd_args = parser.parse_known_args(args)
     # argparse supports double dash to separate options and positional arguments,

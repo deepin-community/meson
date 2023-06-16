@@ -1,4 +1,4 @@
-# Copyright 2012-2017 The Meson development team
+# Copyright 2012-2022 The Meson development team
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,27 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import subprocess, os.path
 import textwrap
 import typing as T
 
-from .. import coredata
-from ..mesonlib import (
-    EnvironmentException, MachineChoice, MesonException, Popen_safe,
-    OptionKey,
-)
+from .. import coredata, mlog
+from ..mesonlib import EnvironmentException, MesonException, Popen_safe, OptionKey, join_args
 from .compilers import Compiler, rust_buildtype_args, clike_debug_args
 
 if T.TYPE_CHECKING:
-    from ..coredata import KeyedOptionDictType
+    from ..coredata import MutableKeyedOptionDictType, KeyedOptionDictType
     from ..envconfig import MachineInfo
     from ..environment import Environment  # noqa: F401
     from ..linkers import DynamicLinker
+    from ..mesonlib import MachineChoice
     from ..programs import ExternalProgram
+    from ..dependencies import Dependency
 
 
 rust_optimization_args = {
+    'plain': [],
     '0': [],
     'g': ['-C', 'opt-level=0'],
     '1': ['-C', 'opt-level=1'],
@@ -44,6 +45,7 @@ class RustCompiler(Compiler):
 
     # rustc doesn't invoke the compiler itself, it doesn't need a LINKER_PREFIX
     language = 'rust'
+    id = 'rustc'
 
     _WARNING_LEVELS: T.Dict[str, T.List[str]] = {
         '0': ['-A', 'warnings'],
@@ -57,11 +59,10 @@ class RustCompiler(Compiler):
                  exe_wrapper: T.Optional['ExternalProgram'] = None,
                  full_version: T.Optional[str] = None,
                  linker: T.Optional['DynamicLinker'] = None):
-        super().__init__(exelist, version, for_machine, info,
+        super().__init__([], exelist, version, for_machine, info,
                          is_cross=is_cross, full_version=full_version,
                          linker=linker)
         self.exe_wrapper = exe_wrapper
-        self.id = 'rustc'
         self.base_options.add(OptionKey('b_colorout'))
         if 'link' in self.linker.id:
             self.base_options.add(OptionKey('b_vscrt'))
@@ -77,7 +78,9 @@ class RustCompiler(Compiler):
                 '''fn main() {
                 }
                 '''))
-        pc = subprocess.Popen(self.exelist + ['-o', output_name, source_name],
+
+        cmdlist = self.exelist + ['-o', output_name, source_name]
+        pc = subprocess.Popen(cmdlist,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,
                               cwd=work_dir)
@@ -86,11 +89,15 @@ class RustCompiler(Compiler):
         assert isinstance(_stde, bytes)
         stdo = _stdo.decode('utf-8', errors='replace')
         stde = _stde.decode('utf-8', errors='replace')
+
+        mlog.debug('Sanity check compiler command line:', join_args(cmdlist))
+        mlog.debug('Sanity check compile stdout:')
+        mlog.debug(stdo)
+        mlog.debug('-----\nSanity check compile stderr:')
+        mlog.debug(stde)
+        mlog.debug('-----')
         if pc.returncode != 0:
-            raise EnvironmentException('Rust compiler {} can not compile programs.\n{}\n{}'.format(
-                self.name_string(),
-                stdo,
-                stde))
+            raise EnvironmentException(f'Rust compiler {self.name_string()} cannot compile programs.')
         if self.is_cross:
             if self.exe_wrapper is None:
                 # Can't check if the binaries run so we have to assume they do
@@ -110,9 +117,9 @@ class RustCompiler(Compiler):
         return rust_buildtype_args[buildtype]
 
     def get_sysroot(self) -> str:
-        cmd = self.exelist + ['--print', 'sysroot']
+        cmd = self.get_exelist(ccache=False) + ['--print', 'sysroot']
         p, stdo, stde = Popen_safe(cmd)
-        return stdo.split('\n')[0]
+        return stdo.split('\n', maxsplit=1)[0]
 
     def get_debug_args(self, is_debug: bool) -> T.List[str]:
         return clike_debug_args[is_debug]
@@ -136,14 +143,14 @@ class RustCompiler(Compiler):
         return ['-o', outputname]
 
     @classmethod
-    def use_linker_args(cls, linker: str) -> T.List[str]:
+    def use_linker_args(cls, linker: str, version: str) -> T.List[str]:
         return ['-C', f'linker={linker}']
 
     # Rust does not have a use_linker_args because it dispatches to a gcc-like
     # C compiler for dynamic linking, as such we invoke the C compiler's
     # use_linker_args method instead.
 
-    def get_options(self) -> 'KeyedOptionDictType':
+    def get_options(self) -> 'MutableKeyedOptionDictType':
         key = OptionKey('std', machine=self.for_machine, lang=self.language)
         return {
             key: coredata.UserComboOption(
@@ -152,6 +159,12 @@ class RustCompiler(Compiler):
                 'none',
             ),
         }
+
+    def get_dependency_compile_args(self, dep: 'Dependency') -> T.List[str]:
+        # Rust doesn't have dependency compile arguments so simply return
+        # nothing here. Dependencies are linked and all required metadata is
+        # provided by the linker flags.
+        return []
 
     def get_option_compile_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
         args = []
@@ -205,11 +218,4 @@ class ClippyRustCompiler(RustCompiler):
     This just provides us a different id
     """
 
-    def __init__(self, exelist: T.List[str], version: str, for_machine: MachineChoice,
-                 is_cross: bool, info: 'MachineInfo',
-                 exe_wrapper: T.Optional['ExternalProgram'] = None,
-                 full_version: T.Optional[str] = None,
-                 linker: T.Optional['DynamicLinker'] = None):
-        super().__init__(exelist, version, for_machine, is_cross, info,
-                         exe_wrapper, full_version, linker)
-        self.id = 'clippy-driver rustc'
+    id = 'clippy-driver rustc'

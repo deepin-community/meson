@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
+from dataclasses import dataclass
 import subprocess
 import typing as T
 from enum import Enum
@@ -26,7 +28,7 @@ from pathlib import Path
 # and cross file currently), and also assists with the reading environment
 # variables.
 #
-# At this time there isn't an ironclad difference between this an other sources
+# At this time there isn't an ironclad difference between this and other sources
 # of state like `coredata`. But one rough guide is much what is in `coredata` is
 # the *output* of the configuration process: the final decisions after tests.
 # This, on the other hand has *inputs*. The config files are parsed, but
@@ -45,12 +47,14 @@ known_cpu_families = (
     'csky',
     'dspic',
     'e2k',
+    'ft32',
     'ia64',
     'loongarch64',
     'm68k',
     'microblaze',
     'mips',
     'mips64',
+    'msp430',
     'parisc',
     'pic24',
     'ppc',
@@ -87,7 +91,7 @@ CPU_FAMILIES_64_BIT = [
 ]
 
 # Map from language identifiers to environment variables.
-ENV_VAR_PROG_MAP: T.Mapping[str, str] = {
+ENV_VAR_COMPILER_MAP: T.Mapping[str, str] = {
     # Compilers
     'c': 'CC',
     'cpp': 'CXX',
@@ -98,6 +102,7 @@ ENV_VAR_PROG_MAP: T.Mapping[str, str] = {
     'objcpp': 'OBJCXX',
     'rust': 'RUSTC',
     'vala': 'VALAC',
+    'nasm': 'NASM',
 
     # Linkers
     'c_ld': 'CC_LD',
@@ -107,18 +112,35 @@ ENV_VAR_PROG_MAP: T.Mapping[str, str] = {
     'objc_ld': 'OBJC_LD',
     'objcpp_ld': 'OBJCXX_LD',
     'rust_ld': 'RUSTC_LD',
+}
 
+# Map from utility names to environment variables.
+ENV_VAR_TOOL_MAP: T.Mapping[str, str] = {
     # Binutils
-    'strip': 'STRIP',
     'ar': 'AR',
+    'as': 'AS',
+    'ld': 'LD',
+    'nm': 'NM',
+    'objcopy': 'OBJCOPY',
+    'objdump': 'OBJDUMP',
+    'ranlib': 'RANLIB',
+    'readelf': 'READELF',
+    'size': 'SIZE',
+    'strings': 'STRINGS',
+    'strip': 'STRIP',
     'windres': 'WINDRES',
 
     # Other tools
     'cmake': 'CMAKE',
     'qmake': 'QMAKE',
     'pkgconfig': 'PKG_CONFIG',
+    'pkg-config': 'PKG_CONFIG',
     'make': 'MAKE',
+    'vapigen': 'VAPIGEN',
+    'llvm-config': 'LLVM_CONFIG',
 }
+
+ENV_VAR_PROG_MAP = {**ENV_VAR_COMPILER_MAP, **ENV_VAR_TOOL_MAP}
 
 # Deprecated environment variables mapped from the new variable to the old one
 # Deprecated in 0.54.0
@@ -145,7 +167,7 @@ class Properties:
         return language + '_stdlib' in self.properties
 
     # Some of get_stdlib, get_root, get_sys_root are wider than is actually
-    # true, but without heterogenious dict annotations it's not practical to
+    # true, but without heterogeneous dict annotations it's not practical to
     # narrow them
     def get_stdlib(self, language: str) -> T.Union[str, T.List[str]]:
         stdlib = self.properties[language + '_stdlib']
@@ -212,7 +234,7 @@ class Properties:
         return res
 
     def get_java_home(self) -> T.Optional[Path]:
-        value = T.cast(T.Optional[str], self.properties.get('java_home'))
+        value = T.cast('T.Optional[str]', self.properties.get('java_home'))
         return Path(value) if value else None
 
     def __eq__(self, other: object) -> bool:
@@ -232,27 +254,15 @@ class Properties:
     def get(self, key: str, default: T.Optional[T.Union[str, bool, int, T.List[str]]] = None) -> T.Optional[T.Union[str, bool, int, T.List[str]]]:
         return self.properties.get(key, default)
 
+@dataclass(unsafe_hash=True)
 class MachineInfo(HoldableObject):
-    def __init__(self, system: str, cpu_family: str, cpu: str, endian: str):
-        self.system = system
-        self.cpu_family = cpu_family
-        self.cpu = cpu
-        self.endian = endian
-        self.is_64_bit = cpu_family in CPU_FAMILIES_64_BIT  # type: bool
+    system: str
+    cpu_family: str
+    cpu: str
+    endian: str
 
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, MachineInfo):
-            return NotImplemented
-        return \
-            self.system == other.system and \
-            self.cpu_family == other.cpu_family and \
-            self.cpu == other.cpu and \
-            self.endian == other.endian
-
-    def __ne__(self, other: object) -> bool:
-        if not isinstance(other, MachineInfo):
-            return NotImplemented
-        return not self.__eq__(other)
+    def __post_init__(self) -> None:
+        self.is_64_bit: bool = self.cpu_family in CPU_FAMILIES_64_BIT
 
     def __repr__(self) -> str:
         return f'<MachineInfo: {self.system} {self.cpu_family} ({self.cpu})>'
@@ -385,6 +395,22 @@ class BinaryTable:
             return []
         return ['ccache']
 
+    @staticmethod
+    def detect_sccache() -> T.List[str]:
+        try:
+            subprocess.check_call(['sccache', '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except (OSError, subprocess.CalledProcessError):
+            return []
+        return ['sccache']
+
+    @staticmethod
+    def detect_compiler_cache() -> T.List[str]:
+        # Sccache is "newer" so it is assumed that people would prefer it by default.
+        cache = BinaryTable.detect_sccache()
+        if cache:
+            return cache
+        return BinaryTable.detect_ccache()
+
     @classmethod
     def parse_entry(cls, entry: T.Union[str, T.List[str]]) -> T.Tuple[T.List[str], T.List[str]]:
         compiler = mesonlib.stringlistify(entry)
@@ -392,6 +418,9 @@ class BinaryTable:
         if compiler[0] == 'ccache':
             compiler = compiler[1:]
             ccache = cls.detect_ccache()
+        elif compiler[0] == 'sccache':
+            compiler = compiler[1:]
+            ccache = cls.detect_sccache()
         else:
             ccache = []
         # Return value has to be a list of compiler 'choices'
@@ -418,7 +447,8 @@ class CMakeVariables:
         for key, value in variables.items():
             value = mesonlib.listify(value)
             for i in value:
-                assert isinstance(i, str)
+                if not isinstance(i, str):
+                    raise EnvironmentException(f"Value '{i}' of CMake variable '{key}' defined in a machine file is a {type(i).__name__} and not a str")
             self.variables[key] = value
 
     def get_variables(self) -> T.Dict[str, T.List[str]]:

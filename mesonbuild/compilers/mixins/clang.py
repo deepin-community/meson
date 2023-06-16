@@ -1,4 +1,4 @@
-# Copyright 2019 The meson development team
+# Copyright 2019-2022 The meson development team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 """Abstractions for the LLVM/Clang compiler family."""
 
@@ -19,7 +20,8 @@ import shutil
 import typing as T
 
 from ... import mesonlib
-from ...linkers import AppleDynamicLinker, ClangClDynamicLinker, LLVMDynamicLinker, GnuGoldDynamicLinker
+from ...linkers import AppleDynamicLinker, ClangClDynamicLinker, LLVMDynamicLinker, GnuGoldDynamicLinker, \
+    MoldDynamicLinker
 from ...mesonlib import OptionKey
 from ..compilers import CompileCheckMode
 from .gnu import GnuLikeCompiler
@@ -35,6 +37,7 @@ clang_color_args = {
 }  # type: T.Dict[str, T.List[str]]
 
 clang_optimization_args = {
+    'plain': [],
     '0': ['-O0'],
     'g': ['-Og'],
     '1': ['-O1'],
@@ -45,12 +48,14 @@ clang_optimization_args = {
 
 class ClangCompiler(GnuLikeCompiler):
 
+    id = 'clang'
+
     def __init__(self, defines: T.Optional[T.Dict[str, str]]):
         super().__init__()
-        self.id = 'clang'
         self.defines = defines or {}
         self.base_options.update(
-            {OptionKey('b_colorout'), OptionKey('b_lto_threads'), OptionKey('b_lto_mode')})
+            {OptionKey('b_colorout'), OptionKey('b_lto_threads'), OptionKey('b_lto_mode'), OptionKey('b_thinlto_cache'),
+             OptionKey('b_thinlto_cache_dir')})
 
         # TODO: this really should be part of the linker base_options, but
         # linkers don't have base_options.
@@ -105,7 +110,7 @@ class ClangCompiler(GnuLikeCompiler):
         if isinstance(self.linker, AppleDynamicLinker) and mesonlib.version_compare(self.version, '>=8.0'):
             extra_args.append('-Wl,-no_weak_imports')
         return super().has_function(funcname, prefix, env, extra_args=extra_args,
-                                   dependencies=dependencies)
+                                    dependencies=dependencies)
 
     def openmp_flags(self) -> T.List[str]:
         if mesonlib.version_compare(self.version, '>=3.8.0'):
@@ -117,7 +122,7 @@ class ClangCompiler(GnuLikeCompiler):
             return []
 
     @classmethod
-    def use_linker_args(cls, linker: str) -> T.List[str]:
+    def use_linker_args(cls, linker: str, version: str) -> T.List[str]:
         # Clang additionally can use a linker specified as a path, which GCC
         # (and other gcc-like compilers) cannot. This is because clang (being
         # llvm based) is retargetable, while GCC is not.
@@ -126,13 +131,15 @@ class ClangCompiler(GnuLikeCompiler):
         # qcld: Qualcomm Snapdragon linker, based on LLVM
         if linker == 'qcld':
             return ['-fuse-ld=qcld']
+        if linker == 'mold':
+            return ['-fuse-ld=mold']
 
         if shutil.which(linker):
             if not shutil.which(linker):
                 raise mesonlib.MesonException(
                     f'Cannot find linker {linker}.')
             return [f'-fuse-ld={linker}']
-        return super().use_linker_args(linker)
+        return super().use_linker_args(linker, version)
 
     def get_has_func_attribute_extra_args(self, name: str) -> T.List[str]:
         # Clang only warns about unknown or ignored attributes, so force an
@@ -145,18 +152,29 @@ class ClangCompiler(GnuLikeCompiler):
     def get_lto_compile_args(self, *, threads: int = 0, mode: str = 'default') -> T.List[str]:
         args: T.List[str] = []
         if mode == 'thin':
-            # Thin LTO requires the use of gold, lld, ld64, or lld-link
-            if not isinstance(self.linker, (AppleDynamicLinker, ClangClDynamicLinker, LLVMDynamicLinker, GnuGoldDynamicLinker)):
-                raise mesonlib.MesonException(f"LLVM's thinLTO only works with gnu gold, lld, lld-link, and ld64, not {self.linker.id}")
+            # ThinLTO requires the use of gold, lld, ld64, lld-link or mold 1.1+
+            if isinstance(self.linker, (MoldDynamicLinker)):
+                # https://github.com/rui314/mold/commit/46995bcfc3e3113133620bf16445c5f13cd76a18
+                if not mesonlib.version_compare(self.linker.version, '>=1.1'):
+                    raise mesonlib.MesonException("LLVM's ThinLTO requires mold 1.1+")
+            elif not isinstance(self.linker, (AppleDynamicLinker, ClangClDynamicLinker, LLVMDynamicLinker, GnuGoldDynamicLinker)):
+                raise mesonlib.MesonException(f"LLVM's ThinLTO only works with gold, lld, lld-link, ld64 or mold, not {self.linker.id}")
             args.append(f'-flto={mode}')
         else:
             assert mode == 'default', 'someone forgot to wire something up'
             args.extend(super().get_lto_compile_args(threads=threads))
         return args
 
-    def get_lto_link_args(self, *, threads: int = 0, mode: str = 'default') -> T.List[str]:
+    def get_lto_link_args(self, *, threads: int = 0, mode: str = 'default',
+                          thinlto_cache_dir: T.Optional[str] = None) -> T.List[str]:
         args = self.get_lto_compile_args(threads=threads, mode=mode)
-        # In clang -flto=0 means auto
-        if threads >= 0:
+        if mode == 'thin' and thinlto_cache_dir is not None:
+            # We check for ThinLTO linker support above in get_lto_compile_args, and all of them support
+            # get_thinlto_cache_args as well
+            args.extend(self.linker.get_thinlto_cache_args(thinlto_cache_dir))
+        # In clang -flto-jobs=0 means auto, and is the default if unspecified, just like in meson
+        if threads > 0:
+            if not mesonlib.version_compare(self.version, '>=4.0.0'):
+                raise mesonlib.MesonException('clang support for LTO threads requires clang >=4.0')
             args.append(f'-flto-jobs={threads}')
         return args

@@ -15,20 +15,32 @@
 # This class contains the basic functionality needed to run any interpreter
 # or an interpreter-based tool
 
-from .interpreter import AstInterpreter
-from .visitor import AstVisitor
+from __future__ import annotations
+import argparse
+import copy
+import os
+import typing as T
+
 from .. import compilers, environment, mesonlib, optinterpreter
 from .. import coredata as cdata
-from ..mesonlib import MachineChoice, OptionKey
-from ..interpreterbase import InvalidArguments, TYPE_nvar
-from ..build import BuildTarget, Executable, Jar, SharedLibrary, SharedModule, StaticLibrary
-from ..mparser import BaseNode, ArithmeticNode, ArrayNode, ElementaryNode, IdNode, FunctionNode, StringNode
+from ..build import Executable, Jar, SharedLibrary, SharedModule, StaticLibrary
 from ..compilers import detect_compiler_for
-import typing as T
-import os
-import argparse
+from ..interpreterbase import InvalidArguments
+from ..mesonlib import MachineChoice, OptionKey
+from ..mparser import BaseNode, ArithmeticNode, ArrayNode, ElementaryNode, IdNode, FunctionNode, StringNode
+from .interpreter import AstInterpreter
 
-build_target_functions = ['executable', 'jar', 'library', 'shared_library', 'shared_module', 'static_library', 'both_libraries']
+if T.TYPE_CHECKING:
+    from ..build import BuildTarget
+    from ..interpreterbase import TYPE_nvar
+    from .visitor import AstVisitor
+
+
+# TODO: it would be nice to not have to duplicate this
+BUILD_TARGET_FUNCTIONS = [
+    'executable', 'jar', 'library', 'shared_library', 'shared_module',
+    'static_library', 'both_libraries'
+]
 
 class IntrospectionHelper(argparse.Namespace):
     # mimic an argparse namespace
@@ -64,7 +76,6 @@ class IntrospectionInterpreter(AstInterpreter):
             self.environment = env
         self.subproject_dir = subproject_dir
         self.coredata = self.environment.get_coredata()
-        self.option_file = os.path.join(self.source_root, self.subdir, 'meson_options.txt')
         self.backend = backend
         self.default_options = {OptionKey('backend'): self.backend}
         self.project_data = {}    # type: T.Dict[str, T.Any]
@@ -101,9 +112,12 @@ class IntrospectionInterpreter(AstInterpreter):
             proj_vers = 'undefined'
         self.project_data = {'descriptive_name': proj_name, 'version': proj_vers}
 
-        if os.path.exists(self.option_file):
+        optfile = os.path.join(self.source_root, self.subdir, 'meson.options')
+        if not os.path.exists(optfile):
+            optfile = os.path.join(self.source_root, self.subdir, 'meson_options.txt')
+        if os.path.exists(optfile):
             oi = optinterpreter.OptionInterpreter(self.subproject)
-            oi.process(self.option_file)
+            oi.process(optfile)
             self.coredata.update_project_options(oi.options)
 
         def_opts = self.flatten_args(kwargs.get('default_options', []))
@@ -129,8 +143,8 @@ class IntrospectionInterpreter(AstInterpreter):
         options = {k: v for k, v in self.environment.options.items() if k.is_backend()}
 
         self.coredata.set_options(options)
-        self._add_languages(proj_langs, MachineChoice.HOST)
-        self._add_languages(proj_langs, MachineChoice.BUILD)
+        self._add_languages(proj_langs, True, MachineChoice.HOST)
+        self._add_languages(proj_langs, True, MachineChoice.BUILD)
 
     def do_subproject(self, dirname: str) -> None:
         subproject_dir_abs = os.path.join(self.environment.get_source_dir(), self.subproject_dir)
@@ -145,14 +159,17 @@ class IntrospectionInterpreter(AstInterpreter):
 
     def func_add_languages(self, node: BaseNode, args: T.List[TYPE_nvar], kwargs: T.Dict[str, TYPE_nvar]) -> None:
         kwargs = self.flatten_kwargs(kwargs)
+        required = kwargs.get('required', True)
+        if isinstance(required, cdata.UserFeatureOption):
+            required = required.is_enabled()
         if 'native' in kwargs:
             native = kwargs.get('native', False)
-            self._add_languages(args, MachineChoice.BUILD if native else MachineChoice.HOST)
+            self._add_languages(args, required, MachineChoice.BUILD if native else MachineChoice.HOST)
         else:
             for for_machine in [MachineChoice.BUILD, MachineChoice.HOST]:
-                self._add_languages(args, for_machine)
+                self._add_languages(args, required, for_machine)
 
-    def _add_languages(self, raw_langs: T.List[TYPE_nvar], for_machine: MachineChoice) -> None:
+    def _add_languages(self, raw_langs: T.List[TYPE_nvar], required: bool, for_machine: MachineChoice) -> None:
         langs = []  # type: T.List[str]
         for l in self.flatten_args(raw_langs):
             if isinstance(l, str):
@@ -163,7 +180,21 @@ class IntrospectionInterpreter(AstInterpreter):
         for lang in sorted(langs, key=compilers.sort_clink):
             lang = lang.lower()
             if lang not in self.coredata.compilers[for_machine]:
-                detect_compiler_for(self.environment, lang, for_machine)
+                try:
+                    comp = detect_compiler_for(self.environment, lang, for_machine)
+                except mesonlib.MesonException:
+                    # do we even care about introspecting this language?
+                    if required:
+                        raise
+                    else:
+                        continue
+                if self.subproject:
+                    options = {}
+                    for k in comp.get_options():
+                        v = copy.copy(self.coredata.options[k])
+                        k = k.evolve(subproject=self.subproject)
+                        options[k] = v
+                    self.coredata.add_compiler_options(options, lang, for_machine, self.environment)
 
     def func_dependency(self, node: BaseNode, args: T.List[TYPE_nvar], kwargs: T.Dict[str, TYPE_nvar]) -> None:
         args = self.flatten_args(args)
@@ -230,11 +261,11 @@ class IntrospectionInterpreter(AstInterpreter):
                     continue
                 arg_nodes = arg_node.arguments.copy()
                 # Pop the first element if the function is a build target function
-                if isinstance(curr, FunctionNode) and curr.func_name in build_target_functions:
+                if isinstance(curr, FunctionNode) and curr.func_name in BUILD_TARGET_FUNCTIONS:
                     arg_nodes.pop(0)
-                elemetary_nodes = [x for x in arg_nodes if isinstance(x, (str, StringNode))]
+                elementary_nodes = [x for x in arg_nodes if isinstance(x, (str, StringNode))]
                 inqueue += [x for x in arg_nodes if isinstance(x, (FunctionNode, ArrayNode, IdNode, ArithmeticNode))]
-                if elemetary_nodes:
+                if elementary_nodes:
                     res += [curr]
             return res
 
@@ -242,14 +273,18 @@ class IntrospectionInterpreter(AstInterpreter):
         extraf_nodes = traverse_nodes(extra_queue)
 
         # Make sure nothing can crash when creating the build class
-        kwargs_reduced = {k: v for k, v in kwargs.items() if k in targetclass.known_kwargs and k in ['install', 'build_by_default', 'build_always']}
+        kwargs_reduced = {k: v for k, v in kwargs.items() if k in targetclass.known_kwargs and k in {'install', 'build_by_default', 'build_always'}}
         kwargs_reduced = {k: v.value if isinstance(v, ElementaryNode) else v for k, v in kwargs_reduced.items()}
         kwargs_reduced = {k: v for k, v in kwargs_reduced.items() if not isinstance(v, BaseNode)}
         for_machine = MachineChoice.HOST
         objects = []        # type: T.List[T.Any]
         empty_sources = []  # type: T.List[T.Any]
         # Passing the unresolved sources list causes errors
-        target = targetclass(name, self.subdir, self.subproject, for_machine, empty_sources, objects, self.environment, kwargs_reduced)
+        kwargs_reduced['_allow_no_sources'] = True
+        target = targetclass(name, self.subdir, self.subproject, for_machine, empty_sources, [], objects,
+                             self.environment, self.coredata.compilers[for_machine], kwargs_reduced)
+        target.process_compilers()
+        target.process_compilers_late([])
 
         new_target = {
             'name': target.get_basename(),

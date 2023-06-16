@@ -14,7 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This file is an entry point for all commands, including scripts. Include the
+# strict minimum python modules for performance reasons.
 import sys
+
+# Check python version before importing anything else, we might have an older
+# Python that would error on f-string syntax for example.
+if sys.version_info < (3, 7):
+    print('Meson works correctly only with python 3.7+.')
+    print('You have python {}.'.format(sys.version))
+    print('Please update your environment')
+    sys.exit(1)
+
 from pathlib import Path
 
 # If we're run uninstalled, add the script directory to sys.path to ensure that

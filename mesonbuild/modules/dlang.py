@@ -14,19 +14,22 @@
 
 # This file contains the detection logic for external dependencies that
 # are UI-related.
+from __future__ import annotations
 
 import json
 import os
 
-from . import ExtensionModule
+from . import ExtensionModule, ModuleInfo
 from .. import dependencies
 from .. import mlog
+from ..interpreterbase import typed_pos_args
 from ..mesonlib import Popen_safe, MesonException
-from ..programs import ExternalProgram
 
 class DlangModule(ExtensionModule):
     class_dubbin = None
     init_dub = False
+
+    INFO = ModuleInfo('dlang', '0.48.0')
 
     def __init__(self, interpreter):
         super().__init__(interpreter)
@@ -34,7 +37,7 @@ class DlangModule(ExtensionModule):
             'generate_dub_file': self.generate_dub_file,
         })
 
-    def _init_dub(self):
+    def _init_dub(self, state):
         if DlangModule.class_dubbin is None:
             self.dubbin = dependencies.DubDependency.class_dubbin
             DlangModule.class_dubbin = self.dubbin
@@ -42,7 +45,7 @@ class DlangModule(ExtensionModule):
             self.dubbin = DlangModule.class_dubbin
 
         if DlangModule.class_dubbin is None:
-            self.dubbin = self.check_dub()
+            self.dubbin = self.check_dub(state)
             DlangModule.class_dubbin = self.dubbin
         else:
             self.dubbin = DlangModule.class_dubbin
@@ -51,12 +54,10 @@ class DlangModule(ExtensionModule):
             if not self.dubbin:
                 raise MesonException('DUB not found.')
 
+    @typed_pos_args('dlang.generate_dub_file', str, str)
     def generate_dub_file(self, state, args, kwargs):
         if not DlangModule.init_dub:
-            self._init_dub()
-
-        if len(args) < 2:
-            raise MesonException('Missing arguments')
+            self._init_dub(state)
 
         config = {
             'name': args[0]
@@ -109,8 +110,8 @@ class DlangModule(ExtensionModule):
         p, out = Popen_safe(self.dubbin.get_command() + args, env=env)[0:2]
         return p.returncode, out.strip()
 
-    def check_dub(self):
-        dubbin = ExternalProgram('dub', silent=True)
+    def check_dub(self, state):
+        dubbin = state.find_program('dub', silent=True)
         if dubbin.found():
             try:
                 p, out = Popen_safe(dubbin.get_command() + ['--version'])[0:2]

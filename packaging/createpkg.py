@@ -22,8 +22,6 @@ import xml.etree.ElementTree as ET
 sys.path.append(os.getcwd())
 from mesonbuild import coredata
 
-from createmsi import get_modules
-
 class PkgGenerator:
 
     def __init__(self):
@@ -46,10 +44,9 @@ class PkgGenerator:
         pyinstaller_bin = '/Users/jpakkane/Library/Python/3.8/bin/pyinstaller'
         pyinst_cmd = [pyinstaller_bin,
                       '--clean',
+                      '--additional-hooks-dir=packaging',
                       '--distpath',
                       self.pkg_dir]
-        for m in get_modules():
-            pyinst_cmd += ['--hidden-import', m]
         pyinst_cmd += ['meson.py']
         subprocess.check_call(pyinst_cmd)
         tmpdir = os.path.join(self.pkg_dir, 'meson')
@@ -88,7 +85,7 @@ class PkgGenerator:
         ET.SubElement(root, 'pkg-ref', {'id': self.identifier})
         ET.SubElement(root, 'options', {'customize': 'never',
                                         'require-scripts': 'false',
-                                        'hostArhcitectures': 'x86_64,arm64'})
+                                        'hostArchitectures': 'x86_64,arm64'})
         choices_outline = ET.SubElement(root, 'choices-outline')
         line = ET.SubElement(choices_outline, 'line', {'choice': 'default'})
         ET.SubElement(line, 'line', {'choice': self.identifier})

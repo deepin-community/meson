@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 from .base import ExternalDependency, DependencyException, DependencyMethods, NotFoundDependency
 from .cmake import CMakeDependency
@@ -27,17 +28,15 @@ if T.TYPE_CHECKING:
     from ..environment import Environment
     from .factory import DependencyFactory, WrappedFactoryFunc, DependencyGenerator
 
+    TV_DepIDEntry = T.Union[str, bool, int, T.Tuple[str, ...]]
+    TV_DepID = T.Tuple[T.Tuple[str, TV_DepIDEntry], ...]
+
 # These must be defined in this file to avoid cyclical references.
 packages: T.Dict[
     str,
     T.Union[T.Type[ExternalDependency], 'DependencyFactory', 'WrappedFactoryFunc']
 ] = {}
 _packages_accept_language: T.Set[str] = set()
-
-if T.TYPE_CHECKING:
-    TV_DepIDEntry = T.Union[str, bool, int, T.Tuple[str, ...]]
-    TV_DepID = T.Tuple[T.Tuple[str, TV_DepIDEntry], ...]
-
 
 def get_dep_identifier(name: str, kwargs: T.Dict[str, T.Any]) -> 'TV_DepID':
     identifier: 'TV_DepID' = (('name', name), )
@@ -54,17 +53,17 @@ def get_dep_identifier(name: str, kwargs: T.Dict[str, T.Any]) -> 'TV_DepID':
         # 'default_options' is only used in fallback case
         # 'not_found_message' has no impact on the dependency lookup
         # 'include_type' is handled after the dependency lookup
-        if key in ('version', 'native', 'required', 'fallback', 'allow_fallback', 'default_options',
-                   'not_found_message', 'include_type'):
+        if key in {'version', 'native', 'required', 'fallback', 'allow_fallback', 'default_options',
+                   'not_found_message', 'include_type'}:
             continue
         # All keyword arguments are strings, ints, or lists (or lists of lists)
         if isinstance(value, list):
-            value = frozenset(listify(value))
             for i in value:
                 assert isinstance(i, str)
+            value = tuple(frozenset(listify(value)))
         else:
             assert isinstance(value, (str, bool, int))
-        identifier += (key, value)
+        identifier = (*identifier, (key, value),)
     return identifier
 
 display_name_map = {
@@ -105,7 +104,7 @@ def find_external_dependency(name: str, env: 'Environment', kwargs: T.Dict[str, 
     candidates = _build_external_dependency_list(name, env, for_machine, kwargs)
 
     pkg_exc: T.List[DependencyException] = []
-    pkgdep:  T.List[ExternalDependency]  = []
+    pkgdep:  T.List[ExternalDependency] = []
     details = ''
 
     for c in candidates:
@@ -115,8 +114,11 @@ def find_external_dependency(name: str, env: 'Environment', kwargs: T.Dict[str, 
             d._check_version()
             pkgdep.append(d)
         except DependencyException as e:
+            assert isinstance(c, functools.partial), 'for mypy'
+            bettermsg = f'Dependency lookup for {name} with method {c.func.log_tried()!r} failed: {e}'
+            mlog.debug(bettermsg)
+            e.args = (bettermsg,)
             pkg_exc.append(e)
-            mlog.debug(str(e))
         else:
             pkg_exc.append(None)
             details = d.log_details()
@@ -159,10 +161,10 @@ def find_external_dependency(name: str, env: 'Environment', kwargs: T.Dict[str, 
 
         # we have a list of failed ExternalDependency objects, so we can report
         # the methods we tried to find the dependency
-        raise DependencyException('Dependency "%s" not found' % (name) +
-                                  (', tried %s' % (tried) if tried else ''))
+        raise DependencyException(f'Dependency "{name}" not found' +
+                                  (f', tried {tried}' if tried else ''))
 
-    return NotFoundDependency(env)
+    return NotFoundDependency(name, env)
 
 
 def _build_external_dependency_list(name: str, env: 'Environment', for_machine: MachineChoice,
@@ -178,13 +180,12 @@ def _build_external_dependency_list(name: str, env: 'Environment', for_machine: 
         # class method, if one exists, otherwise the list just consists of the
         # constructor
         if isinstance(packages[lname], type):
-            entry1 = T.cast(T.Type[ExternalDependency], packages[lname])  # mypy doesn't understand isinstance(..., type)
+            entry1 = T.cast('T.Type[ExternalDependency]', packages[lname])  # mypy doesn't understand isinstance(..., type)
             if issubclass(entry1, ExternalDependency):
-                # TODO: somehow make mypy understand that entry1(env, kwargs) is OK...
-                func: T.Callable[[], 'ExternalDependency'] = lambda: entry1(env, kwargs)  # type: ignore
+                func: T.Callable[[], 'ExternalDependency'] = functools.partial(entry1, env, kwargs)
                 dep = [func]
         else:
-            entry2 = T.cast(T.Union['DependencyFactory', 'WrappedFactoryFunc'], packages[lname])
+            entry2 = T.cast('T.Union[DependencyFactory, WrappedFactoryFunc]', packages[lname])
             dep = entry2(env, for_machine, kwargs)
         return dep
 

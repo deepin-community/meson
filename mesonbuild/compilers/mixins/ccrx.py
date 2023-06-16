@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 """Representations specific to the Renesas CC-RX compiler family."""
 
@@ -20,6 +21,7 @@ import typing as T
 from ...mesonlib import EnvironmentException
 
 if T.TYPE_CHECKING:
+    from ...envconfig import MachineInfo
     from ...environment import Environment
     from ...compilers.compilers import Compiler
 else:
@@ -59,17 +61,19 @@ class CcrxCompiler(Compiler):
         is_cross = True
         can_compile_suffixes = set()  # type: T.Set[str]
 
+    id = 'ccrx'
+
     def __init__(self) -> None:
         if not self.is_cross:
             raise EnvironmentException('ccrx supports only cross-compilation.')
-        self.id = 'ccrx'
         # Assembly
         self.can_compile_suffixes.add('src')
         default_warn_args = []  # type: T.List[str]
         self.warn_args = {'0': [],
                           '1': default_warn_args,
                           '2': default_warn_args + [],
-                          '3': default_warn_args + []}  # type: T.Dict[str, T.List[str]]
+                          '3': default_warn_args + [],
+                          'everything': default_warn_args + []}  # type: T.Dict[str, T.List[str]]
 
     def get_pic_args(self) -> T.List[str]:
         # PIC support is not enabled by default for CCRX,
@@ -104,7 +108,7 @@ class CcrxCompiler(Compiler):
         return ccrx_debug_args[is_debug]
 
     @classmethod
-    def unix_args_to_native(cls, args: T.List[str]) -> T.List[str]:
+    def _unix_args_to_native(cls, args: T.List[str], info: MachineInfo) -> T.List[str]:
         result = []
         for i in args:
             if i.startswith('-D'):

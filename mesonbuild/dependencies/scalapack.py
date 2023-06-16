@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 from pathlib import Path
 import functools
 import os
 import typing as T
 
+from ..mesonlib import OptionKey
 from .base import DependencyMethods
 from .base import DependencyException
 from .cmake import CMakeDependency
@@ -35,7 +37,8 @@ def scalapack_factory(env: 'Environment', for_machine: 'MachineChoice',
     candidates: T.List['DependencyGenerator'] = []
 
     if DependencyMethods.PKGCONFIG in methods:
-        mkl = 'mkl-static-lp64-iomp' if kwargs.get('static', False) else 'mkl-dynamic-lp64-iomp'
+        static_opt = kwargs.get('static', env.coredata.get_option(OptionKey('prefer_static')))
+        mkl = 'mkl-static-lp64-iomp' if static_opt else 'mkl-dynamic-lp64-iomp'
         candidates.append(functools.partial(
             MKLPkgConfigDependency, mkl, env, kwargs))
 

@@ -11,16 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 import codecs
-import textwrap
-import types
+import os
 import typing as T
 from .mesonlib import MesonException
 from . import mlog
 
 if T.TYPE_CHECKING:
+    from typing_extensions import Literal
+
     from .ast import AstVisitor
 
 # This is the regex for the supported escape sequences of a regular string
@@ -34,25 +37,20 @@ ESCAPE_SEQUENCE_SINGLE_RE = re.compile(r'''
     | \\[\\'abfnrtv]      # Single-character escapes
     )''', re.UNICODE | re.VERBOSE)
 
-class MesonUnicodeDecodeError(MesonException):
-    def __init__(self, match: str) -> None:
-        super().__init__(match)
-        self.match = match
-
 def decode_match(match: T.Match[str]) -> str:
-    try:
-        return codecs.decode(match.group(0).encode(), 'unicode_escape')
-    except UnicodeDecodeError:
-        raise MesonUnicodeDecodeError(match.group(0))
+    return codecs.decode(match.group(0).encode(), 'unicode_escape')
 
 class ParseException(MesonException):
+
+    ast: T.Optional[CodeBlockNode] = None
+
     def __init__(self, text: str, line: str, lineno: int, colno: int) -> None:
         # Format as error message, followed by the line with the error, followed by a caret to show the error column.
-        super().__init__("{}\n{}\n{}".format(text, line, '{}^'.format(' ' * colno)))
+        super().__init__(mlog.code_line(text, line, colno))
         self.lineno = lineno
         self.colno = colno
 
-class BlockParseException(MesonException):
+class BlockParseException(ParseException):
     def __init__(
                 self,
                 text: str,
@@ -72,7 +70,7 @@ class BlockParseException(MesonException):
             # Followed by a caret to show the block start
             # Followed by underscores
             # Followed by a caret to show the block end.
-            super().__init__("{}\n{}\n{}".format(text, line, '{}^{}^'.format(' ' * start_colno, '_' * (colno - start_colno - 1))))
+            MesonException.__init__(self, "{}\n{}\n{}".format(text, line, '{}^{}^'.format(' ' * start_colno, '_' * (colno - start_colno - 1))))
         else:
             # If block start and end are on different lines, it is formatted as:
             # Error message
@@ -81,21 +79,21 @@ class BlockParseException(MesonException):
             # Followed by a message saying where the block started.
             # Followed by the line of the block start.
             # Followed by a caret for the block start.
-            super().__init__("%s\n%s\n%s\nFor a block that started at %d,%d\n%s\n%s" % (text, line, '%s^' % (' ' * colno), start_lineno, start_colno, start_line, "%s^" % (' ' * start_colno)))
+            MesonException.__init__(self, "%s\n%s\n%s\nFor a block that started at %d,%d\n%s\n%s" % (text, line, '%s^' % (' ' * colno), start_lineno, start_colno, start_line, "%s^" % (' ' * start_colno)))
         self.lineno = lineno
         self.colno = colno
 
 TV_TokenTypes = T.TypeVar('TV_TokenTypes', int, str, bool)
 
+@dataclass(eq=False)
 class Token(T.Generic[TV_TokenTypes]):
-    def __init__(self, tid: str, filename: str, line_start: int, lineno: int, colno: int, bytespan: T.Tuple[int, int], value: TV_TokenTypes):
-        self.tid = tid                # type: str
-        self.filename = filename      # type: str
-        self.line_start = line_start  # type: int
-        self.lineno = lineno          # type: int
-        self.colno = colno            # type: int
-        self.bytespan = bytespan      # type: T.Tuple[int, int]
-        self.value = value            # type: TV_TokenTypes
+    tid: str
+    filename: str
+    line_start: int
+    lineno: int
+    colno: int
+    bytespan: T.Tuple[int, int]
+    value: TV_TokenTypes
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, str):
@@ -111,9 +109,13 @@ class Lexer:
                          'endif', 'and', 'or', 'not', 'foreach', 'endforeach',
                          'in', 'continue', 'break'}
         self.future_keywords = {'return'}
+        self.in_unit_test = 'MESON_RUNNING_IN_PROJECT_TESTS' in os.environ
+        if self.in_unit_test:
+            self.keywords.update({'testcase', 'endtestcase'})
         self.token_specification = [
             # Need to be sorted longest to shortest.
             ('ignore', re.compile(r'[ \t]')),
+            ('multiline_fstring', re.compile(r"f'''(.|\n)*?'''", re.M)),
             ('fstring', re.compile(r"f'([^'\\]|(\\.))*'")),
             ('id', re.compile('[_a-zA-Z][_0-9a-zA-Z]*')),
             ('number', re.compile(r'0[bB][01]+|0[oO][0-7]+|0[xX][0-9a-fA-F]+|0|[1-9]\d*')),
@@ -174,7 +176,7 @@ class Lexer:
                     span_end = loc
                     bytespan = (span_start, span_end)
                     match_text = mo.group()
-                    if tid == 'ignore' or tid == 'comment':
+                    if tid in {'ignore', 'comment'}:
                         break
                     elif tid == 'lparen':
                         par_count += 1
@@ -193,22 +195,23 @@ class Lexer:
                     elif tid in {'string', 'fstring'}:
                         # Handle here and not on the regexp to give a better error message.
                         if match_text.find("\n") != -1:
-                            mlog.warning(textwrap.dedent("""\
-                                    Newline character in a string detected, use ''' (three single quotes) for multiline strings instead.
-                                    This will become a hard error in a future Meson release.\
-                                """),
-                                self.getline(line_start),
-                                str(lineno),
-                                str(col)
-                            )
+                            msg = ("Newline character in a string detected, use ''' (three single quotes) "
+                                   "for multiline strings instead.\n"
+                                   "This will become a hard error in a future Meson release.")
+                            mlog.warning(mlog.code_line(msg, self.getline(line_start), col), location=BaseNode(lineno, col, filename))
                         value = match_text[2 if tid == 'fstring' else 1:-1]
-                        try:
-                            value = ESCAPE_SEQUENCE_SINGLE_RE.sub(decode_match, value)
-                        except MesonUnicodeDecodeError as err:
-                            raise MesonException(f"Failed to parse escape sequence: '{err.match}' in string:\n  {match_text}")
-                    elif tid == 'multiline_string':
-                        tid = 'string'
-                        value = match_text[3:-3]
+                        value = ESCAPE_SEQUENCE_SINGLE_RE.sub(decode_match, value)
+                    elif tid in {'multiline_string', 'multiline_fstring'}:
+                        # For multiline strings, parse out the value and pass
+                        # through the normal string logic.
+                        # For multiline format strings, we have to emit a
+                        # different AST node so we can add a feature check,
+                        # but otherwise, it follows the normal fstring logic.
+                        if tid == 'multiline_string':
+                            value = match_text[3:-3]
+                            tid = 'string'
+                        else:
+                            value = match_text[4:-3]
                         lines = match_text.split('\n')
                         if len(lines) > 1:
                             lineno += len(lines) - 1
@@ -230,20 +233,26 @@ class Lexer:
                         else:
                             if match_text in self.future_keywords:
                                 mlog.warning(f"Identifier '{match_text}' will become a reserved keyword in a future release. Please rename it.",
-                                             location=types.SimpleNamespace(filename=filename, lineno=lineno))
+                                             location=BaseNode(lineno, col, filename))
                             value = match_text
                     yield Token(tid, filename, curline_start, curline, col, bytespan, value)
                     break
             if not matched:
                 raise ParseException('lexer', self.getline(line_start), lineno, col)
 
+@dataclass(eq=False)
 class BaseNode:
-    def __init__(self, lineno: int, colno: int, filename: str, end_lineno: T.Optional[int] = None, end_colno: T.Optional[int] = None):
-        self.lineno = lineno      # type: int
-        self.colno = colno        # type: int
-        self.filename = filename  # type: str
-        self.end_lineno = end_lineno if end_lineno is not None else self.lineno
-        self.end_colno = end_colno if end_colno is not None else self.colno
+    lineno: int
+    colno: int
+    filename: str
+    end_lineno: T.Optional[int] = None
+    end_colno: T.Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.end_lineno is None:
+            self.end_lineno = self.lineno
+        if self.end_colno is None:
+            self.end_colno = self.colno
 
         # Attributes for the visitors
         self.level = 0            # type: int
@@ -295,7 +304,11 @@ class FormatStringNode(ElementaryNode[str]):
         assert isinstance(self.value, str)
 
     def __str__(self) -> str:
-        return "Format string node: '{self.value}' ({self.lineno}, {self.colno})."
+        return f"Format string node: '{self.value}' ({self.lineno}, {self.colno})."
+
+class MultilineFormatStringNode(FormatStringNode):
+    def __str__(self) -> str:
+        return f"Multiline Format string node: '{self.value}' ({self.lineno}, {self.colno})."
 
 class ContinueNode(ElementaryNode):
     pass
@@ -372,11 +385,11 @@ class AndNode(BaseNode):
         self.right = right  # type: BaseNode
 
 class ComparisonNode(BaseNode):
-    def __init__(self, ctype: str, left: BaseNode, right: BaseNode):
+    def __init__(self, ctype: COMPARISONS, left: BaseNode, right: BaseNode):
         super().__init__(left.lineno, left.colno, left.filename)
         self.left = left    # type: BaseNode
         self.right = right  # type: BaseNode
-        self.ctype = ctype  # type: str
+        self.ctype = ctype
 
 class ArithmeticNode(BaseNode):
     def __init__(self, operation: str, left: BaseNode, right: BaseNode):
@@ -449,6 +462,12 @@ class IfClauseNode(BaseNode):
         self.ifs = []          # type: T.List[IfNode]
         self.elseblock = None  # type: T.Union[EmptyNode, CodeBlockNode]
 
+class TestCaseClauseNode(BaseNode):
+    def __init__(self, condition: BaseNode, block: CodeBlockNode):
+        super().__init__(condition.lineno, condition.colno, condition.filename)
+        self.condition = condition
+        self.block = block
+
 class UMinusNode(BaseNode):
     def __init__(self, current_location: Token, value: BaseNode):
         super().__init__(current_location.lineno, current_location.colno, current_location.filename)
@@ -461,15 +480,19 @@ class TernaryNode(BaseNode):
         self.trueblock = trueblock    # type: BaseNode
         self.falseblock = falseblock  # type: BaseNode
 
-comparison_map = {'equal': '==',
-                  'nequal': '!=',
-                  'lt': '<',
-                  'le': '<=',
-                  'gt': '>',
-                  'ge': '>=',
-                  'in': 'in',
-                  'notin': 'not in',
-                  }
+if T.TYPE_CHECKING:
+    COMPARISONS = Literal['==', '!=', '<', '<=', '>=', '>', 'in', 'notin']
+
+comparison_map: T.Mapping[str, COMPARISONS] = {
+    'equal': '==',
+    'nequal': '!=',
+    'lt': '<',
+    'le': '<=',
+    'gt': '>',
+    'ge': '>=',
+    'in': 'in',
+    'not in': 'notin',
+}
 
 # Recursive descent parser for Meson's definition language.
 # Very basic apart from the fact that we have many precedence
@@ -509,7 +532,7 @@ class Parser:
             return True
         return False
 
-    def accept_any(self, tids: T.Sequence[str]) -> str:
+    def accept_any(self, tids: T.Tuple[str, ...]) -> str:
         tid = self.current.tid
         if tid in tids:
             self.getsym()
@@ -528,7 +551,11 @@ class Parser:
 
     def parse(self) -> CodeBlockNode:
         block = self.codeblock()
-        self.expect('eof')
+        try:
+            self.expect('eof')
+        except ParseException as e:
+            e.ast = block
+            raise
         return block
 
     def statement(self) -> BaseNode:
@@ -682,6 +709,8 @@ class Parser:
             return StringNode(t)
         if self.accept('fstring'):
             return FormatStringNode(t)
+        if self.accept('multiline_fstring'):
+            return MultilineFormatStringNode(t)
         return EmptyNode(self.current.lineno, self.current.colno, self.current.filename)
 
     def key_values(self) -> ArgumentNode:
@@ -785,6 +814,12 @@ class Parser:
             return self.codeblock()
         return EmptyNode(self.current.lineno, self.current.colno, self.current.filename)
 
+    def testcaseblock(self) -> TestCaseClauseNode:
+        condition = self.statement()
+        self.expect('eol')
+        block = self.codeblock()
+        return TestCaseClauseNode(condition, block)
+
     def line(self) -> BaseNode:
         block_start = self.current
         if self.current == 'eol':
@@ -801,14 +836,22 @@ class Parser:
             return ContinueNode(self.current)
         if self.accept('break'):
             return BreakNode(self.current)
+        if self.lexer.in_unit_test and self.accept('testcase'):
+            block = self.testcaseblock()
+            self.block_expect('endtestcase', block_start)
+            return block
         return self.statement()
 
     def codeblock(self) -> CodeBlockNode:
         block = CodeBlockNode(self.current)
         cond = True
-        while cond:
-            curline = self.line()
-            if not isinstance(curline, EmptyNode):
-                block.lines.append(curline)
-            cond = self.accept('eol')
+        try:
+            while cond:
+                curline = self.line()
+                if not isinstance(curline, EmptyNode):
+                    block.lines.append(curline)
+                cond = self.accept('eol')
+        except ParseException as e:
+            e.ast = block
+            raise
         return block

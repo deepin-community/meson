@@ -13,15 +13,16 @@
 # limitations under the License.
 
 # This file contains the detection logic for miscellaneous external dependencies.
+from __future__ import annotations
 
 import functools
 import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
-from ..mesonlib import OrderedSet, join_args
+from ..mesonlib import Popen_safe, OrderedSet, join_args
+from ..programs import ExternalProgram
 from .base import DependencyException, DependencyMethods
 from .configtool import ConfigToolDependency
 from .pkgconfig import PkgConfigDependency
@@ -51,7 +52,7 @@ class HDF5PkgConfigDependency(PkgConfigDependency):
         newinc = []  # type: T.List[str]
         for arg in self.compile_args:
             if arg.startswith('-I'):
-                stem = 'static' if kwargs.get('static', False) else 'shared'
+                stem = 'static' if self.static else 'shared'
                 if (Path(arg[2:]) / stem).is_dir():
                     newinc.append('-I' + str(Path(arg[2:]) / stem))
         self.compile_args += newinc
@@ -96,13 +97,13 @@ class HDF5ConfigToolDependency(ConfigToolDependency):
 
         if language == 'c':
             cenv = 'CC'
-            tools = ['h5cc']
+            tools = ['h5cc', 'h5pcc']
         elif language == 'cpp':
             cenv = 'CXX'
-            tools = ['h5c++']
+            tools = ['h5c++', 'h5pc++']
         elif language == 'fortran':
             cenv = 'FC'
-            tools = ['h5fc']
+            tools = ['h5fc', 'h5pfc']
         else:
             raise DependencyException('How did you get here?')
 
@@ -129,7 +130,7 @@ class HDF5ConfigToolDependency(ConfigToolDependency):
         # We first need to call the tool with -c to get the compile arguments
         # and then without -c to get the link arguments.
         args = self.get_config_value(['-show', '-c'], 'args')[1:]
-        args += self.get_config_value(['-show', '-noshlib' if kwargs.get('static', False) else '-shlib'], 'args')[1:]
+        args += self.get_config_value(['-show', '-noshlib' if self.static else '-shlib'], 'args')[1:]
         for arg in args:
             if arg.startswith(('-I', '-f', '-D')) or arg == '-pthread':
                 self.compile_args.append(arg)
@@ -159,14 +160,14 @@ def hdf5_factory(env: 'Environment', for_machine: 'MachineChoice',
     if DependencyMethods.PKGCONFIG in methods:
         # Use an ordered set so that these remain the first tried pkg-config files
         pkgconfig_files = OrderedSet(['hdf5', 'hdf5-serial'])
-        # FIXME: This won't honor pkg-config paths, and cross-native files
-        PCEXE = shutil.which('pkg-config')
+        PCEXE = PkgConfigDependency._detect_pkgbin(False, env, for_machine)
+        pcenv = PkgConfigDependency.setup_env(os.environ, env, for_machine)
         if PCEXE:
+            assert isinstance(PCEXE, ExternalProgram)
             # some distros put hdf5-1.2.3.pc with version number in .pc filename.
-            ret = subprocess.run([PCEXE, '--list-all'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    universal_newlines=True)
+            ret, stdout, _ = Popen_safe(PCEXE.get_command() + ['--list-all'], stderr=subprocess.DEVNULL, env=pcenv)
             if ret.returncode == 0:
-                for pkg in ret.stdout.split('\n'):
+                for pkg in stdout.split('\n'):
                     if pkg.startswith('hdf5'):
                         pkgconfig_files.add(pkg.split(' ', 1)[0])
 

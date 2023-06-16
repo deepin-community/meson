@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 """Abstractions for the PGI family of compilers."""
 
@@ -43,16 +44,19 @@ pgi_buildtype_args = {
 
 class PGICompiler(Compiler):
 
+    id = 'pgi'
+
     def __init__(self) -> None:
         self.base_options = {OptionKey('b_pch')}
-        self.id = 'pgi'
 
         default_warn_args = ['-Minform=inform']
-        self.warn_args = {'0': [],
-                          '1': default_warn_args,
-                          '2': default_warn_args,
-                          '3': default_warn_args
-        }  # type: T.Dict[str, T.List[str]]
+        self.warn_args: T.Dict[str, T.List[str]] = {
+            '0': [],
+            '1': default_warn_args,
+            '2': default_warn_args,
+            '3': default_warn_args,
+            'everything': default_warn_args
+        }
 
     def get_module_incdir_args(self) -> T.Tuple[str]:
         return ('-module', )

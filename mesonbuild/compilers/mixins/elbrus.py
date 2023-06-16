@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 """Abstractions for the Elbrus family of compilers."""
 
@@ -32,22 +33,24 @@ class ElbrusCompiler(GnuLikeCompiler):
     # Elbrus compiler is nearly like GCC, but does not support
     # PCH, LTO, sanitizers and color output as of version 1.21.x.
 
+    id = 'lcc'
+
     def __init__(self) -> None:
         super().__init__()
-        self.id = 'lcc'
         self.base_options = {OptionKey(o) for o in ['b_pgo', 'b_coverage', 'b_ndebug', 'b_staticpic', 'b_lundef', 'b_asneeded']}
         default_warn_args = ['-Wall']
         self.warn_args = {'0': [],
                           '1': default_warn_args,
                           '2': default_warn_args + ['-Wextra'],
-                          '3': default_warn_args + ['-Wextra', '-Wpedantic']}
+                          '3': default_warn_args + ['-Wextra', '-Wpedantic'],
+                          'everything': default_warn_args + ['-Wextra', '-Wpedantic']}
 
     # FIXME: use _build_wrapper to call this so that linker flags from the env
     # get applied
     def get_library_dirs(self, env: 'Environment', elf_class: T.Optional[int] = None) -> T.List[str]:
         os_env = os.environ.copy()
         os_env['LC_ALL'] = 'C'
-        stdo = Popen_safe(self.exelist + ['--print-search-dirs'], env=os_env)[1]
+        stdo = Popen_safe(self.get_exelist(ccache=False) + ['--print-search-dirs'], env=os_env)[1]
         for line in stdo.split('\n'):
             if line.startswith('libraries:'):
                 # lcc does not include '=' in --print-search-dirs output. Also it could show nonexistent dirs.
@@ -58,7 +61,7 @@ class ElbrusCompiler(GnuLikeCompiler):
     def get_program_dirs(self, env: 'Environment') -> T.List[str]:
         os_env = os.environ.copy()
         os_env['LC_ALL'] = 'C'
-        stdo = Popen_safe(self.exelist + ['--print-search-dirs'], env=os_env)[1]
+        stdo = Popen_safe(self.get_exelist(ccache=False) + ['--print-search-dirs'], env=os_env)[1]
         for line in stdo.split('\n'):
             if line.startswith('programs:'):
                 # lcc does not include '=' in --print-search-dirs output.
@@ -69,7 +72,7 @@ class ElbrusCompiler(GnuLikeCompiler):
     def get_default_include_dirs(self) -> T.List[str]:
         os_env = os.environ.copy()
         os_env['LC_ALL'] = 'C'
-        p = subprocess.Popen(self.exelist + ['-xc', '-E', '-v', '-'], env=os_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(self.get_exelist(ccache=False) + ['-xc', '-E', '-v', '-'], env=os_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stderr = p.stderr.read().decode('utf-8', errors='replace')
         includes = []
         for line in stderr.split('\n'):

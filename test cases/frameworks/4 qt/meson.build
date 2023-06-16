@@ -1,6 +1,6 @@
-project('qt4 and 5 build test', 'cpp',
-  # Qt5 now requires C++ 11 support
-  default_options : ['cpp_std=c++11'])
+project('qt4, qt5, and qt6 build test', 'cpp',
+  # Qt6 requires C++ 17 support
+  default_options : ['cpp_std=c++17'])
 
 qt5_modules = ['Widgets']
 qt6_modules = ['Widgets']
@@ -65,7 +65,7 @@ foreach qt : ['qt4', 'qt5', 'qt6']
     extra_cpp_args = []
     if meson.is_unity()
       extra_cpp_args += '-DUNITY_BUILD'
-      prep_rcc = qtmodule.preprocess(qt + '_unity_ressource', qresources : ['stuff.qrc', 'stuff2.qrc'], method : get_option('method'))
+      prep_rcc = qtmodule.preprocess(qt + '_unity_resource', qresources : ['stuff.qrc', 'stuff2.qrc'], method : get_option('method'))
     else
       prep_rcc = qtmodule.preprocess(qresources : ['stuff.qrc', 'stuff2.qrc'], method : get_option('method'))
     endif
@@ -83,7 +83,7 @@ foreach qt : ['qt4', 'qt5', 'qt6']
 
     translations_cpp = qtmodule.compile_translations(qresource: qt+'_lang.qrc')
     # unity builds suck and definitely cannot handle two qrc embeds in one compilation unit
-    unityproof_translations = static_library(qt+'unityproof_translations', translations_cpp)
+    unityproof_translations = static_library(qt+'unityproof_translations', translations_cpp, dependencies: qtdep)
 
     extra_cpp_args += '-DQT="@0@"'.format(qt)
     qexe = executable(qt + 'app',
@@ -152,7 +152,8 @@ foreach qt : ['qt4', 'qt5', 'qt6']
     endif
 
     # Check we can apply a version constraint
-    dependency(qt, modules: qt_modules, version: '>=@0@'.format(qtdep.version()), method : get_option('method'))
+    accept_versions = ['>=@0@'.format(qtdep.version()), '<@0@'.format(qtdep.version()[0].to_int() + 1)]
+    dependency(qt, modules: qt_modules, version: accept_versions, method : get_option('method'))
 
   endif
 endforeach

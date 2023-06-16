@@ -14,6 +14,8 @@
 
 # This file contains the detection logic for external dependencies that
 # are UI-related.
+from __future__ import annotations
+
 import os
 import subprocess
 import typing as T
@@ -43,15 +45,20 @@ class GLDependencySystem(SystemDependency):
             self.link_args = ['-framework', 'OpenGL']
             # FIXME: Detect version using self.clib_compiler
             return
-        if self.env.machines[self.for_machine].is_windows():
+        elif self.env.machines[self.for_machine].is_windows():
             self.is_found = True
             # FIXME: Use self.clib_compiler.find_library()
             self.link_args = ['-lopengl32']
             # FIXME: Detect version using self.clib_compiler
             return
-
-    def log_tried(self) -> str:
-        return 'system'
+        else:
+            links = self.clib_compiler.find_library('GL', environment, [])
+            has_header = self.clib_compiler.has_header('GL/gl.h', '', environment)[0]
+            if links and has_header:
+                self.is_found = True
+                self.link_args = links
+            elif links:
+                raise DependencyException('Found GL runtime library but no development header files')
 
 class GnuStepDependency(ConfigToolDependency):
 
@@ -145,7 +152,7 @@ class SDL2DependencyConfigTool(ConfigToolDependency):
 
 class WxDependency(ConfigToolDependency):
 
-    tools = ['wx-config-3.0', 'wx-config', 'wx-config-gtk3']
+    tools = ['wx-config-3.0', 'wx-config-3.1', 'wx-config', 'wx-config-gtk3']
     tool_name = 'wx-config'
 
     def __init__(self, environment: 'Environment', kwargs: T.Dict[str, T.Any]):
@@ -236,9 +243,6 @@ class VulkanDependencySystem(SystemDependency):
                 for lib in libs:
                     self.link_args.append(lib)
                 return
-
-    def log_tried(self) -> str:
-        return 'system'
 
 gl_factory = DependencyFactory(
     'gl',

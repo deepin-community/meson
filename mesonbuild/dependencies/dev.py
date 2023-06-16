@@ -15,18 +15,23 @@
 # This file contains the detection logic for external dependencies useful for
 # development purposes, such as testing, debugging, etc..
 
+from __future__ import annotations
+
 import glob
 import os
 import re
 import pathlib
 import shutil
+import subprocess
 import typing as T
+import functools
+
+from mesonbuild.interpreterbase.decorators import FeatureDeprecated
 
 from .. import mesonlib, mlog
-from ..compilers import AppleClangCCompiler, AppleClangCPPCompiler, detect_compiler_for
 from ..environment import get_llvm_tool_names
-from ..mesonlib import version_compare, stringlistify, extract_as_list, MachineChoice
-from .base import DependencyException, DependencyMethods, strip_system_libdirs, SystemDependency
+from ..mesonlib import version_compare, version_compare_many, search_version, stringlistify, extract_as_list
+from .base import DependencyException, DependencyMethods, detect_compiler, strip_system_libdirs, SystemDependency, ExternalDependency, DependencyTypeName
 from .cmake import CMakeDependency
 from .configtool import ConfigToolDependency
 from .factory import DependencyFactory
@@ -35,7 +40,15 @@ from .pkgconfig import PkgConfigDependency
 
 if T.TYPE_CHECKING:
     from ..envconfig import MachineInfo
-    from .. environment import Environment
+    from ..environment import Environment
+    from ..mesonlib import MachineChoice
+    from typing_extensions import TypedDict
+
+    class JNISystemDependencyKW(TypedDict):
+        modules: T.List[str]
+        # FIXME: When dependency() moves to typed Kwargs, this should inherit
+        # from its TypedDict type.
+        version: T.Optional[str]
 
 
 def get_shared_library_suffix(environment: 'Environment', for_machine: MachineChoice) -> str:
@@ -102,9 +115,6 @@ class GTestDependencySystem(SystemDependency):
             return 'prebuilt'
         else:
             return 'building self'
-
-    def log_tried(self) -> str:
-        return 'system'
 
 
 class GTestDependencyPC(PkgConfigDependency):
@@ -173,9 +183,6 @@ class GMockDependencySystem(SystemDependency):
             return 'prebuilt'
         else:
             return 'building self'
-
-    def log_tried(self) -> str:
-        return 'system'
 
 
 class GMockDependencyPC(PkgConfigDependency):
@@ -392,16 +399,35 @@ class LLVMDependencyCMake(CMakeDependency):
     def __init__(self, name: str, env: 'Environment', kwargs: T.Dict[str, T.Any]) -> None:
         self.llvm_modules = stringlistify(extract_as_list(kwargs, 'modules'))
         self.llvm_opt_modules = stringlistify(extract_as_list(kwargs, 'optional_modules'))
-        super().__init__(name, env, kwargs, language='cpp')
 
-        # Cmake will always create a statically linked binary, so don't use
-        # cmake if dynamic is required
-        if not self.static:
-            self.is_found = False
-            mlog.warning('Ignoring LLVM CMake dependency because dynamic was requested')
+        compilers = None
+        if kwargs.get('native', False):
+            compilers = env.coredata.compilers.build
+        else:
+            compilers = env.coredata.compilers.host
+        if not compilers or not all(x in compilers for x in ('c', 'cpp')):
+            # Initialize basic variables
+            ExternalDependency.__init__(self, DependencyTypeName('cmake'), env, kwargs)
+
+            # Initialize CMake specific variables
+            self.found_modules: T.List[str] = []
+            self.name = name
+
+            # Warn and return
+            mlog.warning('The LLVM dependency was not found via CMake since both a C and C++ compiler are required.')
             return
 
+        super().__init__(name, env, kwargs, language='cpp', force_use_global_compilers=True)
+
         if self.traceparser is None:
+            return
+
+        if not self.is_found:
+            return
+
+        #CMake will return not found due to not defined LLVM_DYLIB_COMPONENTS
+        if not self.static and version_compare(self.version, '< 7.0') and self.llvm_modules:
+            mlog.warning('Before version 7.0 cmake does not export modules for dynamic linking, cannot check required modules')
             return
 
         # Extract extra include directories and definitions
@@ -420,8 +446,33 @@ class LLVMDependencyCMake(CMakeDependency):
         # Use a custom CMakeLists.txt for LLVM
         return 'CMakeListsLLVM.txt'
 
+    # Check version in CMake to return exact version as config tool (latest allowed)
+    # It is safe to add .0 to latest argument, it will discarded if we use search_version
+    def llvm_cmake_versions(self) -> T.List[str]:
+
+        def ver_from_suf(req: str) -> str:
+            return search_version(req.strip('-')+'.0')
+
+        def version_sorter(a: str, b: str) -> int:
+            if version_compare(a, "="+b):
+                return 0
+            if version_compare(a, "<"+b):
+                return 1
+            return -1
+
+        llvm_requested_versions = [ver_from_suf(x) for x in get_llvm_tool_names('') if version_compare(ver_from_suf(x), '>=0')]
+        if self.version_reqs:
+            llvm_requested_versions = [ver_from_suf(x) for x in get_llvm_tool_names('') if version_compare_many(ver_from_suf(x), self.version_reqs)]
+        # CMake sorting before 3.18 is incorrect, sort it here instead
+        return sorted(llvm_requested_versions, key=functools.cmp_to_key(version_sorter))
+
+    # Split required and optional modules to distinguish it in CMake
     def _extra_cmake_opts(self) -> T.List[str]:
-        return ['-DLLVM_MESON_MODULES={}'.format(';'.join(self.llvm_modules + self.llvm_opt_modules))]
+        return ['-DLLVM_MESON_REQUIRED_MODULES={}'.format(';'.join(self.llvm_modules)),
+                '-DLLVM_MESON_OPTIONAL_MODULES={}'.format(';'.join(self.llvm_opt_modules)),
+                '-DLLVM_MESON_PACKAGE_NAMES={}'.format(';'.join(get_llvm_tool_names(self.name))),
+                '-DLLVM_MESON_VERSIONS={}'.format(';'.join(self.llvm_cmake_versions())),
+                '-DLLVM_MESON_DYLIB={}'.format('OFF' if self.static else 'ON')]
 
     def _map_module_list(self, modules: T.List[T.Tuple[str, bool]], components: T.List[T.Tuple[str, bool]]) -> T.List[T.Tuple[str, bool]]:
         res = []
@@ -431,7 +482,7 @@ class LLVMDependencyCMake(CMakeDependency):
                 if required:
                     raise self._gen_exception(f'LLVM module {mod} was not found')
                 else:
-                    mlog.warning('Optional LLVM module', mlog.bold(mod), 'was not found')
+                    mlog.warning('Optional LLVM module', mlog.bold(mod), 'was not found', fatal=False)
                     continue
             for i in cm_targets:
                 res += [(i, required)]
@@ -460,27 +511,24 @@ class ZlibSystemDependency(SystemDependency):
 
     def __init__(self, name: str, environment: 'Environment', kwargs: T.Dict[str, T.Any]):
         super().__init__(name, environment, kwargs)
+        from ..compilers.c import AppleClangCCompiler
+        from ..compilers.cpp import AppleClangCPPCompiler
 
         m = self.env.machines[self.for_machine]
 
         # I'm not sure this is entirely correct. What if we're cross compiling
         # from something to macOS?
         if ((m.is_darwin() and isinstance(self.clib_compiler, (AppleClangCCompiler, AppleClangCPPCompiler))) or
-                m.is_freebsd() or m.is_dragonflybsd()):
+                m.is_freebsd() or m.is_dragonflybsd() or m.is_android()):
             # No need to set includes,
             # on macos xcode/clang will do that for us.
             # on freebsd zlib.h is in /usr/include
 
             self.is_found = True
             self.link_args = ['-lz']
-        elif m.is_windows():
-            # Without a clib_compiler we can't find zlib, s just give up.
-            if self.clib_compiler is None:
-                self.is_found = False
-                return
-
+        else:
             if self.clib_compiler.get_argument_syntax() == 'msvc':
-                libs = ['zlib1' 'zlib']
+                libs = ['zlib1', 'zlib']
             else:
                 libs = ['z']
             for lib in libs:
@@ -492,24 +540,34 @@ class ZlibSystemDependency(SystemDependency):
                     break
             else:
                 return
-        else:
-            mlog.debug(f'Unsupported OS {m.system}')
-            return
 
         v, _ = self.clib_compiler.get_define('ZLIB_VERSION', '#include <zlib.h>', self.env, [], [self])
         self.version = v.strip('"')
 
 
-class JDKSystemDependency(SystemDependency):
-    def __init__(self, environment: 'Environment', kwargs: T.Dict[str, T.Any]):
-        super().__init__('jdk', environment, kwargs)
+class JNISystemDependency(SystemDependency):
+    def __init__(self, environment: 'Environment', kwargs: JNISystemDependencyKW):
+        super().__init__('jni', environment, T.cast('T.Dict[str, T.Any]', kwargs))
+
+        self.feature_since = ('0.62.0', '')
 
         m = self.env.machines[self.for_machine]
 
         if 'java' not in environment.coredata.compilers[self.for_machine]:
-            detect_compiler_for(environment, 'java', self.for_machine)
+            detect_compiler(self.name, environment, self.for_machine, 'java')
         self.javac = environment.coredata.compilers[self.for_machine]['java']
         self.version = self.javac.version
+
+        modules: T.List[str] = mesonlib.listify(kwargs.get('modules', []))
+        for module in modules:
+            if module not in {'jvm', 'awt'}:
+                msg = f'Unknown JNI module ({module})'
+                if self.required:
+                    mlog.error(msg)
+                else:
+                    mlog.debug(msg)
+                self.is_found = False
+                return
 
         if 'version' in kwargs and not version_compare(self.version, kwargs['version']):
             mlog.error(f'Incorrect JDK version found ({self.version}), wanted {kwargs["version"]}')
@@ -519,6 +577,20 @@ class JDKSystemDependency(SystemDependency):
         self.java_home = environment.properties[self.for_machine].get_java_home()
         if not self.java_home:
             self.java_home = pathlib.Path(shutil.which(self.javac.exelist[0])).resolve().parents[1]
+            if m.is_darwin():
+                problem_java_prefix = pathlib.Path('/System/Library/Frameworks/JavaVM.framework/Versions')
+                if problem_java_prefix in self.java_home.parents:
+                    res = subprocess.run(['/usr/libexec/java_home', '--failfast', '--arch', m.cpu_family],
+                                         stdout=subprocess.PIPE)
+                    if res.returncode != 0:
+                        msg = 'JAVA_HOME could not be discovered on the system. Please set it explicitly.'
+                        if self.required:
+                            mlog.error(msg)
+                        else:
+                            mlog.debug(msg)
+                        self.is_found = False
+                        return
+                    self.java_home = pathlib.Path(res.stdout.decode().strip())
 
         platform_include_dir = self.__machine_info_to_platform_include_dir(m)
         if platform_include_dir is None:
@@ -529,16 +601,56 @@ class JDKSystemDependency(SystemDependency):
         java_home_include = self.java_home / 'include'
         self.compile_args.append(f'-I{java_home_include}')
         self.compile_args.append(f'-I{java_home_include / platform_include_dir}')
+
+        if modules:
+            if m.is_windows():
+                java_home_lib = self.java_home / 'lib'
+                java_home_lib_server = java_home_lib
+            else:
+                if version_compare(self.version, '<= 1.8.0'):
+                    java_home_lib = self.java_home / 'jre' / 'lib' / self.__cpu_translate(m.cpu_family)
+                else:
+                    java_home_lib = self.java_home / 'lib'
+
+                java_home_lib_server = java_home_lib / 'server'
+
+            if 'jvm' in modules:
+                jvm = self.clib_compiler.find_library('jvm', environment, extra_dirs=[str(java_home_lib_server)])
+                if jvm is None:
+                    mlog.debug('jvm library not found.')
+                    self.is_found = False
+                else:
+                    self.link_args.extend(jvm)
+            if 'awt' in modules:
+                jawt = self.clib_compiler.find_library('jawt', environment, extra_dirs=[str(java_home_lib)])
+                if jawt is None:
+                    mlog.debug('jawt library not found.')
+                    self.is_found = False
+                else:
+                    self.link_args.extend(jawt)
+
         self.is_found = True
 
     @staticmethod
+    def __cpu_translate(cpu: str) -> str:
+        '''
+        The JDK and Meson have a disagreement here, so translate it over. In the event more
+        translation needs to be done, add to following dict.
+        '''
+        java_cpus = {
+            'x86_64': 'amd64',
+        }
+
+        return java_cpus.get(cpu, cpu)
+
+    @staticmethod
     def __machine_info_to_platform_include_dir(m: 'MachineInfo') -> T.Optional[str]:
-        """Translates the machine information to the platform-dependent include directory
+        '''Translates the machine information to the platform-dependent include directory
 
         When inspecting a JDK release tarball or $JAVA_HOME, inside the `include/` directory is a
-        platform dependent folder that must be on the target's include path in addition to the
+        platform-dependent directory that must be on the target's include path in addition to the
         parent `include/` directory.
-        """
+        '''
         if m.is_linux():
             return 'linux'
         elif m.is_windows():
@@ -547,8 +659,28 @@ class JDKSystemDependency(SystemDependency):
             return 'darwin'
         elif m.is_sunos():
             return 'solaris'
+        elif m.is_freebsd():
+            return 'freebsd'
+        elif m.is_netbsd():
+            return 'netbsd'
+        elif m.is_openbsd():
+            return 'openbsd'
+        elif m.is_dragonflybsd():
+            return 'dragonfly'
 
         return None
+
+
+class JDKSystemDependency(JNISystemDependency):
+    def __init__(self, environment: 'Environment', kwargs: JNISystemDependencyKW):
+        super().__init__(environment, kwargs)
+
+        self.feature_since = ('0.59.0', '')
+        self.featurechecks.append(FeatureDeprecated(
+            'jdk system dependency',
+            '0.62.0',
+            'Use the jni system dependency instead'
+        ))
 
 
 llvm_factory = DependencyFactory(
