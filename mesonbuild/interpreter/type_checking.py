@@ -95,15 +95,19 @@ def _install_mode_validator(mode: T.List[T.Union[str, bool, int]]) -> T.Optional
 
 
 def _install_mode_convertor(mode: T.Optional[T.List[T.Union[str, bool, int]]]) -> FileMode:
-    """Convert the DSL form of the `install_mode` keyword argument to `FileMode`
+    """Convert the DSL form of the `install_mode` keyword argument to `FileMode`"""
 
-    This is not required, and if not required returns None
+    if not mode:
+        return FileMode()
 
-    TODO: It's not clear to me why this needs to be None and not just return an
-    empty FileMode.
-    """
-    # this has already been validated by the validator
-    return FileMode(*(m if isinstance(m, str) else None for m in mode))
+    # This has already been validated by the validator. False denotes "use
+    # default". mypy is totally incapable of understanding it, because
+    # generators clobber types via homogeneous return. But also we *must*
+    # convert the first element different from the rest
+    m1 = mode[0] if isinstance(mode[0], str) else None
+    rest = (m if isinstance(m, (str, int)) else None for m in mode[1:])
+
+    return FileMode(m1, *rest)
 
 
 def _lower_strlist(input: T.List[str]) -> T.List[str]:
@@ -180,7 +184,7 @@ REQUIRED_KW: KwargInfo[T.Union[bool, UserFeatureOption]] = KwargInfo(
 DISABLER_KW: KwargInfo[bool] = KwargInfo('disabler', bool, default=False)
 
 def _env_validator(value: T.Union[EnvironmentVariables, T.List['TYPE_var'], T.Dict[str, 'TYPE_var'], str, None],
-                   allow_dict_list: bool = True) -> T.Optional[str]:
+                   only_dict_str: bool = True) -> T.Optional[str]:
     def _splitter(v: str) -> T.Optional[str]:
         split = v.split('=', 1)
         if len(split) == 1:
@@ -201,18 +205,21 @@ def _env_validator(value: T.Union[EnvironmentVariables, T.List['TYPE_var'], T.Di
     elif isinstance(value, dict):
         # We don't need to spilt here, just do the type checking
         for k, dv in value.items():
-            if allow_dict_list:
+            if only_dict_str:
                 if any(i for i in listify(dv) if not isinstance(i, str)):
                     return f"Dictionary element {k} must be a string or list of strings not {dv!r}"
-            elif not isinstance(dv, str):
-                return f"Dictionary element {k} must be a string not {dv!r}"
+            elif isinstance(dv, list):
+                if any(not isinstance(i, str) for i in dv):
+                    return f"Dictionary element {k} must be a string, bool, integer or list of strings, not {dv!r}"
+            elif not isinstance(dv, (str, bool, int)):
+                return f"Dictionary element {k} must be a string, bool, integer or list of strings, not {dv!r}"
     # We know that otherwise we have an EnvironmentVariables object or None, and
     # we're okay at this point
     return None
 
 def _options_validator(value: T.Union[EnvironmentVariables, T.List['TYPE_var'], T.Dict[str, 'TYPE_var'], str, None]) -> T.Optional[str]:
     # Reusing the env validator is a little overkill, but nicer than duplicating the code
-    return _env_validator(value, allow_dict_list=False)
+    return _env_validator(value, only_dict_str=False)
 
 def split_equal_string(input: str) -> T.Tuple[str, str]:
     """Split a string in the form `x=y`
@@ -277,21 +284,25 @@ COMMAND_KW: KwargInfo[T.List[T.Union[str, BuildTarget, CustomTarget, CustomTarge
     default=[],
 )
 
-def _override_options_convertor(raw: T.List[str]) -> T.Dict[OptionKey, str]:
-    output: T.Dict[OptionKey, str] = {}
-    for each in raw:
-        k, v = split_equal_string(each)
-        output[OptionKey.from_string(k)] = v
-    return output
+def _override_options_convertor(raw: T.Union[str, T.List[str], T.Dict[str, T.Union[str, int, bool, T.List[str]]]]) -> T.Dict[OptionKey, T.Union[str, int, bool, T.List[str]]]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, list):
+        output: T.Dict[OptionKey, T.Union[str, int, bool, T.List[str]]] = {}
+        for each in raw:
+            k, v = split_equal_string(each)
+            output[OptionKey.from_string(k)] = v
+        return output
+    return {OptionKey.from_string(k): v for k, v in raw.items()}
 
 
-OVERRIDE_OPTIONS_KW: KwargInfo[T.List[str]] = KwargInfo(
+OVERRIDE_OPTIONS_KW: KwargInfo[T.Union[str, T.Dict[str, T.Union[str, int, bool, T.List[str]]], T.List[str]]] = KwargInfo(
     'override_options',
-    ContainerTypeInfo(list, str),
-    listify=True,
-    default=[],
+    (str, ContainerTypeInfo(list, str), ContainerTypeInfo(dict, (str, int, bool, list))),
+    default={},
     validator=_options_validator,
     convertor=_override_options_convertor,
+    since_values={dict: '1.2.0'},
 )
 
 
@@ -381,14 +392,7 @@ INCLUDE_DIRECTORIES: KwargInfo[T.List[T.Union[str, IncludeDirs]]] = KwargInfo(
     default=[],
 )
 
-# for cases like default_options and override_options
-DEFAULT_OPTIONS: KwargInfo[T.List[str]] = KwargInfo(
-    'default_options',
-    ContainerTypeInfo(list, str),
-    listify=True,
-    default=[],
-    validator=_options_validator,
-)
+DEFAULT_OPTIONS = OVERRIDE_OPTIONS_KW.evolve(name='default_options')
 
 ENV_METHOD_KW = KwargInfo('method', str, default='set', since='0.62.0',
                           validator=in_set_validator({'set', 'prepend', 'append'}))

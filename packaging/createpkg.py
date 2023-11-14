@@ -16,6 +16,7 @@
 
 import subprocess
 import shutil, sys, os
+from glob import glob
 
 import xml.etree.ElementTree as ET
 
@@ -41,7 +42,10 @@ class PkgGenerator:
         if os.path.exists(self.pkg_dir):
             shutil.rmtree(self.pkg_dir)
         os.mkdir(self.pkg_dir)
-        pyinstaller_bin = '/Users/jpakkane/Library/Python/3.8/bin/pyinstaller'
+        pyinstaller_bin = glob('/Users/jpakkane/Library/Python/*/bin/pyinstaller')
+        if len(pyinstaller_bin) != 1:
+            sys.exit('Could not determine unique installer.')
+        pyinstaller_bin = pyinstaller_bin[0]
         pyinst_cmd = [pyinstaller_bin,
                       '--clean',
                       '--additional-hooks-dir=packaging',
@@ -96,7 +100,7 @@ class PkgGenerator:
                                         'version': '0', # self.version,
                                         'onConclusion': 'none'}).text = self.pkgname
         ET.ElementTree(root).write(self.distribution_file, encoding='utf-8', xml_declaration=True)
-        # ElementTree can not do prettyprinting so do it manually
+        # ElementTree cannot do pretty-printing, so do it manually
         import xml.dom.minidom
         doc = xml.dom.minidom.parse(self.distribution_file)
         with open(self.distribution_file, 'w') as open_file:

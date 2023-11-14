@@ -39,6 +39,8 @@ from .mixins.clang import ClangCompiler
 from .mixins.elbrus import ElbrusCompiler
 from .mixins.pgi import PGICompiler
 from .mixins.emscripten import EmscriptenMixin
+from .mixins.metrowerks import MetrowerksCompiler
+from .mixins.metrowerks import mwccarm_instruction_set_args, mwcceppc_instruction_set_args
 
 if T.TYPE_CHECKING:
     from .compilers import CompileCheckMode
@@ -46,7 +48,7 @@ if T.TYPE_CHECKING:
     from ..dependencies import Dependency
     from ..envconfig import MachineInfo
     from ..environment import Environment
-    from ..linkers import DynamicLinker
+    from ..linkers.linkers import DynamicLinker
     from ..mesonlib import MachineChoice
     from ..programs import ExternalProgram
     CompilerMixinBase = CLikeCompiler
@@ -152,6 +154,8 @@ class CPPCompiler(CLikeCompiler, Compiler):
             'gnu++17': 'gnu++1z',
             'c++20': 'c++2a',
             'gnu++20': 'gnu++2a',
+            'c++23': 'c++2b',
+            'gnu++23': 'gnu++2b',
         }
 
         # Currently, remapping is only supported for Clang, Elbrus and GCC
@@ -181,7 +185,48 @@ class CPPCompiler(CLikeCompiler, Compiler):
         return opts
 
 
-class ClangCPPCompiler(ClangCompiler, CPPCompiler):
+class _StdCPPLibMixin(CompilerMixinBase):
+
+    """Detect whether to use libc++ or libstdc++."""
+
+    @functools.lru_cache(None)
+    def language_stdlib_only_link_flags(self, env: Environment) -> T.List[str]:
+        """Detect the C++ stdlib and default search dirs
+
+        As an optimization, this method will cache the value, to avoid building the same values over and over
+
+        :param env: An Environment object
+        :raises MesonException: If a stdlib cannot be determined
+        """
+
+        # We need to apply the search prefix here, as these link arguments may
+        # be passed to a different compiler with a different set of default
+        # search paths, such as when using Clang for C/C++ and gfortran for
+        # fortran.
+        search_dirs = [f'-L{d}' for d in self.get_compiler_dirs(env, 'libraries')]
+
+        machine = env.machines[self.for_machine]
+        assert machine is not None, 'for mypy'
+
+        # We need to determine whether to use libc++ or libstdc++. We can't
+        # really know the answer in most cases, only the most likely answer,
+        # because a user can install things themselves or build custom images.
+        search_order: T.List[str] = []
+        if machine.system in {'android', 'darwin', 'dragonfly', 'freebsd', 'netbsd', 'openbsd'}:
+            search_order = ['c++', 'stdc++']
+        else:
+            search_order = ['stdc++', 'c++']
+        for lib in search_order:
+            if self.find_library(lib, env, []) is not None:
+                return search_dirs + [f'-l{lib}']
+        # TODO: maybe a bug exception?
+        raise MesonException('Could not detect either libc++ or libstdc++ as your C++ stdlib implementation.')
+
+
+class ClangCPPCompiler(_StdCPPLibMixin, ClangCompiler, CPPCompiler):
+
+    _CPP23_VERSION = '>=12.0.0'
+
     def __init__(self, ccache: T.List[str], exelist: T.List[str], version: str, for_machine: MachineChoice, is_cross: bool,
                  info: 'MachineInfo', exe_wrapper: T.Optional['ExternalProgram'] = None,
                  linker: T.Optional['DynamicLinker'] = None,
@@ -208,11 +253,15 @@ class ClangCPPCompiler(ClangCompiler, CPPCompiler):
             ),
             key.evolve('rtti'): coredata.UserBooleanOption('Enable RTTI', True),
         })
-        opts[key.evolve('std')].choices = [
+        cppstd_choices = [
             'none', 'c++98', 'c++03', 'c++11', 'c++14', 'c++17', 'c++1z',
             'c++2a', 'c++20', 'gnu++11', 'gnu++14', 'gnu++17', 'gnu++1z',
             'gnu++2a', 'gnu++20',
         ]
+        if version_compare(self.version, self._CPP23_VERSION):
+            cppstd_choices.append('c++23')
+            cppstd_choices.append('gnu++23')
+        opts[key.evolve('std')].choices = cppstd_choices
         if self.info.is_windows() or self.info.is_cygwin():
             opts.update({
                 key.evolve('winlibs'): coredata.UserArrayOption(
@@ -247,16 +296,6 @@ class ClangCPPCompiler(ClangCompiler, CPPCompiler):
             return libs
         return []
 
-    def language_stdlib_only_link_flags(self, env: 'Environment') -> T.List[str]:
-        # We need to apply the search prefix here, as these link arguments may
-        # be passed to a different compiler with a different set of default
-        # search paths, such as when using Clang for C/C++ and gfortran for
-        # fortran,
-        search_dirs: T.List[str] = []
-        for d in self.get_compiler_dirs(env, 'libraries'):
-            search_dirs.append(f'-L{d}')
-        return search_dirs + ['-lstdc++']
-
 
 class ArmLtdClangCPPCompiler(ClangCPPCompiler):
 
@@ -264,15 +303,8 @@ class ArmLtdClangCPPCompiler(ClangCPPCompiler):
 
 
 class AppleClangCPPCompiler(ClangCPPCompiler):
-    def language_stdlib_only_link_flags(self, env: 'Environment') -> T.List[str]:
-        # We need to apply the search prefix here, as these link arguments may
-        # be passed to a different compiler with a different set of default
-        # search paths, such as when using Clang for C/C++ and gfortran for
-        # fortran,
-        search_dirs: T.List[str] = []
-        for d in self.get_compiler_dirs(env, 'libraries'):
-            search_dirs.append(f'-L{d}')
-        return search_dirs + ['-lc++']
+
+    _CPP23_VERSION = '>=13.0.0'
 
 
 class EmscriptenCPPCompiler(EmscriptenMixin, ClangCPPCompiler):
@@ -351,7 +383,7 @@ class ArmclangCPPCompiler(ArmclangCompiler, CPPCompiler):
         return []
 
 
-class GnuCPPCompiler(GnuCompiler, CPPCompiler):
+class GnuCPPCompiler(_StdCPPLibMixin, GnuCompiler, CPPCompiler):
     def __init__(self, ccache: T.List[str], exelist: T.List[str], version: str, for_machine: MachineChoice, is_cross: bool,
                  info: 'MachineInfo', exe_wrapper: T.Optional['ExternalProgram'] = None,
                  linker: T.Optional['DynamicLinker'] = None,
@@ -389,7 +421,7 @@ class GnuCPPCompiler(GnuCompiler, CPPCompiler):
             'c++2a', 'c++20', 'gnu++03', 'gnu++11', 'gnu++14', 'gnu++17',
             'gnu++1z', 'gnu++2a', 'gnu++20',
         ]
-        if version_compare(self.version, '>=12.2.0'):
+        if version_compare(self.version, '>=11.0.0'):
             cppstd_choices.append('c++23')
             cppstd_choices.append('gnu++23')
         opts[key].choices = cppstd_choices
@@ -431,16 +463,6 @@ class GnuCPPCompiler(GnuCompiler, CPPCompiler):
 
     def get_pch_use_args(self, pch_dir: str, header: str) -> T.List[str]:
         return ['-fpch-preprocess', '-include', os.path.basename(header)]
-
-    def language_stdlib_only_link_flags(self, env: 'Environment') -> T.List[str]:
-        # We need to apply the search prefix here, as these link arguments may
-        # be passed to a different compiler with a different set of default
-        # search paths, such as when using Clang for C/C++ and gfortran for
-        # fortran,
-        search_dirs: T.List[str] = []
-        for d in self.get_compiler_dirs(env, 'libraries'):
-            search_dirs.append(f'-L{d}')
-        return ['-lstdc++']
 
 
 class PGICPPCompiler(PGICompiler, CPPCompiler):
@@ -893,3 +915,60 @@ class TICPPCompiler(TICompiler, CPPCompiler):
 class C2000CPPCompiler(TICPPCompiler):
     # Required for backwards compat with projects created before ti-cgt support existed
     id = 'c2000'
+
+class MetrowerksCPPCompilerARM(MetrowerksCompiler, CPPCompiler):
+    id = 'mwccarm'
+
+    def __init__(self, ccache: T.List[str], exelist: T.List[str], version: str, for_machine: MachineChoice,
+                 is_cross: bool, info: 'MachineInfo',
+                 exe_wrapper: T.Optional['ExternalProgram'] = None,
+                 linker: T.Optional['DynamicLinker'] = None,
+                 full_version: T.Optional[str] = None):
+        CPPCompiler.__init__(self, ccache, exelist, version, for_machine, is_cross,
+                             info, exe_wrapper, linker=linker, full_version=full_version)
+        MetrowerksCompiler.__init__(self)
+
+    def get_instruction_set_args(self, instruction_set: str) -> T.Optional[T.List[str]]:
+        return mwccarm_instruction_set_args.get(instruction_set, None)
+
+    def get_options(self) -> 'MutableKeyedOptionDictType':
+        opts = CPPCompiler.get_options(self)
+        key = OptionKey('std', machine=self.for_machine, lang=self.language)
+        opts[key].choices = ['none']
+        return opts
+
+    def get_option_compile_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
+        args = []
+        std = options[OptionKey('std', machine=self.for_machine, lang=self.language)]
+        if std.value != 'none':
+            args.append('-lang')
+            args.append(std.value)
+        return args
+
+class MetrowerksCPPCompilerEmbeddedPowerPC(MetrowerksCompiler, CPPCompiler):
+    id = 'mwcceppc'
+
+    def __init__(self, ccache: T.List[str], exelist: T.List[str], version: str, for_machine: MachineChoice,
+                 is_cross: bool, info: 'MachineInfo',
+                 exe_wrapper: T.Optional['ExternalProgram'] = None,
+                 linker: T.Optional['DynamicLinker'] = None,
+                 full_version: T.Optional[str] = None):
+        CPPCompiler.__init__(self, ccache, exelist, version, for_machine, is_cross,
+                             info, exe_wrapper, linker=linker, full_version=full_version)
+        MetrowerksCompiler.__init__(self)
+
+    def get_instruction_set_args(self, instruction_set: str) -> T.Optional[T.List[str]]:
+        return mwcceppc_instruction_set_args.get(instruction_set, None)
+
+    def get_options(self) -> 'MutableKeyedOptionDictType':
+        opts = CPPCompiler.get_options(self)
+        key = OptionKey('std', machine=self.for_machine, lang=self.language)
+        opts[key].choices = ['none']
+        return opts
+
+    def get_option_compile_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
+        args = []
+        std = options[OptionKey('std', machine=self.for_machine, lang=self.language)]
+        if std.value != 'none':
+            args.append('-lang ' + std.value)
+        return args

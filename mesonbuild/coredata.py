@@ -1,4 +1,4 @@
-# Copyright 2012-2023 The Meson development team
+# Copyright 2013-2023 The Meson development team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -59,9 +59,21 @@ if T.TYPE_CHECKING:
 #
 # Pip requires that RCs are named like this: '0.1.0.rc1'
 # But the corresponding Git tag needs to be '0.1.0rc1'
-version = '1.1.1'
+version = '1.2.3'
+
+# The next stable version when we are in dev. This is used to allow projects to
+# require meson version >=1.2.0 when using 1.1.99. FeatureNew won't warn when
+# using a feature introduced in 1.2.0 when using Meson 1.1.99.
+stable_version = version
+if stable_version.endswith('.99'):
+    stable_version_array = stable_version.split('.')
+    stable_version_array[-1] = '0'
+    stable_version_array[-2] = str(int(stable_version_array[-2]) + 1)
+    stable_version = '.'.join(stable_version_array)
 
 backendlist = ['ninja', 'vs', 'vs2010', 'vs2012', 'vs2013', 'vs2015', 'vs2017', 'vs2019', 'vs2022', 'xcode', 'none']
+genvslitelist = ['vs2022']
+buildtypelist = ['plain', 'debug', 'debugoptimized', 'release', 'minsize', 'custom']
 
 DEFAULT_YIELDING = False
 
@@ -69,11 +81,18 @@ DEFAULT_YIELDING = False
 _T = T.TypeVar('_T')
 
 
+def get_genvs_default_buildtype_list() -> list:
+    # just debug, debugoptimized, and release for now
+    # but this should probably be configurable through some extra option, alongside --genvslite.
+    return buildtypelist[1:-2]
+
+
 class MesonVersionMismatchException(MesonException):
     '''Build directory generated with Meson version is incompatible with current version'''
-    def __init__(self, old_version: str, current_version: str) -> None:
+    def __init__(self, old_version: str, current_version: str, extra_msg: str = '') -> None:
         super().__init__(f'Build directory has been generated with Meson version {old_version}, '
-                         f'which is incompatible with the current version {current_version}.')
+                         f'which is incompatible with the current version {current_version}.'
+                         + extra_msg)
         self.old_version = old_version
         self.current_version = current_version
 
@@ -191,7 +210,7 @@ class UserUmaskOption(UserIntegerOption, UserOption[T.Union[str, OctalInt]]):
         return format(self.value, '04o')
 
     def validate_value(self, value: T.Any) -> T.Union[str, OctalInt]:
-        if value is None or value == 'preserve':
+        if value == 'preserve':
             return 'preserve'
         return OctalInt(super().validate_value(value))
 
@@ -314,11 +333,10 @@ class DependencyCacheType(enum.Enum):
 
     @classmethod
     def from_type(cls, dep: 'dependencies.Dependency') -> 'DependencyCacheType':
-        from . import dependencies
         # As more types gain search overrides they'll need to be added here
-        if isinstance(dep, dependencies.PkgConfigDependency):
+        if dep.type_name == 'pkgconfig':
             return cls.PKG_CONFIG
-        if isinstance(dep, dependencies.CMakeDependency):
+        if dep.type_name == 'cmake':
             return cls.CMAKE
         return cls.OTHER
 
@@ -704,20 +722,16 @@ class CoreData:
 
         if key.name == 'buildtype':
             dirty |= self._set_others_from_buildtype(value)
-        elif key.name in {'wrap_mode', 'force_fallback_for'}:
-            # We could have the system dependency cached for a dependency that
-            # is now forced to use subproject fallback. We probably could have
-            # more fine-grained cache invalidation, but better be safe.
-            self.clear_deps_cache()
-            dirty = True
 
         return dirty
 
-    def clear_deps_cache(self):
+    def clear_cache(self) -> None:
         self.deps.host.clear()
         self.deps.build.clear()
+        self.compiler_check_cache.clear()
+        self.run_check_cache.clear()
 
-    def get_nondefault_buildtype_args(self):
+    def get_nondefault_buildtype_args(self) -> T.List[T.Union[T.Tuple[str, str, str], T.Tuple[str, bool, bool]]]:
         result = []
         value = self.options[OptionKey('buildtype')].value
         if value == 'plain':
@@ -794,7 +808,7 @@ class CoreData:
                 continue
 
             oldval = self.options[key]
-            if type(oldval) != type(value):
+            if type(oldval) is not type(value):
                 self.options[key] = value
             elif oldval.choices != value.choices:
                 # If the choices have changed, use the new value, but attempt
@@ -918,7 +932,6 @@ class CoreData:
     def process_new_compiler(self, lang: str, comp: 'Compiler', env: 'Environment') -> None:
         from . import compilers
 
-        self.compilers[comp.for_machine][lang] = comp
         self.add_compiler_options(comp.get_options(), lang, comp.for_machine, env)
 
         enabled_opts: T.List[OptionKey] = []
@@ -956,7 +969,10 @@ class MachineFileParser():
         self.constants = {'True': True, 'False': False}
         self.sections = {}
 
-        self.parser.read(filenames)
+        try:
+            self.parser.read(filenames)
+        except configparser.Error as e:
+            raise EnvironmentException(f'Malformed cross or native file: {e}')
 
         # Parse [constants] first so they can be used in other sections
         if self.parser.has_section('constants'):
@@ -977,9 +993,11 @@ class MachineFileParser():
             value = value.replace('\\', '\\\\')
             try:
                 ast = mparser.Parser(value, 'machinefile').parse()
+                if not ast.lines:
+                    raise EnvironmentException('value cannot be empty')
                 res = self._evaluate_statement(ast.lines[0])
-            except MesonException:
-                raise EnvironmentException(f'Malformed value in machine file variable {entry!r}.')
+            except MesonException as e:
+                raise EnvironmentException(f'Malformed value in machine file variable {entry!r}: {str(e)}.')
             except KeyError as e:
                 raise EnvironmentException(f'Undefined constant {e.args[0]!r} in machine file variable {entry!r}.')
             section[entry] = res
@@ -1075,9 +1093,9 @@ def major_versions_differ(v1: str, v2: str) -> bool:
     # Major version differ, or one is development version but not the other.
     return v1_major != v2_major or ('99' in {v1_minor, v2_minor} and v1_minor != v2_minor)
 
-def load(build_dir: str) -> CoreData:
+def load(build_dir: str, suggest_reconfigure: bool = True) -> CoreData:
     filename = os.path.join(build_dir, 'meson-private', 'coredata.dat')
-    return pickle_load(filename, 'Coredata', CoreData)
+    return pickle_load(filename, 'Coredata', CoreData, suggest_reconfigure)
 
 
 def save(obj: CoreData, build_dir: str) -> str:
@@ -1241,8 +1259,16 @@ BUILTIN_CORE_OPTIONS: 'MutableKeyedOptionDictType' = OrderedDict([
     (OptionKey('auto_features'),   BuiltinOption(UserFeatureOption, "Override value of all 'auto' features", 'auto')),
     (OptionKey('backend'),         BuiltinOption(UserComboOption, 'Backend to use', 'ninja', choices=backendlist,
                                                  readonly=True)),
+    (OptionKey('genvslite'),
+     BuiltinOption(
+         UserComboOption,
+         'Setup multiple buildtype-suffixed ninja-backend build directories, '
+         'and a [builddir]_vs containing a Visual Studio meta-backend with multiple configurations that calls into them',
+         'vs2022',
+         choices=genvslitelist)
+     ),
     (OptionKey('buildtype'),       BuiltinOption(UserComboOption, 'Build type to use', 'debug',
-                                                 choices=['plain', 'debug', 'debugoptimized', 'release', 'minsize', 'custom'])),
+                                                 choices=buildtypelist)),
     (OptionKey('debug'),           BuiltinOption(UserBooleanOption, 'Enable debug symbols and other information', True)),
     (OptionKey('default_library'), BuiltinOption(UserComboOption, 'Default library type', 'shared', choices=['shared', 'static', 'both'],
                                                  yielding=False)),
@@ -1266,6 +1292,8 @@ BUILTIN_CORE_OPTIONS: 'MutableKeyedOptionDictType' = OrderedDict([
      BuiltinOption(UserBooleanOption, 'Generate pkgconfig files as relocatable', False)),
 
     # Python module
+    (OptionKey('bytecompile', module='python'),
+     BuiltinOption(UserIntegerOption, 'Whether to compile bytecode', (-1, 2, 0))),
     (OptionKey('install_env', module='python'),
      BuiltinOption(UserComboOption, 'Which python environment to install to', 'prefix', choices=['auto', 'prefix', 'system', 'venv'])),
     (OptionKey('platlibdir', module='python'),

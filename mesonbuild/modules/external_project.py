@@ -23,7 +23,8 @@ from . import ExtensionModule, ModuleReturnValue, NewExtensionModule, ModuleInfo
 from .. import mlog, build
 from ..compilers.compilers import CFLAGS_MAPPING
 from ..envconfig import ENV_VAR_PROG_MAP
-from ..dependencies import InternalDependency, PkgConfigDependency
+from ..dependencies import InternalDependency
+from ..dependencies.pkgconfig import PkgConfigDependency
 from ..interpreterbase import FeatureNew
 from ..interpreter.type_checking import ENV_KW, DEPENDS_KW
 from ..interpreterbase.decorators import ContainerTypeInfo, KwargInfo, typed_kwargs, typed_pos_args
@@ -204,7 +205,7 @@ class ExternalProject(NewExtensionModule):
     def _run(self, step: str, command: T.List[str], workdir: Path) -> None:
         mlog.log(f'External project {self.name}:', mlog.bold(step))
         m = 'Running command ' + str(command) + ' in directory ' + str(workdir) + '\n'
-        log_filename = Path(mlog.log_dir, f'{self.name}-{step}.log')
+        log_filename = Path(mlog.get_log_dir(), f'{self.name}-{step}.log')
         output = None
         if not self.verbose:
             output = open(log_filename, 'w', encoding='utf-8')
@@ -228,7 +229,7 @@ class ExternalProject(NewExtensionModule):
                 '--srcdir', self.src_dir.as_posix(),
                 '--builddir', self.build_dir.as_posix(),
                 '--installdir', self.install_dir.as_posix(),
-                '--logdir', mlog.log_dir,
+                '--logdir', mlog.get_log_dir(),
                 '--make', join_args(self.make),
                 ]
         if self.verbose:
@@ -274,7 +275,7 @@ class ExternalProject(NewExtensionModule):
         link_args = [f'-L{abs_libdir}', f'-l{libname}']
         sources = self.target
         dep = InternalDependency(version, [], compile_args, link_args, [],
-                                 [], [sources], [], {}, [], [], [])
+                                 [], [sources], [], [], {}, [], [], [])
         return dep
 
 

@@ -24,20 +24,23 @@ import subprocess
 import textwrap
 import typing as T
 
-from . import ExtensionModule, ModuleInfo
-from . import ModuleReturnValue
+from . import (
+    ExtensionModule, GirTarget, GResourceHeaderTarget, GResourceTarget, ModuleInfo,
+    ModuleReturnValue, TypelibTarget, VapiTarget,
+)
 from .. import build
 from .. import interpreter
 from .. import mesonlib
 from .. import mlog
 from ..build import CustomTarget, CustomTargetIndex, Executable, GeneratedList, InvalidArguments
-from ..dependencies import Dependency, PkgConfigDependency, InternalDependency
-from ..interpreter.type_checking import DEPENDS_KW, DEPEND_FILES_KW, INSTALL_DIR_KW, INSTALL_KW, NoneType, SOURCES_KW, in_set_validator
+from ..dependencies import Dependency, InternalDependency
+from ..dependencies.pkgconfig import PkgConfigDependency
+from ..interpreter.type_checking import DEPENDS_KW, DEPEND_FILES_KW, ENV_KW, INSTALL_DIR_KW, INSTALL_KW, NoneType, SOURCES_KW, in_set_validator
 from ..interpreterbase import noPosargs, noKwargs, FeatureNew, FeatureDeprecated
 from ..interpreterbase import typed_kwargs, KwargInfo, ContainerTypeInfo
 from ..interpreterbase.decorators import typed_pos_args
 from ..mesonlib import (
-    MachineChoice, MesonException, OrderedSet, Popen_safe, join_args,
+    MachineChoice, MesonException, OrderedSet, Popen_safe, join_args, quote_arg
 )
 from ..programs import OverrideProgram
 from ..scripts.gettext import read_linguas
@@ -200,6 +203,8 @@ if T.TYPE_CHECKING:
         vtail: T.Optional[str]
         depends: T.List[T.Union[BuildTarget, CustomTarget, CustomTargetIndex]]
 
+    ToolType = T.Union[Executable, ExternalProgram, OverrideProgram]
+
 
 # Differs from the CustomTarget version in that it straight defaults to True
 _BUILD_BY_DEFAULT: KwargInfo[bool] = KwargInfo(
@@ -247,21 +252,6 @@ def annotations_validator(annotations: T.List[T.Union[str, T.List[str]]]) -> T.O
             if len(annot) != 3 or not all(isinstance(i, str) for i in annot):
                 return f'element {c+1} {badlist}'
     return None
-
-class GResourceTarget(build.CustomTarget):
-    pass
-
-class GResourceHeaderTarget(build.CustomTarget):
-    pass
-
-class GirTarget(build.CustomTarget):
-    pass
-
-class TypelibTarget(build.CustomTarget):
-    pass
-
-class VapiTarget(build.CustomTarget):
-    pass
 
 # gresource compilation is broken due to the way
 # the resource compiler and Ninja clash about it
@@ -329,6 +319,22 @@ class GnomeModule(ExtensionModule):
                      mlog.bold('https://github.com/mesonbuild/meson/issues/1387'),
                      once=True, fatal=False)
 
+    @staticmethod
+    def _find_tool(state: 'ModuleState', tool: str) -> 'ToolType':
+        tool_map = {
+            'gio-querymodules': 'gio-2.0',
+            'glib-compile-schemas': 'gio-2.0',
+            'glib-compile-resources': 'gio-2.0',
+            'gdbus-codegen': 'gio-2.0',
+            'glib-genmarshal': 'glib-2.0',
+            'glib-mkenums': 'glib-2.0',
+            'g-ir-scanner': 'gobject-introspection-1.0',
+            'g-ir-compiler': 'gobject-introspection-1.0',
+        }
+        depname = tool_map[tool]
+        varname = tool.replace('-', '_')
+        return state.find_tool(tool, depname, varname)
+
     @typed_kwargs(
         'gnome.post_install',
         KwargInfo('glib_compile_schemas', bool, default=False),
@@ -344,7 +350,7 @@ class GnomeModule(ExtensionModule):
         datadir_abs = os.path.join(state.environment.get_prefix(), state.environment.get_datadir())
         if kwargs['glib_compile_schemas'] and not self.install_glib_compile_schemas:
             self.install_glib_compile_schemas = True
-            prog = state.find_tool('glib-compile-schemas', 'gio-2.0', 'glib_compile_schemas')
+            prog = self._find_tool(state, 'glib-compile-schemas')
             schemasdir = os.path.join(datadir_abs, 'glib-2.0', 'schemas')
             script = state.backend.get_executable_serialisation([prog, schemasdir])
             script.skip_if_destdir = True
@@ -352,7 +358,7 @@ class GnomeModule(ExtensionModule):
         for d in kwargs['gio_querymodules']:
             if d not in self.install_gio_querymodules:
                 self.install_gio_querymodules.append(d)
-                prog = state.find_tool('gio-querymodules', 'gio-2.0', 'gio_querymodules')
+                prog = self._find_tool(state, 'gio-querymodules')
                 moduledir = os.path.join(state.environment.get_prefix(), d)
                 script = state.backend.get_executable_serialisation([prog, moduledir])
                 script.skip_if_destdir = True
@@ -402,8 +408,8 @@ class GnomeModule(ExtensionModule):
         self.__print_gresources_warning(state)
         glib_version = self._get_native_glib_version(state)
 
-        glib_compile_resources = state.find_program('glib-compile-resources')
-        cmd: T.List[T.Union[ExternalProgram, Executable, OverrideProgram, str]] = [glib_compile_resources, '@INPUT@']
+        glib_compile_resources = self._find_tool(state, 'glib-compile-resources')
+        cmd: T.List[T.Union['ToolType', str]] = [glib_compile_resources, '@INPUT@']
 
         source_dirs = kwargs['source_dir']
         dependencies = kwargs['dependencies']
@@ -420,7 +426,7 @@ class GnomeModule(ExtensionModule):
                 depends.append(dep)
                 subdirs.append(dep.get_subdir())
                 if not mesonlib.version_compare(glib_version, gresource_dep_needed_version):
-                    m = 'The "dependencies" argument of gnome.compile_resources() can not\n' \
+                    m = 'The "dependencies" argument of gnome.compile_resources() cannot\n' \
                         'be used with the current version of glib-compile-resources due to\n' \
                         '<https://bugzilla.gnome.org/show_bug.cgi?id=774368>'
                     raise MesonException(m)
@@ -493,7 +499,7 @@ class GnomeModule(ExtensionModule):
             raise MesonException('GResource header is installed yet export is not enabled')
 
         depfile: T.Optional[str] = None
-        target_cmd: T.List[T.Union[ExternalProgram, Executable, OverrideProgram, str]]
+        target_cmd: T.List[T.Union['ToolType', str]]
         if not mesonlib.version_compare(glib_version, gresource_dep_needed_version):
             # This will eventually go out of sync if dependencies are added
             target_cmd = cmd
@@ -784,15 +790,16 @@ class GnomeModule(ExtensionModule):
             self.devenv = build.EnvironmentVariables()
         self.devenv.prepend(varname, [value])
 
-    def get_devenv(self) -> T.Optional[build.EnvironmentVariables]:
-        return self.devenv
+    def postconf_hook(self, b: build.Build) -> None:
+        if self.devenv is not None:
+            b.devenv.append(self.devenv)
 
     def _get_gir_dep(self, state: 'ModuleState') -> T.Tuple[Dependency, T.Union[build.Executable, 'ExternalProgram', 'OverrideProgram'],
                                                             T.Union[build.Executable, 'ExternalProgram', 'OverrideProgram']]:
         if not self.gir_dep:
             self.gir_dep = state.dependency('gobject-introspection-1.0')
-            self.giscanner = state.find_tool('g-ir-scanner', 'gobject-introspection-1.0', 'g_ir_scanner')
-            self.gicompiler = state.find_tool('g-ir-compiler', 'gobject-introspection-1.0', 'g_ir_compiler')
+            self.giscanner = self._find_tool(state, 'g-ir-scanner')
+            self.gicompiler = self._find_tool(state, 'g-ir-compiler')
         return self.gir_dep, self.giscanner, self.gicompiler
 
     @functools.lru_cache(maxsize=None)
@@ -979,6 +986,10 @@ class GnomeModule(ExtensionModule):
         # settings user could have set in machine file, like PKG_CONFIG_LIBDIR,
         # SYSROOT, etc.
         run_env = PkgConfigDependency.get_env(state.environment, MachineChoice.HOST, uninstalled=True)
+        # g-ir-scanner uses Python's distutils to find the compiler, which uses 'CC'
+        cc_exelist = state.environment.coredata.compilers.host['c'].get_exelist()
+        run_env.set('CC', [quote_arg(x) for x in cc_exelist], ' ')
+        run_env.merge(kwargs['env'])
 
         return GirTarget(
             girfile,
@@ -1023,6 +1034,7 @@ class GnomeModule(ExtensionModule):
             install_dir=[install_dir],
             install_tag=['typelib'],
             build_by_default=kwargs['build_by_default'],
+            env=kwargs['env'],
         )
 
     @staticmethod
@@ -1095,6 +1107,7 @@ class GnomeModule(ExtensionModule):
         INSTALL_KW,
         _BUILD_BY_DEFAULT.evolve(since='0.40.0'),
         _EXTRA_ARGS_KW,
+        ENV_KW.evolve(since='1.2.0'),
         KwargInfo('dependencies', ContainerTypeInfo(list, Dependency), default=[], listify=True),
         KwargInfo('export_packages', ContainerTypeInfo(list, str), default=[], listify=True),
         KwargInfo('fatal_warnings', bool, default=False, since='0.55.0'),
@@ -1118,6 +1131,9 @@ class GnomeModule(ExtensionModule):
     )
     def generate_gir(self, state: 'ModuleState', args: T.Tuple[T.List[T.Union[build.Executable, build.SharedLibrary, build.StaticLibrary]]],
                      kwargs: 'GenerateGir') -> ModuleReturnValue:
+        # Ensure we have a C compiler even in C++ projects.
+        state.add_language('c', MachineChoice.HOST)
+
         girtargets = [self._unwrap_gir_target(arg, state) for arg in args[0]]
         if len(girtargets) > 1 and any(isinstance(el, build.Executable) for el in girtargets):
             raise MesonException('generate_gir only accepts a single argument when one of the arguments is an executable')
@@ -1232,7 +1248,7 @@ class GnomeModule(ExtensionModule):
         srcdir = os.path.join(state.build_to_src, state.subdir)
         outdir = state.subdir
 
-        cmd: T.List[T.Union[ExternalProgram, Executable, OverrideProgram, str]] = [state.find_program('glib-compile-schemas'), '--targetdir', outdir, srcdir]
+        cmd: T.List[T.Union['ToolType', str]] = [self._find_tool(state, 'glib-compile-schemas'), '--targetdir', outdir, srcdir]
         if state.subdir == '':
             targetname = 'gsettings-compile'
         else:
@@ -1432,6 +1448,9 @@ class GnomeModule(ExtensionModule):
 
         namespace = kwargs['namespace']
 
+        # Ensure we have a C compiler even in C++ projects.
+        state.add_language('c', MachineChoice.HOST)
+
         def abs_filenames(files: T.Iterable['FileOrString']) -> T.Iterator[str]:
             for f in files:
                 if isinstance(f, mesonlib.File):
@@ -1597,7 +1616,7 @@ class GnomeModule(ExtensionModule):
                       kwargs: 'GdbusCodegen') -> ModuleReturnValue:
         namebase = args[0]
         xml_files: T.List[T.Union['FileOrString', build.GeneratedTypes]] = [args[1]] if args[1] else []
-        cmd: T.List[T.Union[ExternalProgram, Executable, OverrideProgram, str]] = [state.find_program('gdbus-codegen')]
+        cmd: T.List[T.Union['ToolType', str]] = [self._find_tool(state, 'gdbus-codegen')]
         cmd.extend(kwargs['extra_args'])
 
         # Autocleanup supported?
@@ -1904,8 +1923,8 @@ class GnomeModule(ExtensionModule):
 
         return ModuleReturnValue([c_file, h_file], [c_file, h_file])
 
-    @staticmethod
     def _make_mkenum_impl(
+            self,
             state: 'ModuleState',
             sources: T.Sequence[T.Union[str, mesonlib.File, build.CustomTarget, build.CustomTargetIndex, build.GeneratedList]],
             output: str,
@@ -1915,7 +1934,7 @@ class GnomeModule(ExtensionModule):
             install_dir: T.Optional[T.Sequence[T.Union[str, bool]]] = None,
             depends: T.Optional[T.Sequence[T.Union[CustomTarget, CustomTargetIndex, BuildTarget]]] = None
             ) -> build.CustomTarget:
-        real_cmd: T.List[T.Union[ExternalProgram, Executable, OverrideProgram, str]] = [state.find_program(['glib-mkenums', 'mkenums'])]
+        real_cmd: T.List[T.Union[str, 'ToolType']] = [self._find_tool(state, 'glib-mkenums')]
         real_cmd.extend(cmd)
         _install_dir = install_dir or state.environment.coredata.get_option(mesonlib.OptionKey('includedir'))
         assert isinstance(_install_dir, str), 'for mypy'
@@ -1959,7 +1978,7 @@ class GnomeModule(ExtensionModule):
 
         new_genmarshal = mesonlib.version_compare(self._get_native_glib_version(state), '>= 2.53.3')
 
-        cmd: T.List[T.Union[ExternalProgram, Executable, OverrideProgram, str]] = [state.find_program('glib-genmarshal')]
+        cmd: T.List[T.Union['ToolType', str]] = [self._find_tool(state, 'glib-genmarshal')]
         if kwargs['prefix']:
             cmd.extend(['--prefix', kwargs['prefix']])
         if kwargs['extra_args']:
@@ -2154,7 +2173,7 @@ class GnomeModule(ExtensionModule):
         # - add relevant directories to include dirs
         incs = [build.IncludeDirs(state.subdir, ['.'] + vapi_includes, False)]
         sources = [vapi_target] + vapi_depends
-        rv = InternalDependency(None, incs, [], [], link_with, [], sources, [], {}, [], [], [])
+        rv = InternalDependency(None, incs, [], [], link_with, [], sources, [], [], {}, [], [], [])
         created_values.append(rv)
         return ModuleReturnValue(rv, created_values)
 

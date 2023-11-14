@@ -34,7 +34,7 @@ if T.TYPE_CHECKING:
     from ..dependencies import Dependency
     from ..environment import Environment  # noqa: F401
     from ..envconfig import MachineInfo
-    from ..linkers import DynamicLinker
+    from ..linkers.linkers import DynamicLinker
     from ..mesonlib import MachineChoice
     from ..programs import ExternalProgram
 
@@ -557,7 +557,7 @@ class CudaCompiler(Compiler):
         mlog.debug(stde)
         mlog.debug('-----')
         if pc.returncode != 0:
-            raise EnvironmentException(f'Compiler {self.name_string()} can not compile programs.')
+            raise EnvironmentException(f'Compiler {self.name_string()} cannot compile programs.')
 
         # Run sanity check (if possible)
         if self.is_cross:
@@ -787,5 +787,5 @@ class CudaCompiler(Compiler):
     def get_profile_use_args(self) -> T.List[str]:
         return ['-Xcompiler=' + x for x in self.host_compiler.get_profile_use_args()]
 
-    def get_disable_assert_args(self) -> T.List[str]:
-        return self.host_compiler.get_disable_assert_args()
+    def get_assert_args(self, disable: bool) -> T.List[str]:
+        return self.host_compiler.get_assert_args(disable)

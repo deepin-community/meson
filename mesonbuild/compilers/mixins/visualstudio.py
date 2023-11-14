@@ -213,7 +213,7 @@ class VisualStudioLikeCompiler(Compiler, metaclass=abc.ABCMeta):
         return ['/DEF:' + defsfile]
 
     def gen_pch_args(self, header: str, source: str, pchname: str) -> T.Tuple[str, T.List[str]]:
-        objname = os.path.splitext(pchname)[0] + '.obj'
+        objname = os.path.splitext(source)[0] + '.obj'
         return objname, ['/Yc' + header, '/Fp' + pchname, '/Fo' + objname]
 
     def openmp_flags(self) -> T.List[str]:
@@ -450,7 +450,7 @@ class MSVCCompiler(VisualStudioLikeCompiler):
         if self.version.split('.')[0] == '16' and instruction_set == 'avx':
             # VS documentation says that this exists and should work, but
             # it does not. The headers do not contain AVX intrinsics
-            # and they can not be called.
+            # and they cannot be called.
             return None
         return super().get_instruction_set_args(instruction_set)
 

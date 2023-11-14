@@ -18,20 +18,19 @@ from __future__ import annotations
 import dataclasses
 import typing as T
 
-from .. import mesonlib
+from .. import build, mesonlib
 from ..build import IncludeDirs
 from ..interpreterbase.decorators import noKwargs, noPosargs
 from ..mesonlib import relpath, HoldableObject, MachineChoice
 from ..programs import ExternalProgram
 
 if T.TYPE_CHECKING:
-    from .. import build
     from ..interpreter import Interpreter
     from ..interpreter.interpreterobjects import MachineHolder
     from ..interpreterbase import TYPE_var, TYPE_kwargs
     from ..programs import OverrideProgram
     from ..wrap import WrapMode
-    from ..build import EnvironmentVariables, Executable
+    from ..build import Executable
     from ..dependencies import Dependency
 
 class ModuleState:
@@ -113,7 +112,7 @@ class ModuleState:
         if dep.found() and dep.type_name == 'pkgconfig':
             value = dep.get_variable(pkgconfig=varname)
             if value:
-                return ExternalProgram(name, [value])
+                return ExternalProgram(value)
 
         # Normal program lookup
         return self.find_program(name, required=required, wanted=wanted)
@@ -168,6 +167,8 @@ class ModuleState:
             else:
                 yield self._interpreter.build_incdir_object([d])
 
+    def add_language(self, lang: str, for_machine: MachineChoice) -> None:
+        self._interpreter.add_languages([lang], True, for_machine)
 
 class ModuleObject(HoldableObject):
     """Base class for all objects returned by modules
@@ -219,8 +220,8 @@ class NewExtensionModule(ModuleObject):
     def found() -> bool:
         return True
 
-    def get_devenv(self) -> T.Optional['EnvironmentVariables']:
-        return None
+    def postconf_hook(self, b: build.Build) -> None:
+        pass
 
 # FIXME: Port all modules to stop using self.interpreter and use API on
 # ModuleState instead. Modules should stop using this class and instead use
@@ -261,3 +262,18 @@ class ModuleReturnValue:
         self.return_value = return_value
         assert isinstance(new_objects, list)
         self.new_objects: T.List[T.Union['TYPE_var', 'build.ExecutableSerialisation']] = new_objects
+
+class GResourceTarget(build.CustomTarget):
+    pass
+
+class GResourceHeaderTarget(build.CustomTarget):
+    pass
+
+class GirTarget(build.CustomTarget):
+    pass
+
+class TypelibTarget(build.CustomTarget):
+    pass
+
+class VapiTarget(build.CustomTarget):
+    pass
