@@ -639,6 +639,8 @@ class MachineHolder(ObjectHolder['MachineInfo']):
                              'cpu': self.cpu_method,
                              'cpu_family': self.cpu_family_method,
                              'endian': self.endian_method,
+                             'kernel': self.kernel_method,
+                             'subsystem': self.subsystem_method,
                              })
 
     @noPosargs
@@ -660,6 +662,21 @@ class MachineHolder(ObjectHolder['MachineInfo']):
     @noKwargs
     def endian_method(self, args: T.List[TYPE_var], kwargs: TYPE_kwargs) -> str:
         return self.held_object.endian
+
+    @noPosargs
+    @noKwargs
+    def kernel_method(self, args: T.List[TYPE_var], kwargs: TYPE_kwargs) -> str:
+        if self.held_object.kernel is not None:
+            return self.held_object.kernel
+        raise InterpreterException('Kernel not defined or could not be autodetected.')
+
+    @noPosargs
+    @noKwargs
+    def subsystem_method(self, args: T.List[TYPE_var], kwargs: TYPE_kwargs) -> str:
+        if self.held_object.subsystem is not None:
+            return self.held_object.subsystem
+        raise InterpreterException('Subsystem not defined or could not be autodetected.')
+
 
 class IncludeDirsHolder(ObjectHolder[build.IncludeDirs]):
     pass
@@ -731,7 +748,8 @@ class SubprojectHolder(MesonInterpreterObject):
                  subdir: str,
                  warnings: int = 0,
                  disabled_feature: T.Optional[str] = None,
-                 exception: T.Optional[Exception] = None) -> None:
+                 exception: T.Optional[Exception] = None,
+                 callstack: T.Optional[T.List[str]] = None) -> None:
         super().__init__()
         self.held_object = subinterpreter
         self.warnings = warnings
@@ -739,6 +757,7 @@ class SubprojectHolder(MesonInterpreterObject):
         self.exception = exception
         self.subdir = PurePath(subdir).as_posix()
         self.cm_interpreter: T.Optional[CMakeInterpreter] = None
+        self.callstack = callstack
         self.methods.update({'get_variable': self.get_variable_method,
                              'found': self.found_method,
                              })
@@ -885,6 +904,9 @@ class BuildTargetHolder(ObjectHolder[_BuildTarget]):
 
     @noPosargs
     @noKwargs
+    @FeatureDeprecated('BuildTarget.get_id', '1.2.0',
+                       'This was never formally documented and does not seem to have a real world use. ' +
+                       'See https://github.com/mesonbuild/meson/pull/6061')
     def get_id_method(self, args: T.List[TYPE_var], kwargs: TYPE_kwargs) -> str:
         return self._target_object.get_id()
 

@@ -144,6 +144,7 @@ __all__ = [
     'path_is_in_root',
     'pickle_load',
     'Popen_safe',
+    'Popen_safe_logged',
     'quiet_git',
     'quote_arg',
     'relative_to_if_possible',
@@ -701,15 +702,23 @@ def darwin_get_object_archs(objpath: str) -> 'ImmutableListProtocol[str]':
         mlog.debug(f'lipo {objpath}: {stderr}')
         return None
     stdo = stdo.rsplit(': ', 1)[1]
+
     # Convert from lipo-style archs to meson-style CPUs
-    stdo = stdo.replace('i386', 'x86')
-    stdo = stdo.replace('arm64', 'aarch64')
-    stdo = stdo.replace('ppc7400', 'ppc')
-    stdo = stdo.replace('ppc970', 'ppc')
+    map_arch = {
+        'i386': 'x86',
+        'arm64': 'aarch64',
+        'arm64e': 'aarch64',
+        'ppc7400': 'ppc',
+        'ppc970': 'ppc',
+    }
+    lipo_archs = stdo.split()
+    meson_archs = [map_arch.get(lipo_arch, lipo_arch) for lipo_arch in lipo_archs]
+
     # Add generic name for armv7 and armv7s
     if 'armv7' in stdo:
-        stdo += ' arm'
-    return stdo.split()
+        meson_archs.append('arm')
+
+    return meson_archs
 
 def windows_detect_native_arch() -> str:
     """
@@ -754,7 +763,7 @@ def detect_vcs(source_dir: T.Union[str, Path]) -> T.Optional[T.Dict[str, str]]:
             'name': 'git',
             'cmd': 'git',
             'repo_dir': '.git',
-            'get_rev': 'git describe --dirty=+',
+            'get_rev': 'git describe --dirty=+ --always',
             'rev_regex': '(.*)',
             'dep': '.git/logs/HEAD'
         },
@@ -1512,6 +1521,21 @@ def Popen_safe_legacy(args: T.List[str], write: T.Optional[str] = None,
     return p, o, e
 
 
+def Popen_safe_logged(args: T.List[str], msg: str = 'Called', **kwargs: T.Any) -> T.Tuple['subprocess.Popen[str]', str, str]:
+    '''
+    Wrapper around Popen_safe that assumes standard piped o/e and logs this to the meson log.
+    '''
+    p, o, e = Popen_safe(args, **kwargs)
+    rc, out, err = p.returncode, o.strip(), e.strip()
+    mlog.debug('-----------')
+    mlog.debug(f'{msg}: `{join_args(args)}` -> {rc}')
+    if out:
+        mlog.debug(f'stdout:\n{out}\n-----------')
+    if err:
+        mlog.debug(f'stderr:\n{err}\n-----------')
+    return p, o, e
+
+
 def iter_regexin_iter(regexiter: T.Iterable[str], initer: T.Iterable[str]) -> T.Optional[str]:
     '''
     Takes each regular expression in @regexiter and tries to search for it in
@@ -1893,17 +1917,20 @@ class ProgressBarFallback:  # lgtm [py/iter-returns-non-self]
     __iter__ method' warning.
     '''
     def __init__(self, iterable: T.Optional[T.Iterable[str]] = None, total: T.Optional[int] = None,
-                 bar_type: T.Optional[str] = None, desc: T.Optional[str] = None):
+                 bar_type: T.Optional[str] = None, desc: T.Optional[str] = None,
+                 disable: T.Optional[bool] = None):
         if iterable is not None:
             self.iterable = iter(iterable)
             return
         self.total = total
         self.done = 0
         self.printed_dots = 0
-        if self.total and bar_type == 'download':
-            print('Download size:', self.total)
-        if desc:
-            print(f'{desc}: ', end='')
+        self.disable = not mlog.colorize_console() if disable is None else disable
+        if not self.disable:
+            if self.total and bar_type == 'download':
+                print('Download size:', self.total)
+            if desc:
+                print(f'{desc}: ', end='')
 
     # Pretend to be an iterator when called as one and don't print any
     # progress
@@ -1914,8 +1941,9 @@ class ProgressBarFallback:  # lgtm [py/iter-returns-non-self]
         return next(self.iterable)
 
     def print_dot(self) -> None:
-        print('.', end='')
-        sys.stdout.flush()
+        if not self.disable:
+            print('.', end='')
+            sys.stdout.flush()
         self.printed_dots += 1
 
     def update(self, progress: int) -> None:
@@ -1929,7 +1957,8 @@ class ProgressBarFallback:  # lgtm [py/iter-returns-non-self]
             self.print_dot()
 
     def close(self) -> None:
-        print('')
+        if not self.disable:
+            print()
 
 try:
     from tqdm import tqdm
@@ -1940,10 +1969,17 @@ else:
     class ProgressBarTqdm(tqdm):
         def __init__(self, *args: T.Any, bar_type: T.Optional[str] = None, **kwargs: T.Any) -> None:
             if bar_type == 'download':
-                kwargs.update({'unit': 'bytes', 'leave': True})
+                kwargs.update({'unit': 'B',
+                               'unit_scale': True,
+                               'unit_divisor': 1024,
+                               'leave': True,
+                               'bar_format': '{l_bar}{bar}| {n_fmt}/{total_fmt} {rate_fmt} eta {remaining}',
+                               })
+
             else:
-                kwargs.update({'leave': False})
-            kwargs['ncols'] = 100
+                kwargs.update({'leave': False,
+                               'bar_format': '{l_bar}{bar}| {n_fmt}/{total_fmt} eta {remaining}',
+                               })
             super().__init__(*args, **kwargs)
 
     ProgressBar = ProgressBarTqdm
@@ -2130,6 +2166,7 @@ _BUILTIN_NAMES = {
     'debug',
     'default_library',
     'errorlogs',
+    'genvslite',
     'install_umask',
     'layout',
     'optimization',
@@ -2346,22 +2383,22 @@ class OptionKey:
         return self.type is OptionType.BASE
 
 
-def pickle_load(filename: str, object_name: str, object_type: T.Type[_PL]) -> _PL:
-    load_fail_msg = f'{object_name} file {filename!r} is corrupted. Try with a fresh build tree.'
+def pickle_load(filename: str, object_name: str, object_type: T.Type[_PL], suggest_reconfigure: bool = True) -> _PL:
+    load_fail_msg = f'{object_name} file {filename!r} is corrupted.'
+    extra_msg = ' Consider reconfiguring the directory with "meson setup --reconfigure".' if suggest_reconfigure else ''
     try:
         with open(filename, 'rb') as f:
             obj = pickle.load(f)
     except (pickle.UnpicklingError, EOFError):
-        raise MesonException(load_fail_msg)
+        raise MesonException(load_fail_msg + extra_msg)
     except (TypeError, ModuleNotFoundError, AttributeError):
-        build_dir = os.path.dirname(os.path.dirname(filename))
         raise MesonException(
             f"{object_name} file {filename!r} references functions or classes that don't "
             "exist. This probably means that it was generated with an old "
-            "version of meson. Try running from the source directory "
-            f'meson setup {build_dir} --wipe')
+            "version of meson." + extra_msg)
+
     if not isinstance(obj, object_type):
-        raise MesonException(load_fail_msg)
+        raise MesonException(load_fail_msg + extra_msg)
 
     # Because these Protocols are not available at runtime (and cannot be made
     # available at runtime until we drop support for Python < 3.8), we have to
@@ -2375,7 +2412,7 @@ def pickle_load(filename: str, object_name: str, object_type: T.Type[_PL]) -> _P
     from ..coredata import version as coredata_version
     from ..coredata import major_versions_differ, MesonVersionMismatchException
     if major_versions_differ(version, coredata_version):
-        raise MesonVersionMismatchException(version, coredata_version)
+        raise MesonVersionMismatchException(version, coredata_version, extra_msg)
     return obj
 
 

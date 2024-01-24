@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from .base import ExternalDependency, DependencyException, DependencyTypeName
-from ..mesonlib import listify, Popen_safe, split_args, version_compare, version_compare_many
+from ..mesonlib import listify, Popen_safe, Popen_safe_logged, split_args, version_compare, version_compare_many
 from ..programs import find_external_program
 from .. import mlog
 import re
@@ -43,6 +43,7 @@ class ConfigToolDependency(ExternalDependency):
     tool_name: T.Optional[str] = None
     version_arg = '--version'
     skip_version: T.Optional[str] = None
+    allow_default_for_cross = False
     __strip_version = re.compile(r'^[0-9][0-9.]+')
 
     def __init__(self, name: str, environment: 'Environment', kwargs: T.Dict[str, T.Any], language: T.Optional[str] = None):
@@ -85,7 +86,7 @@ class ConfigToolDependency(ExternalDependency):
         best_match: T.Tuple[T.Optional[T.List[str]], T.Optional[str]] = (None, None)
         for potential_bin in find_external_program(
                 self.env, self.for_machine, self.tool_name,
-                self.tool_name, self.tools, allow_default_for_cross=False):
+                self.tool_name, self.tools, allow_default_for_cross=self.allow_default_for_cross):
             if not potential_bin.found():
                 continue
             tool = potential_bin.get_command()
@@ -142,7 +143,7 @@ class ConfigToolDependency(ExternalDependency):
         return self.config is not None
 
     def get_config_value(self, args: T.List[str], stage: str) -> T.List[str]:
-        p, out, err = Popen_safe(self.config + args)
+        p, out, err = Popen_safe_logged(self.config + args)
         if p.returncode != 0:
             if self.required:
                 raise DependencyException(f'Could not generate {stage} for {self.name}.\n{err}')

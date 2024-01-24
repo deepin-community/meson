@@ -19,6 +19,7 @@ from pathlib import Path
 from collections import deque
 from contextlib import suppress
 from copy import deepcopy
+from fnmatch import fnmatch
 import argparse
 import asyncio
 import datetime
@@ -70,6 +71,26 @@ GNU_ERROR_RETURNCODE = 99
 
 # Exit if 3 Ctrl-C's are received within one second
 MAX_CTRLC = 3
+
+# Define unencodable xml characters' regex for replacing them with their
+# printable representation
+UNENCODABLE_XML_UNICHRS: T.List[T.Tuple[int, int]] = [
+    (0x00, 0x08), (0x0B, 0x0C), (0x0E, 0x1F), (0x7F, 0x84),
+    (0x86, 0x9F), (0xFDD0, 0xFDEF), (0xFFFE, 0xFFFF)]
+# Not narrow build
+if sys.maxunicode >= 0x10000:
+    UNENCODABLE_XML_UNICHRS.extend([
+        (0x1FFFE, 0x1FFFF), (0x2FFFE, 0x2FFFF),
+        (0x3FFFE, 0x3FFFF), (0x4FFFE, 0x4FFFF),
+        (0x5FFFE, 0x5FFFF), (0x6FFFE, 0x6FFFF),
+        (0x7FFFE, 0x7FFFF), (0x8FFFE, 0x8FFFF),
+        (0x9FFFE, 0x9FFFF), (0xAFFFE, 0xAFFFF),
+        (0xBFFFE, 0xBFFFF), (0xCFFFE, 0xCFFFF),
+        (0xDFFFE, 0xDFFFF), (0xEFFFE, 0xEFFFF),
+        (0xFFFFE, 0xFFFFF), (0x10FFFE, 0x10FFFF)])
+UNENCODABLE_XML_CHR_RANGES = [fr'{chr(low)}-{chr(high)}' for (low, high) in UNENCODABLE_XML_UNICHRS]
+UNENCODABLE_XML_CHRS_RE = re.compile('([' + ''.join(UNENCODABLE_XML_CHR_RANGES) + '])')
+
 
 def is_windows() -> bool:
     platname = platform.system().lower()
@@ -846,10 +867,10 @@ class JunitBuilder(TestLogger):
                     et.SubElement(testcase, 'system-out').text = subtest.explanation
             if test.stdo:
                 out = et.SubElement(suite, 'system-out')
-                out.text = test.stdo.rstrip()
+                out.text = replace_unencodable_xml_chars(test.stdo.rstrip())
             if test.stde:
                 err = et.SubElement(suite, 'system-err')
-                err.text = test.stde.rstrip()
+                err.text = replace_unencodable_xml_chars(test.stde.rstrip())
         else:
             if test.project not in self.suites:
                 suite = self.suites[test.project] = et.Element(
@@ -872,10 +893,10 @@ class JunitBuilder(TestLogger):
                 suite.attrib['failures'] = str(int(suite.attrib['failures']) + 1)
             if test.stdo:
                 out = et.SubElement(testcase, 'system-out')
-                out.text = test.stdo.rstrip()
+                out.text = replace_unencodable_xml_chars(test.stdo.rstrip())
             if test.stde:
                 err = et.SubElement(testcase, 'system-err')
-                err.text = test.stde.rstrip()
+                err.text = replace_unencodable_xml_chars(test.stde.rstrip())
 
     async def finish(self, harness: 'TestHarness') -> None:
         """Calculate total test counts and write out the xml result."""
@@ -1035,12 +1056,16 @@ class TestRunGTest(TestRunExitCode):
             filename = os.path.join(self.test.workdir, filename)
 
         try:
-            self.junit = et.parse(filename)
+            with open(filename, 'r', encoding='utf8', errors='replace') as f:
+                self.junit = et.parse(f)
         except FileNotFoundError:
             # This can happen if the test fails to run or complete for some
             # reason, like the rpath for libgtest isn't properly set. ExitCode
             # will handle the failure, don't generate a stacktrace.
             pass
+        except et.ParseError as e:
+            # ExitCode will handle the failure, don't generate a stacktrace.
+            mlog.error(f'Unable to parse {filename}: {e!s}')
 
         super().complete()
 
@@ -1143,6 +1168,13 @@ class TestRunRust(TestRun):
 
 TestRun.PROTOCOL_TO_CLASS[TestProtocol.RUST] = TestRunRust
 
+# Check unencodable characters in xml output and replace them with
+# their printable representation
+def replace_unencodable_xml_chars(original_str: str) -> str:
+    # [1:-1] is needed for removing `'` characters from both start and end
+    # of the string
+    replacement_lambda = lambda illegal_chr: repr(illegal_chr.group())[1:-1]
+    return UNENCODABLE_XML_CHRS_RE.sub(replacement_lambda, original_str)
 
 def decode(stream: T.Union[None, bytes]) -> str:
     if stream is None:
@@ -1447,7 +1479,7 @@ class SingleTestRunner:
 
     async def run(self, harness: 'TestHarness') -> TestRun:
         if self.cmd is None:
-            self.stdo = 'Not run because can not execute cross compiled binaries.'
+            self.stdo = 'Not run because cannot execute cross compiled binaries.'
             harness.log_start_test(self.runobj)
             self.runobj.complete_skip()
         else:
@@ -1601,9 +1633,12 @@ class TestHarness:
             # happen before rebuild_deps(), because we need the correct list of
             # tests and their dependencies to compute
             if not self.options.no_rebuild:
-                ret = subprocess.run(self.ninja + ['build.ninja']).returncode
-                if ret != 0:
-                    raise TestException(f'Could not configure {self.options.wd!r}')
+                teststdo = subprocess.run(self.ninja + ['-n', 'build.ninja'], capture_output=True).stdout
+                if b'ninja: no work to do.' not in teststdo and b'samu: nothing to do' not in teststdo:
+                    stdo = sys.stderr if self.options.list else sys.stdout
+                    ret = subprocess.run(self.ninja + ['build.ninja'], stdout=stdo.fileno())
+                    if ret.returncode != 0:
+                        raise TestException(f'Could not configure {self.options.wd!r}')
 
             self.build_data = build.load(os.getcwd())
             if not self.options.setup:
@@ -1855,21 +1890,52 @@ class TestHarness:
         run all tests with that name across all subprojects, which is
         identical to "meson test foo1"
         '''
+        patterns: T.Dict[T.Tuple[str, str], bool] = {}
         for arg in self.options.args:
+            # Replace empty components by wildcards:
+            # '' -> '*:*'
+            # 'name' -> '*:name'
+            # ':name' -> '*:name'
+            # 'proj:' -> 'proj:*'
             if ':' in arg:
                 subproj, name = arg.split(':', maxsplit=1)
+                if name == '':
+                    name = '*'
+                if subproj == '':  # in case arg was ':'
+                    subproj = '*'
             else:
-                subproj, name = '', arg
-            for t in tests:
-                if subproj and t.project_name != subproj:
-                    continue
-                if name and t.name != name:
-                    continue
-                yield t
+                subproj, name = '*', arg
+            patterns[(subproj, name)] = False
 
-    def get_tests(self) -> T.List[TestSerialisation]:
+        for t in tests:
+            # For each test, find the first matching pattern
+            # and mark it as used. yield the matching tests.
+            for subproj, name in list(patterns):
+                if fnmatch(t.project_name, subproj) and fnmatch(t.name, name):
+                    patterns[(subproj, name)] = True
+                    yield t
+                    break
+
+        for (subproj, name), was_used in patterns.items():
+            if not was_used:
+                # For each unused pattern...
+                arg = f'{subproj}:{name}'
+                for t in tests:
+                    # ... if it matches a test, then it wasn't used because another
+                    # pattern matched the same test before.
+                    # Report it as a warning.
+                    if fnmatch(t.project_name, subproj) and fnmatch(t.name, name):
+                        mlog.warning(f'{arg} test name is redundant and was not used')
+                        break
+                else:
+                    # If the pattern doesn't match any test,
+                    # report it as an error. We don't want the `test` command to
+                    # succeed on an invalid pattern.
+                    raise MesonException(f'{arg} test name does not match any test')
+
+    def get_tests(self, errorfile: T.Optional[T.IO] = None) -> T.List[TestSerialisation]:
         if not self.tests:
-            print('No tests defined.')
+            print('No tests defined.', file=errorfile)
             return []
 
         tests = [t for t in self.tests if self.test_suitable(t)]
@@ -1877,7 +1943,7 @@ class TestHarness:
             tests = list(self.tests_from_args(tests))
 
         if not tests:
-            print('No suitable tests defined.')
+            print('No suitable tests defined.', file=errorfile)
             return []
 
         return tests
@@ -2035,7 +2101,7 @@ class TestHarness:
                 await l.finish(self)
 
 def list_tests(th: TestHarness) -> bool:
-    tests = th.get_tests()
+    tests = th.get_tests(errorfile=sys.stderr)
     for t in tests:
         print(th.get_pretty_suite(t))
     return not tests

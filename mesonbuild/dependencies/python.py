@@ -20,6 +20,7 @@ import typing as T
 from .. import mesonlib, mlog
 from .base import process_method_kw, DependencyMethods, DependencyTypeName, ExternalDependency, SystemDependency
 from .configtool import ConfigToolDependency
+from .detect import packages
 from .factory import DependencyFactory
 from .framework import ExtraFrameworkDependency
 from .pkgconfig import PkgConfigDependency
@@ -54,6 +55,9 @@ else:
 class Pybind11ConfigToolDependency(ConfigToolDependency):
 
     tools = ['pybind11-config']
+
+    # any version of the tool is valid, since this is header-only
+    allow_default_for_cross = True
 
     # pybind11 in 2.10.4 added --version, sanity-check another flag unique to it
     # in the meantime
@@ -109,7 +113,9 @@ class BasicPythonExternalProgram(ExternalProgram):
 
         with importlib.resources.path('mesonbuild.scripts', 'python_info.py') as f:
             cmd = self.get_command() + [str(f)]
-            p, stdout, stderr = mesonlib.Popen_safe(cmd)
+            env = os.environ.copy()
+            env['SETUPTOOLS_USE_DISTUTILS'] = 'stdlib'
+            p, stdout, stderr = mesonlib.Popen_safe(cmd, env=env)
 
         try:
             info = json.loads(stdout)
@@ -404,7 +410,9 @@ def python_factory(env: 'Environment', for_machine: 'MachineChoice',
 
     return candidates
 
-pybind11_factory = DependencyFactory(
+packages['python3'] = python_factory
+
+packages['pybind11'] = pybind11_factory = DependencyFactory(
     'pybind11',
     [DependencyMethods.PKGCONFIG, DependencyMethods.CONFIG_TOOL, DependencyMethods.CMAKE],
     configtool_class=Pybind11ConfigToolDependency,

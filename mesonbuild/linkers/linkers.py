@@ -14,10 +14,11 @@
 from __future__ import annotations
 
 import abc
-import enum
 import os
 import typing as T
+import re
 
+from .base import ArLikeLinker, RSPFileSyntax
 from .. import mesonlib
 from ..mesonlib import EnvironmentException, MesonException
 from ..arglist import CompilerArgs
@@ -26,15 +27,6 @@ if T.TYPE_CHECKING:
     from ..coredata import KeyedOptionDictType
     from ..environment import Environment
     from ..mesonlib import MachineChoice
-
-
-@enum.unique
-class RSPFileSyntax(enum.Enum):
-
-    """Which RSP file syntax the compiler supports."""
-
-    MSVC = enum.auto()
-    GCC = enum.auto()
 
 
 class StaticLinker:
@@ -154,6 +146,8 @@ class VisualStudioLinker(VisualStudioLikeLinker, StaticLinker):
 
     """Microsoft's lib static linker."""
 
+    id = 'lib'
+
     def __init__(self, exelist: T.List[str], machine: str):
         StaticLinker.__init__(self, exelist)
         VisualStudioLikeLinker.__init__(self, machine)
@@ -163,31 +157,14 @@ class IntelVisualStudioLinker(VisualStudioLikeLinker, StaticLinker):
 
     """Intel's xilib static linker."""
 
+    id = 'xilib'
+
     def __init__(self, exelist: T.List[str], machine: str):
         StaticLinker.__init__(self, exelist)
         VisualStudioLikeLinker.__init__(self, machine)
 
 
-class ArLikeLinker(StaticLinker):
-    # POSIX requires supporting the dash, GNU permits omitting it
-    std_args = ['-csr']
-
-    def can_linker_accept_rsp(self) -> bool:
-        # armar / AIX can't accept arguments using the @rsp syntax
-        # in fact, only the 'ar' id can
-        return False
-
-    def get_std_link_args(self, env: 'Environment', is_thin: bool) -> T.List[str]:
-        return self.std_args
-
-    def get_output_args(self, target: str) -> T.List[str]:
-        return [target]
-
-    def rsp_file_syntax(self) -> RSPFileSyntax:
-        return RSPFileSyntax.GCC
-
-
-class ArLinker(ArLikeLinker):
+class ArLinker(ArLikeLinker, StaticLinker):
     id = 'ar'
 
     def __init__(self, for_machine: mesonlib.MachineChoice, exelist: T.List[str]):
@@ -227,7 +204,7 @@ class AppleArLinker(ArLinker):
     id = 'applear'
 
 
-class ArmarLinker(ArLikeLinker):
+class ArmarLinker(ArLikeLinker, StaticLinker):
     id = 'armar'
 
 
@@ -322,10 +299,32 @@ class C2000Linker(TILinker):
     id = 'ar2000'
 
 
-class AIXArLinker(ArLikeLinker):
+class AIXArLinker(ArLikeLinker, StaticLinker):
     id = 'aixar'
     std_args = ['-csr', '-Xany']
 
+
+class MetrowerksStaticLinker(StaticLinker):
+
+    def can_linker_accept_rsp(self) -> bool:
+        return True
+
+    def get_linker_always_args(self) -> T.List[str]:
+        return ['-library']
+
+    def get_output_args(self, target: str) -> T.List[str]:
+        return ['-o', target]
+
+    def rsp_file_syntax(self) -> RSPFileSyntax:
+        return RSPFileSyntax.GCC
+
+
+class MetrowerksStaticLinkerARM(MetrowerksStaticLinker):
+    id = 'mwldarm'
+
+
+class MetrowerksStaticLinkerEmbeddedPowerPC(MetrowerksStaticLinker):
+    id = 'mwldeppc'
 
 def prepare_rpaths(raw_rpaths: T.Tuple[str, ...], build_dir: str, from_dir: str) -> T.List[str]:
     # The rpaths we write must be relative if they point to the build dir,
@@ -545,6 +544,14 @@ class DynamicLinker(metaclass=abc.ABCMeta):
 
     def get_soname_args(self, env: 'Environment', prefix: str, shlib_name: str,
                         suffix: str, soversion: str, darwin_versions: T.Tuple[str, str]) -> T.List[str]:
+        return []
+
+    def get_archive_name(self, filename: str) -> str:
+        #Only used by AIX.
+        return str()
+
+    def get_command_to_archive_shlib(self) -> T.List[str]:
+        #Only used by AIX.
         return []
 
 
@@ -1446,6 +1453,21 @@ class AIXDynamicLinker(PosixDynamicLinkerMixin, DynamicLinker):
     def get_allow_undefined_args(self) -> T.List[str]:
         return self._apply_prefix(['-berok'])
 
+    def get_archive_name(self, filename: str) -> str:
+        # In AIX we allow the shared library name to have the lt_version and so_version.
+        # But the archive name must just be .a .
+        # For Example shared object can have the name libgio.so.0.7200.1 but the archive
+        # must have the name libgio.a having libgio.a (libgio.so.0.7200.1) in the
+        # archive. This regular expression is to do the same.
+        filename = re.sub('[.][a]([.]?([0-9]+))*([.]?([a-z]+))*', '.a', filename.replace('.so', '.a'))
+        return filename
+
+    def get_command_to_archive_shlib(self) -> T.List[str]:
+        # Archive shared library object and remove the shared library object,
+        # since it already exists in the archive.
+        command = ['ar', '-q', '-v', '$out', '$in', '&&', 'rm', '-f', '$in']
+        return command
+
     def get_link_whole_for(self, args: T.List[str]) -> T.List[str]:
         # AIX's linker always links the whole archive: "The ld command
         # processes all input files in the same manner, whether they are
@@ -1465,9 +1487,9 @@ class AIXDynamicLinker(PosixDynamicLinkerMixin, DynamicLinker):
             all_paths.add(os.path.join(build_dir, p))
         # We should consider allowing the $LIBPATH environment variable
         # to override sys_path.
-        sys_path = env.get_compiler_system_dirs(self.for_machine)
+        sys_path = env.get_compiler_system_lib_dirs(self.for_machine)
         if len(sys_path) == 0:
-            # get_compiler_system_dirs doesn't support our compiler.
+            # get_compiler_system_lib_dirs doesn't support our compiler.
             # Use the default system library path
             all_paths.update(['/usr/lib', '/lib'])
         else:
@@ -1554,3 +1576,46 @@ class CudaLinker(PosixDynamicLinkerMixin, DynamicLinker):
     def get_soname_args(self, env: 'Environment', prefix: str, shlib_name: str,
                         suffix: str, soversion: str, darwin_versions: T.Tuple[str, str]) -> T.List[str]:
         return []
+
+
+class MetrowerksLinker(DynamicLinker):
+
+    def __init__(self, exelist: T.List[str], for_machine: mesonlib.MachineChoice,
+                 *, version: str = 'unknown version'):
+        super().__init__(exelist, for_machine, '', [],
+                         version=version)
+
+    def fatal_warnings(self) -> T.List[str]:
+        return ['-w', 'error']
+
+    def get_allow_undefined_args(self) -> T.List[str]:
+        return []
+
+    def get_accepts_rsp(self) -> bool:
+        return True
+
+    def get_lib_prefix(self) -> str:
+        return ""
+
+    def get_linker_always_args(self) -> T.List[str]:
+        return []
+
+    def get_output_args(self, target: str) -> T.List[str]:
+        return ['-o', target]
+
+    def get_search_args(self, dirname: str) -> T.List[str]:
+        return self._apply_prefix('-L' + dirname)
+
+    def invoked_by_compiler(self) -> bool:
+        return False
+
+    def rsp_file_syntax(self) -> RSPFileSyntax:
+        return RSPFileSyntax.GCC
+
+
+class MetrowerksLinkerARM(MetrowerksLinker):
+    id = 'mwldarm'
+
+
+class MetrowerksLinkerEmbeddedPowerPC(MetrowerksLinker):
+    id = 'mwldeppc'

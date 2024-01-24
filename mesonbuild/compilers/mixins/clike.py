@@ -35,7 +35,7 @@ from pathlib import Path
 from ... import arglist
 from ... import mesonlib
 from ... import mlog
-from ...linkers import GnuLikeDynamicLinkerMixin, SolarisDynamicLinker, CompCertDynamicLinker
+from ...linkers.linkers import GnuLikeDynamicLinkerMixin, SolarisDynamicLinker, CompCertDynamicLinker
 from ...mesonlib import LibType
 from ...coredata import OptionKey
 from .. import compilers
@@ -327,7 +327,7 @@ class CLikeCompiler(Compiler):
         mlog.debug(stde)
         mlog.debug('-----')
         if pc.returncode != 0:
-            raise mesonlib.EnvironmentException(f'Compiler {self.name_string()} can not compile programs.')
+            raise mesonlib.EnvironmentException(f'Compiler {self.name_string()} cannot compile programs.')
         # Run sanity check
         if self.is_cross:
             if self.exe_wrapper is None:
@@ -688,7 +688,7 @@ class CLikeCompiler(Compiler):
         # Get the preprocessed value after the delimiter,
         # minus the extra newline at the end and
         # merge string literals.
-        return self._concatenate_string_literals(p.stdout.split(delim + '\n')[-1][:-1]), cached
+        return self._concatenate_string_literals(p.stdout.split(delim + '\n')[-1][:-1]).strip(), cached
 
     def get_return_value(self, fname: str, rtype: str, prefix: str,
                          env: 'Environment', extra_args: T.Optional[T.List[str]],
@@ -1066,6 +1066,10 @@ class CLikeCompiler(Compiler):
 
     @staticmethod
     def _sort_shlibs_openbsd(libs: T.List[str]) -> T.List[str]:
+        def tuple_key(x: str) -> T.Tuple[int, ...]:
+            ver = x.rsplit('.so.', maxsplit=1)[1]
+            return tuple(int(i) for i in ver.split('.'))
+
         filtered = []  # type: T.List[str]
         for lib in libs:
             # Validate file as a shared library of type libfoo.so.X.Y
@@ -1073,12 +1077,11 @@ class CLikeCompiler(Compiler):
             if len(ret) != 2:
                 continue
             try:
-                float(ret[1])
+                tuple(int(i) for i in ret[1].split('.'))
             except ValueError:
                 continue
             filtered.append(lib)
-        float_cmp = lambda x: float(x.rsplit('.so.', maxsplit=1)[1])
-        return sorted(filtered, key=float_cmp, reverse=True)
+        return sorted(filtered, key=tuple_key, reverse=True)
 
     @classmethod
     def _get_trials_from_pattern(cls, pattern: str, directory: str, libname: str) -> T.List[Path]:
@@ -1332,8 +1335,10 @@ class CLikeCompiler(Compiler):
         return self.compiles(self.attribute_check_func(name), env,
                              extra_args=self.get_has_func_attribute_extra_args(name))
 
-    def get_disable_assert_args(self) -> T.List[str]:
-        return ['-DNDEBUG']
+    def get_assert_args(self, disable: bool) -> T.List[str]:
+        if disable:
+            return ['-DNDEBUG']
+        return []
 
     @functools.lru_cache(maxsize=None)
     def can_compile(self, src: 'mesonlib.FileOrString') -> bool:

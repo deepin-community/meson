@@ -41,7 +41,7 @@ from mesonbuild.mesonlib import (
     BuildDirLock, MachineChoice, is_windows, is_osx, is_cygwin, is_dragonflybsd,
     is_sunos, windows_proof_rmtree, python_command, version_compare, split_args, quote_arg,
     relpath, is_linux, git, search_version, do_conf_file, do_conf_str, default_prefix,
-    MesonException, EnvironmentException, OptionKey, ExecutableSerialisation, EnvironmentVariables,
+    MesonException, EnvironmentException, OptionKey,
     windows_proof_rm
 )
 from mesonbuild.programs import ExternalProgram
@@ -55,9 +55,11 @@ from mesonbuild.compilers import (
     detect_static_linker, detect_c_compiler, compiler_from_language,
     detect_compiler_for
 )
+from mesonbuild.linkers import linkers
 
-from mesonbuild.dependencies import PkgConfigDependency
+from mesonbuild.dependencies.pkgconfig import PkgConfigDependency
 from mesonbuild.build import Target, ConfigurationData, Executable, SharedLibrary, StaticLibrary
+from mesonbuild import mtest
 import mesonbuild.modules.pkgconfig
 from mesonbuild.scripts import destdir_join
 
@@ -354,7 +356,7 @@ class AllPlatformTests(BasePlatformTests):
         static_linker = detect_static_linker(env, cc)
         if is_windows():
             raise SkipTest('https://github.com/mesonbuild/meson/issues/1526')
-        if not isinstance(static_linker, mesonbuild.linkers.ArLinker):
+        if not isinstance(static_linker, linkers.ArLinker):
             raise SkipTest('static linker is not `ar`')
         # Configure
         self.init(testdir)
@@ -396,6 +398,62 @@ class AllPlatformTests(BasePlatformTests):
         self.assertTrue(compdb[2]['file'].endswith("libfile3.c"))
         self.assertTrue(compdb[3]['file'].endswith("libfile4.c"))
         # FIXME: We don't have access to the linker command
+
+    def test_replace_unencodable_xml_chars(self):
+        '''
+        Test that unencodable xml chars are replaced with their
+        printable representation
+        https://github.com/mesonbuild/meson/issues/9894
+        '''
+        # Create base string(\nHello Meson\n) to see valid chars are not replaced
+        base_string_invalid = '\n\x48\x65\x6c\x6c\x6f\x20\x4d\x65\x73\x6f\x6e\n'
+        base_string_valid = '\nHello Meson\n'
+        # Create invalid input from all known unencodable chars
+        invalid_string = (
+            '\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f\x10\x11'
+            '\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f'
+            '\x80\x81\x82\x83\x84\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f'
+            '\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e'
+            '\x9f\ufdd0\ufdd1\ufdd2\ufdd3\ufdd4\ufdd5\ufdd6\ufdd7\ufdd8'
+            '\ufdd9\ufdda\ufddb\ufddc\ufddd\ufdde\ufddf\ufde0\ufde1'
+            '\ufde2\ufde3\ufde4\ufde5\ufde6\ufde7\ufde8\ufde9\ufdea'
+            '\ufdeb\ufdec\ufded\ufdee\ufdef\ufffe\uffff')
+        if sys.maxunicode >= 0x10000:
+            invalid_string = invalid_string + (
+                '\U0001fffe\U0001ffff\U0002fffe\U0002ffff'
+                '\U0003fffe\U0003ffff\U0004fffe\U0004ffff'
+                '\U0005fffe\U0005ffff\U0006fffe\U0006ffff'
+                '\U0007fffe\U0007ffff\U0008fffe\U0008ffff'
+                '\U0009fffe\U0009ffff\U000afffe\U000affff'
+                '\U000bfffe\U000bffff\U000cfffe\U000cffff'
+                '\U000dfffe\U000dffff\U000efffe\U000effff'
+                '\U000ffffe\U000fffff\U0010fffe\U0010ffff')
+
+        valid_string = base_string_valid + repr(invalid_string)[1:-1] + base_string_valid
+        invalid_string = base_string_invalid + invalid_string + base_string_invalid
+        fixed_string = mtest.replace_unencodable_xml_chars(invalid_string)
+        self.assertEqual(fixed_string, valid_string)
+
+    def test_replace_unencodable_xml_chars_unit(self):
+        '''
+        Test that unencodable xml chars are replaced with their
+        printable representation
+        https://github.com/mesonbuild/meson/issues/9894
+        '''
+        if not shutil.which('xmllint'):
+            raise SkipTest('xmllint not installed')
+        testdir = os.path.join(self.unit_test_dir, '110 replace unencodable xml chars')
+        self.init(testdir)
+        tests_command_output = self.run_tests()
+        junit_xml_logs = Path(self.logdir, 'testlog.junit.xml')
+        subprocess.run(['xmllint', junit_xml_logs], check=True)
+        # Ensure command output and JSON / text logs are not mangled.
+        raw_output_sample = '\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b'
+        assert raw_output_sample in tests_command_output
+        text_log = Path(self.logdir, 'testlog.txt').read_text()
+        assert raw_output_sample in text_log
+        json_log = json.loads(Path(self.logdir, 'testlog.json').read_bytes())
+        assert raw_output_sample in json_log['stdout']
 
     def test_run_target_files_path(self):
         '''
@@ -818,6 +876,30 @@ class AllPlatformTests(BasePlatformTests):
         o = self._run(self.mtest_command + ['--list', '--no-rebuild'])
         self.assertNotIn('Regenerating build files.', o)
 
+    def test_unexisting_test_name(self):
+        testdir = os.path.join(self.unit_test_dir, '4 suite selection')
+        self.init(testdir)
+        self.build()
+
+        self.assertRaises(subprocess.CalledProcessError, self._run, self.mtest_command + ['notatest'])
+
+    def test_select_test_using_wildcards(self):
+        testdir = os.path.join(self.unit_test_dir, '4 suite selection')
+        self.init(testdir)
+        self.build()
+
+        o = self._run(self.mtest_command + ['--list', 'mainprj*'])
+        self.assertIn('mainprj-failing_test', o)
+        self.assertIn('mainprj-successful_test_no_suite', o)
+        self.assertNotIn('subprj', o)
+
+        o = self._run(self.mtest_command + ['--list', '*succ*', 'subprjm*:'])
+        self.assertIn('mainprj-successful_test_no_suite', o)
+        self.assertIn('subprjmix-failing_test', o)
+        self.assertIn('subprjmix-successful_test', o)
+        self.assertIn('subprjsucc-successful_test_no_suite', o)
+        self.assertNotIn('subprjfail-failing_test', o)
+
     def test_build_by_default(self):
         testdir = os.path.join(self.common_test_dir, '129 build by default')
         self.init(testdir)
@@ -841,7 +923,7 @@ class AllPlatformTests(BasePlatformTests):
         testdir = os.path.join("test cases/cython", '2 generated sources')
         env = get_fake_env(testdir, self.builddir, self.prefix)
         try:
-            detect_compiler_for(env, "cython", MachineChoice.HOST)
+            detect_compiler_for(env, "cython", MachineChoice.HOST, True)
         except EnvironmentException:
             raise SkipTest("Cython is not installed")
         self.init(testdir)
@@ -852,7 +934,7 @@ class AllPlatformTests(BasePlatformTests):
         name = None
         for target in targets:
             for target_sources in target["target_sources"]:
-                for generated_source in target_sources["generated_sources"]:
+                for generated_source in target_sources.get("generated_sources", []):
                     if "includestuff.pyx.c" in generated_source:
                         name = generated_source
                         break
@@ -866,7 +948,7 @@ class AllPlatformTests(BasePlatformTests):
         testdir = os.path.join("test cases/cython", '2 generated sources')
         env = get_fake_env(testdir, self.builddir, self.prefix)
         try:
-            cython = detect_compiler_for(env, "cython", MachineChoice.HOST)
+            cython = detect_compiler_for(env, "cython", MachineChoice.HOST, True)
             if not version_compare(cython.version, '>=0.29.33'):
                 raise SkipTest('Cython is too old')
         except EnvironmentException:
@@ -959,8 +1041,8 @@ class AllPlatformTests(BasePlatformTests):
         intel = IntelGnuLikeCompiler
         msvc = (VisualStudioCCompiler, VisualStudioCPPCompiler)
         clangcl = (ClangClCCompiler, ClangClCPPCompiler)
-        ar = mesonbuild.linkers.ArLinker
-        lib = mesonbuild.linkers.VisualStudioLinker
+        ar = linkers.ArLinker
+        lib = linkers.VisualStudioLinker
         langs = [('c', 'CC'), ('cpp', 'CXX')]
         if not is_windows() and platform.machine().lower() != 'e2k':
             langs += [('objc', 'OBJC'), ('objcpp', 'OBJCXX')]
@@ -1004,39 +1086,39 @@ class AllPlatformTests(BasePlatformTests):
             if isinstance(cc, gnu):
                 self.assertIsInstance(linker, ar)
                 if is_osx():
-                    self.assertIsInstance(cc.linker, mesonbuild.linkers.AppleDynamicLinker)
+                    self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
                 elif is_sunos():
-                    self.assertIsInstance(cc.linker, (mesonbuild.linkers.SolarisDynamicLinker, mesonbuild.linkers.GnuLikeDynamicLinkerMixin))
+                    self.assertIsInstance(cc.linker, (linkers.SolarisDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
                 else:
-                    self.assertIsInstance(cc.linker, mesonbuild.linkers.GnuLikeDynamicLinkerMixin)
+                    self.assertIsInstance(cc.linker, linkers.GnuLikeDynamicLinkerMixin)
             if isinstance(cc, clangcl):
                 self.assertIsInstance(linker, lib)
-                self.assertIsInstance(cc.linker, mesonbuild.linkers.ClangClDynamicLinker)
+                self.assertIsInstance(cc.linker, linkers.ClangClDynamicLinker)
             if isinstance(cc, clang):
                 self.assertIsInstance(linker, ar)
                 if is_osx():
-                    self.assertIsInstance(cc.linker, mesonbuild.linkers.AppleDynamicLinker)
+                    self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
                 elif is_windows():
                     # This is clang, not clang-cl. This can be either an
                     # ld-like linker of link.exe-like linker (usually the
                     # former for msys2, the latter otherwise)
-                    self.assertIsInstance(cc.linker, (mesonbuild.linkers.MSVCDynamicLinker, mesonbuild.linkers.GnuLikeDynamicLinkerMixin))
+                    self.assertIsInstance(cc.linker, (linkers.MSVCDynamicLinker, linkers.GnuLikeDynamicLinkerMixin))
                 else:
-                    self.assertIsInstance(cc.linker, mesonbuild.linkers.GnuLikeDynamicLinkerMixin)
+                    self.assertIsInstance(cc.linker, linkers.GnuLikeDynamicLinkerMixin)
             if isinstance(cc, intel):
                 self.assertIsInstance(linker, ar)
                 if is_osx():
-                    self.assertIsInstance(cc.linker, mesonbuild.linkers.AppleDynamicLinker)
+                    self.assertIsInstance(cc.linker, linkers.AppleDynamicLinker)
                 elif is_windows():
-                    self.assertIsInstance(cc.linker, mesonbuild.linkers.XilinkDynamicLinker)
+                    self.assertIsInstance(cc.linker, linkers.XilinkDynamicLinker)
                 else:
-                    self.assertIsInstance(cc.linker, mesonbuild.linkers.GnuDynamicLinker)
+                    self.assertIsInstance(cc.linker, linkers.GnuDynamicLinker)
             if isinstance(cc, msvc):
                 self.assertTrue(is_windows())
                 self.assertIsInstance(linker, lib)
                 self.assertEqual(cc.id, 'msvc')
                 self.assertTrue(hasattr(cc, 'is_64'))
-                self.assertIsInstance(cc.linker, mesonbuild.linkers.MSVCDynamicLinker)
+                self.assertIsInstance(cc.linker, linkers.MSVCDynamicLinker)
                 # If we're on Windows CI, we know what the compiler will be
                 if 'arch' in os.environ:
                     if os.environ['arch'] == 'x64':
@@ -1083,7 +1165,7 @@ class AllPlatformTests(BasePlatformTests):
         for cmd in self.get_compdb():
             # Get compiler
             split = split_args(cmd['command'])
-            if split[0] == 'ccache':
+            if split[0] in ('ccache', 'sccache'):
                 compiler = split[1]
             else:
                 compiler = split[0]
@@ -1266,6 +1348,8 @@ class AllPlatformTests(BasePlatformTests):
         # This assumes all of the targets support lto
         for t in targets:
             for s in t['target_sources']:
+                if 'linker' in s:
+                    continue
                 for e in expected:
                     self.assertIn(e, s['parameters'])
 
@@ -2139,7 +2223,7 @@ class AllPlatformTests(BasePlatformTests):
         env = get_fake_env()
         for l in ['cpp', 'cs', 'd', 'java', 'cuda', 'fortran', 'objc', 'objcpp', 'rust']:
             try:
-                comp = detect_compiler_for(env, l, MachineChoice.HOST)
+                comp = detect_compiler_for(env, l, MachineChoice.HOST, True)
                 with tempfile.TemporaryDirectory() as d:
                     comp.sanity_check(d, env)
                 langs.append(l)
@@ -2156,7 +2240,7 @@ class AllPlatformTests(BasePlatformTests):
                 if is_windows() and lang == 'fortran' and target_type == 'library':
                     # non-Gfortran Windows Fortran compilers do not do shared libraries in a Fortran standard way
                     # see "test cases/fortran/6 dynamic"
-                    fc = detect_compiler_for(env, 'fortran', MachineChoice.HOST)
+                    fc = detect_compiler_for(env, 'fortran', MachineChoice.HOST, True)
                     if fc.get_id() in {'intel-cl', 'pgi'}:
                         continue
                 # test empty directory
@@ -2640,10 +2724,10 @@ class AllPlatformTests(BasePlatformTests):
     def test_native_dep_pkgconfig(self):
         testdir = os.path.join(self.unit_test_dir,
                                '45 native dep pkgconfig var')
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as crossfile:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as crossfile:
             crossfile.write(textwrap.dedent(
                 '''[binaries]
-                pkgconfig = '{}'
+                pkg-config = '{}'
 
                 [properties]
 
@@ -2667,10 +2751,10 @@ class AllPlatformTests(BasePlatformTests):
     def test_pkg_config_libdir(self):
         testdir = os.path.join(self.unit_test_dir,
                                '45 native dep pkgconfig var')
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as crossfile:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as crossfile:
             crossfile.write(textwrap.dedent(
                 '''[binaries]
-                pkgconfig = 'pkg-config'
+                pkg-config = 'pkg-config'
 
                 [properties]
                 pkg_config_libdir = ['{}']
@@ -2984,8 +3068,11 @@ class AllPlatformTests(BasePlatformTests):
             ('benchmarks', list),
             ('buildoptions', list),
             ('buildsystem_files', list),
+            ('compilers', dict),
             ('dependencies', list),
+            ('install_plan', dict),
             ('installed', dict),
+            ('machines', dict),
             ('projectinfo', dict),
             ('targets', list),
             ('tests', list),
@@ -3002,6 +3089,7 @@ class AllPlatformTests(BasePlatformTests):
             ('depends', list),
             ('workdir', (str, None)),
             ('priority', int),
+            ('extra_paths', list),
         ]
 
         buildoptions_keylist = [
@@ -3027,9 +3115,16 @@ class AllPlatformTests(BasePlatformTests):
 
         dependencies_typelist = [
             ('name', str),
+            ('type', str),
             ('version', str),
             ('compile_args', list),
             ('link_args', list),
+            ('include_directories', list),
+            ('sources', list),
+            ('extra_files', list),
+            ('dependencies', list),
+            ('depends', list),
+            ('meson_variables', list),
         ]
 
         targets_typelist = [
@@ -3042,8 +3137,12 @@ class AllPlatformTests(BasePlatformTests):
             ('target_sources', list),
             ('extra_files', list),
             ('subproject', (str, None)),
+            ('dependencies', list),
+            ('depends', list),
             ('install_filename', (list, None)),
             ('installed', bool),
+            ('vs_module_defs', (str, None)),
+            ('win_subsystem', (str, None)),
         ]
 
         targets_sources_typelist = [
@@ -3052,6 +3151,12 @@ class AllPlatformTests(BasePlatformTests):
             ('parameters', list),
             ('sources', list),
             ('generated_sources', list),
+            ('unity_sources', (list, None)),
+        ]
+
+        target_sources_linker_typelist = [
+            ('linker', list),
+            ('parameters', list),
         ]
 
         # First load all files
@@ -3075,7 +3180,7 @@ class AllPlatformTests(BasePlatformTests):
             name_to_out.update({i['name']: i['filename']})
             for group in i['target_sources']:
                 src_to_id.update({os.path.relpath(src, testdir): i['id']
-                                  for src in group['sources']})
+                                  for src in group.get('sources', [])})
 
         # Check Tests and benchmarks
         tests_to_find = ['test case 1', 'test case 2', 'benchmark 1']
@@ -3155,8 +3260,11 @@ class AllPlatformTests(BasePlatformTests):
                 self.assertPathEqual(i['defined_in'], os.path.join(testdir, tgt[3]))
                 targets_to_find.pop(i['name'], None)
             for j in i['target_sources']:
-                assertKeyTypes(targets_sources_typelist, j)
-                self.assertEqual(j['sources'], [os.path.normpath(f) for f in tgt[4]])
+                if 'compiler' in j:
+                    assertKeyTypes(targets_sources_typelist, j)
+                    self.assertEqual(j['sources'], [os.path.normpath(f) for f in tgt[4]])
+                else:
+                    assertKeyTypes(target_sources_linker_typelist, j)
         self.assertDictEqual(targets_to_find, {})
 
     def test_introspect_file_dump_equals_all(self):
@@ -3169,9 +3277,11 @@ class AllPlatformTests(BasePlatformTests):
             'benchmarks',
             'buildoptions',
             'buildsystem_files',
+            'compilers',
             'dependencies',
             'installed',
             'install_plan',
+            'machines',
             'projectinfo',
             'targets',
             'tests',
@@ -3244,12 +3354,13 @@ class AllPlatformTests(BasePlatformTests):
         res_wb = [i for i in res_wb if i['type'] != 'custom']
         for i in res_wb:
             i['filename'] = [os.path.relpath(x, self.builddir) for x in i['filename']]
-            if 'install_filename' in i:
-                del i['install_filename']
+            for k in ('install_filename', 'dependencies', 'win_subsystem'):
+                if k in i:
+                    del i[k]
 
             sources = []
             for j in i['target_sources']:
-                sources += j['sources']
+                sources += j.get('sources', [])
             i['target_sources'] = [{
                 'language': 'unknown',
                 'compiler': [],
@@ -3461,7 +3572,7 @@ class AllPlatformTests(BasePlatformTests):
               Subprojects
                 sub            : YES
                 sub2           : NO Problem encountered: This subproject failed
-                subsub         : YES
+                subsub         : YES (from sub2)
 
               User defined options
                 backend        : ''' + self.backend_name + '''
@@ -4091,7 +4202,7 @@ class AllPlatformTests(BasePlatformTests):
         cmd = self.meson_command + ['devenv', '-C', self.builddir, '--dump', fname]
         o = self._run(cmd)
         self.assertEqual(o, '')
-        o = Path(fname).read_text()
+        o = Path(fname).read_text(encoding='utf-8')
         expected = os.pathsep.join(['/prefix', '$TEST_C', '/suffix'])
         self.assertIn(f'TEST_C="{expected}"', o)
         self.assertIn('export TEST_C', o)
@@ -4151,18 +4262,18 @@ class AllPlatformTests(BasePlatformTests):
             env = get_fake_env()
 
             # Get the compiler so we know which compiler class to mock.
-            cc =  detect_compiler_for(env, 'c', MachineChoice.HOST)
+            cc =  detect_compiler_for(env, 'c', MachineChoice.HOST, True)
             cc_type = type(cc)
 
             # Test a compiler that acts as a linker
             with mock.patch.object(cc_type, 'INVOKES_LINKER', True):
-                cc =  detect_compiler_for(env, 'c', MachineChoice.HOST)
+                cc =  detect_compiler_for(env, 'c', MachineChoice.HOST, True)
                 link_args = env.coredata.get_external_link_args(cc.for_machine, cc.language)
                 self.assertEqual(sorted(link_args), sorted(['-DCFLAG', '-flto']))
 
             # And one that doesn't
             with mock.patch.object(cc_type, 'INVOKES_LINKER', False):
-                cc =  detect_compiler_for(env, 'c', MachineChoice.HOST)
+                cc =  detect_compiler_for(env, 'c', MachineChoice.HOST, True)
                 link_args = env.coredata.get_external_link_args(cc.for_machine, cc.language)
                 self.assertEqual(sorted(link_args), sorted(['-flto']))
 
@@ -4304,6 +4415,9 @@ class AllPlatformTests(BasePlatformTests):
             Path(installpath, 'usr/share/foo2.h'),
             Path(installpath, 'usr/share/out1.txt'),
             Path(installpath, 'usr/share/out2.txt'),
+            Path(installpath, 'usr/share/install tag'),
+            Path(installpath, 'usr/share/install tag/aaa.txt'),
+            Path(installpath, 'usr/share/install tag/bbb.txt'),
         }
 
         def do_install(tags, expected_files, expected_scripts):
@@ -4350,8 +4464,7 @@ class AllPlatformTests(BasePlatformTests):
                            structured_sources=None,
                            objects=[], environment=env, compilers=env.coredata.compilers[MachineChoice.HOST],
                            kwargs={})
-            target.process_compilers()
-            target.process_compilers_late([])
+            target.process_compilers_late()
             return target.filename
 
         shared_lib_name = lambda name: output_name(name, SharedLibrary)
@@ -4363,140 +4476,182 @@ class AllPlatformTests(BasePlatformTests):
                 f'{self.builddir}/out1-notag.txt': {
                     'destination': '{datadir}/out1-notag.txt',
                     'tag': None,
+                    'subproject': None,
                 },
                 f'{self.builddir}/out2-notag.txt': {
                     'destination': '{datadir}/out2-notag.txt',
                     'tag': None,
+                    'subproject': None,
                 },
                 f'{self.builddir}/libstatic.a': {
                     'destination': '{libdir_static}/libstatic.a',
                     'tag': 'devel',
+                    'subproject': None,
                 },
                 f'{self.builddir}/' + exe_name('app'): {
                     'destination': '{bindir}/' + exe_name('app'),
                     'tag': 'runtime',
+                    'subproject': None,
                 },
                 f'{self.builddir}/' + exe_name('app-otherdir'): {
                     'destination': '{prefix}/otherbin/' + exe_name('app-otherdir'),
                     'tag': 'runtime',
+                    'subproject': None,
                 },
                 f'{self.builddir}/subdir/' + exe_name('app2'): {
                     'destination': '{bindir}/' + exe_name('app2'),
                     'tag': 'runtime',
+                    'subproject': None,
                 },
                 f'{self.builddir}/' + shared_lib_name('shared'): {
                     'destination': '{libdir_shared}/' + shared_lib_name('shared'),
                     'tag': 'runtime',
+                    'subproject': None,
                 },
                 f'{self.builddir}/' + shared_lib_name('both'): {
                     'destination': '{libdir_shared}/' + shared_lib_name('both'),
                     'tag': 'runtime',
+                    'subproject': None,
                 },
                 f'{self.builddir}/' + static_lib_name('both'): {
                     'destination': '{libdir_static}/' + static_lib_name('both'),
                     'tag': 'devel',
+                    'subproject': None,
                 },
                 f'{self.builddir}/' + shared_lib_name('bothcustom'): {
                     'destination': '{libdir_shared}/' + shared_lib_name('bothcustom'),
                     'tag': 'custom',
+                    'subproject': None,
                 },
                 f'{self.builddir}/' + static_lib_name('bothcustom'): {
                     'destination': '{libdir_static}/' + static_lib_name('bothcustom'),
                     'tag': 'custom',
+                    'subproject': None,
                 },
                 f'{self.builddir}/subdir/' + shared_lib_name('both2'): {
                     'destination': '{libdir_shared}/' + shared_lib_name('both2'),
                     'tag': 'runtime',
+                    'subproject': None,
                 },
                 f'{self.builddir}/subdir/' + static_lib_name('both2'): {
                     'destination': '{libdir_static}/' + static_lib_name('both2'),
                     'tag': 'devel',
+                    'subproject': None,
                 },
                 f'{self.builddir}/out1-custom.txt': {
                     'destination': '{datadir}/out1-custom.txt',
                     'tag': 'custom',
+                    'subproject': None,
                 },
                 f'{self.builddir}/out2-custom.txt': {
                     'destination': '{datadir}/out2-custom.txt',
                     'tag': 'custom',
+                    'subproject': None,
                 },
                 f'{self.builddir}/out3-custom.txt': {
                     'destination': '{datadir}/out3-custom.txt',
                     'tag': 'custom',
+                    'subproject': None,
                 },
                 f'{self.builddir}/subdir/out1.txt': {
                     'destination': '{datadir}/out1.txt',
                     'tag': None,
+                    'subproject': None,
                 },
                 f'{self.builddir}/subdir/out2.txt': {
                     'destination': '{datadir}/out2.txt',
                     'tag': None,
+                    'subproject': None,
                 },
                 f'{self.builddir}/out-devel.h': {
                     'destination': '{includedir}/out-devel.h',
                     'tag': 'devel',
+                    'subproject': None,
                 },
                 f'{self.builddir}/out3-notag.txt': {
                     'destination': '{datadir}/out3-notag.txt',
                     'tag': None,
+                    'subproject': None,
                 },
             },
             'configure': {
                 f'{self.builddir}/foo-notag.h': {
                     'destination': '{datadir}/foo-notag.h',
                     'tag': None,
+                    'subproject': None,
                 },
                 f'{self.builddir}/foo2-devel.h': {
                     'destination': '{includedir}/foo2-devel.h',
                     'tag': 'devel',
+                    'subproject': None,
                 },
                 f'{self.builddir}/foo-custom.h': {
                     'destination': '{datadir}/foo-custom.h',
                     'tag': 'custom',
+                    'subproject': None,
                 },
                 f'{self.builddir}/subdir/foo2.h': {
                     'destination': '{datadir}/foo2.h',
                     'tag': None,
+                    'subproject': None,
                 },
             },
             'data': {
                 f'{testdir}/bar-notag.txt': {
                     'destination': '{datadir}/bar-notag.txt',
                     'tag': None,
+                    'subproject': None,
                 },
                 f'{testdir}/bar-devel.h': {
                     'destination': '{includedir}/bar-devel.h',
                     'tag': 'devel',
+                    'subproject': None,
                 },
                 f'{testdir}/bar-custom.txt': {
                     'destination': '{datadir}/bar-custom.txt',
                     'tag': 'custom',
+                    'subproject': None,
                 },
                 f'{testdir}/subdir/bar2-devel.h': {
                     'destination': '{includedir}/bar2-devel.h',
                     'tag': 'devel',
+                    'subproject': None,
+                },
+                f'{testdir}/subprojects/subproject/aaa.txt': {
+                    'destination': '{datadir}/install tag/aaa.txt',
+                    'tag': None,
+                    'subproject': 'subproject',
+                },
+                f'{testdir}/subprojects/subproject/bbb.txt': {
+                    'destination': '{datadir}/install tag/bbb.txt',
+                    'tag': 'data',
+                    'subproject': 'subproject',
                 },
             },
             'headers': {
                 f'{testdir}/foo1-devel.h': {
                     'destination': '{includedir}/foo1-devel.h',
                     'tag': 'devel',
+                    'subproject': None,
                 },
                 f'{testdir}/subdir/foo3-devel.h': {
                     'destination': '{includedir}/foo3-devel.h',
                     'tag': 'devel',
+                    'subproject': None,
                 },
             },
             'install_subdirs': {
                 f'{testdir}/custom_files': {
                     'destination': '{datadir}/custom_files',
                     'tag': 'custom',
+                    'subproject': None,
                     'exclude_dirs': [],
                     'exclude_files': [],
                 },
                 f'{testdir}/excludes': {
                     'destination': '{datadir}/excludes',
                     'tag': 'custom',
+                    'subproject': None,
                     'exclude_dirs': ['excluded'],
                     'exclude_files': ['excluded.txt'],
                 }
@@ -4548,7 +4703,7 @@ class AllPlatformTests(BasePlatformTests):
 
         testdir = os.path.join(self.unit_test_dir, '102 rlib linkage')
         gen_file = os.path.join(testdir, 'lib.rs')
-        with open(gen_file, 'w') as f:
+        with open(gen_file, 'w', encoding='utf-8') as f:
             f.write(template.format(0))
         self.addCleanup(windows_proof_rm, gen_file)
 
@@ -4556,7 +4711,7 @@ class AllPlatformTests(BasePlatformTests):
         self.build()
         self.run_tests()
 
-        with open(gen_file, 'w') as f:
+        with open(gen_file, 'w', encoding='utf-8') as f:
             f.write(template.format(39))
 
         self.build()
@@ -4580,7 +4735,10 @@ class AllPlatformTests(BasePlatformTests):
         symlinked_subproject = os.path.join(testdir, 'subprojects', 'symlinked_subproject')
         if not os.path.exists(subproject_dir):
             os.mkdir(subproject_dir)
-        os.symlink(subproject, symlinked_subproject)
+        try:
+            os.symlink(subproject, symlinked_subproject)
+        except OSError:
+            raise SkipTest("Symlinks are not available on this machine")
         self.addCleanup(os.remove, symlinked_subproject)
 
         self.init(testdir)
@@ -4622,31 +4780,3 @@ class AllPlatformTests(BasePlatformTests):
             self.assertNotEqual(olddata, newdata)
             olddata = newdata
             oldmtime = newmtime
-
-    def test_scripts_loaded_modules(self):
-        '''
-        Simulate a wrapped command, as done for custom_target() that capture
-        output. The script will print all python modules loaded and we verify
-        that it contains only an acceptable subset. Loading too many modules
-        slows down the build when many custom targets get wrapped.
-        '''
-        es = ExecutableSerialisation(python_command + ['-c', 'exit(0)'], env=EnvironmentVariables())
-        p = Path(self.builddir, 'exe.dat')
-        with p.open('wb') as f:
-            pickle.dump(es, f)
-        cmd = self.meson_command + ['--internal', 'test_loaded_modules', '--unpickle', str(p)]
-        p = subprocess.run(cmd, stdout=subprocess.PIPE)
-        all_modules = json.loads(p.stdout.splitlines()[0])
-        meson_modules = [m for m in all_modules if 'meson' in m]
-        expected_meson_modules = [
-            'mesonbuild',
-            'mesonbuild._pathlib',
-            'mesonbuild.utils',
-            'mesonbuild.utils.core',
-            'mesonbuild.mesonmain',
-            'mesonbuild.mlog',
-            'mesonbuild.scripts',
-            'mesonbuild.scripts.meson_exe',
-            'mesonbuild.scripts.test_loaded_modules'
-        ]
-        self.assertEqual(sorted(expected_meson_modules), sorted(meson_modules))
