@@ -1,11 +1,12 @@
 Metadata-Version: 2.1
 Name: meson
-Version: 1.1.1
+Version: 1.2.3
 Summary: A high performance build system
 Home-page: https://mesonbuild.com
 Author: Jussi Pakkanen
 Author-email: jpakkane@gmail.com
 License: Apache License, Version 2.0
+Project-URL: Source, https://github.com/mesonbuild/meson
 Keywords: meson,mesonbuild,build system,cmake
 Classifier: Development Status :: 5 - Production/Stable
 Classifier: Environment :: Console
@@ -22,6 +23,7 @@ Classifier: Programming Language :: Python :: 3.8
 Classifier: Programming Language :: Python :: 3.9
 Classifier: Programming Language :: Python :: 3.10
 Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
 Classifier: Topic :: Software Development :: Build Tools
 Requires-Python: >=3.7
 Provides-Extra: ninja

@@ -38,6 +38,7 @@ from mesonbuild import coredata
 from mesonbuild.compilers.c import ClangCCompiler, GnuCCompiler
 from mesonbuild.compilers.cpp import VisualStudioCPPCompiler
 from mesonbuild.compilers.d import DmdDCompiler
+from mesonbuild.linkers import linkers
 from mesonbuild.interpreterbase import typed_pos_args, InvalidArguments, ObjectHolder
 from mesonbuild.interpreterbase import typed_pos_args, InvalidArguments, typed_kwargs, ContainerTypeInfo, KwargInfo
 from mesonbuild.mesonlib import (
@@ -46,7 +47,7 @@ from mesonbuild.mesonlib import (
     OptionType
 )
 from mesonbuild.interpreter.type_checking import in_set_validator, NoneType
-from mesonbuild.dependencies import PkgConfigDependency
+from mesonbuild.dependencies.pkgconfig import PkgConfigDependency
 from mesonbuild.programs import ExternalProgram
 import mesonbuild.modules.pkgconfig
 
@@ -223,7 +224,7 @@ class InternalTests(unittest.TestCase):
 
 
     def test_compiler_args_class_visualstudio(self):
-        linker = mesonbuild.linkers.MSVCDynamicLinker(MachineChoice.HOST, [])
+        linker = linkers.MSVCDynamicLinker(MachineChoice.HOST, [])
         # Version just needs to be > 19.0.0
         cc = VisualStudioCPPCompiler([], [], '20.00', MachineChoice.HOST, False, mock.Mock(), 'x64', linker=linker)
 
@@ -245,7 +246,7 @@ class InternalTests(unittest.TestCase):
 
     def test_compiler_args_class_gnuld(self):
         ## Test --start/end-group
-        linker = mesonbuild.linkers.GnuBFDDynamicLinker([], MachineChoice.HOST, '-Wl,', [])
+        linker = linkers.GnuBFDDynamicLinker([], MachineChoice.HOST, '-Wl,', [])
         gcc = GnuCCompiler([], [], 'fake', False, MachineChoice.HOST, mock.Mock(), linker=linker)
         ## Ensure that the fake compiler is never called by overriding the relevant function
         gcc.get_default_include_dirs = lambda: ['/usr/include', '/usr/share/include', '/usr/local/include']
@@ -273,7 +274,7 @@ class InternalTests(unittest.TestCase):
 
     def test_compiler_args_remove_system(self):
         ## Test --start/end-group
-        linker = mesonbuild.linkers.GnuBFDDynamicLinker([], MachineChoice.HOST, '-Wl,', [])
+        linker = linkers.GnuBFDDynamicLinker([], MachineChoice.HOST, '-Wl,', [])
         gcc = GnuCCompiler([], [], 'fake', False, MachineChoice.HOST, mock.Mock(), linker=linker)
         ## Ensure that the fake compiler is never called by overriding the relevant function
         gcc.get_default_include_dirs = lambda: ['/usr/include', '/usr/share/include', '/usr/local/include']
@@ -452,7 +453,7 @@ class InternalTests(unittest.TestCase):
         # Can not be used as context manager because we need to
         # open it a second time and this is not possible on
         # Windows.
-        configfile = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+        configfile = tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8')
         configfilename = configfile.name
         config.write(configfile)
         configfile.flush()
@@ -468,7 +469,7 @@ class InternalTests(unittest.TestCase):
             'needs_exe_wrapper': 'true' if desired_value else 'false'
         }
 
-        configfile = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+        configfile = tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8')
         configfilename = configfile.name
         config.write(configfile)
         configfile.close()
@@ -548,11 +549,14 @@ class InternalTests(unittest.TestCase):
         if platform != 'openbsd':
             return
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in ['libfoo.so.6.0', 'libfoo.so.5.0', 'libfoo.so.54.0', 'libfoo.so.66a.0b', 'libfoo.so.70.0.so.1']:
+            for i in ['libfoo.so.6.0', 'libfoo.so.5.0', 'libfoo.so.54.0', 'libfoo.so.66a.0b', 'libfoo.so.70.0.so.1',
+                      'libbar.so.7.10', 'libbar.so.7.9', 'libbar.so.7.9.3']:
                 libpath = Path(tmpdir) / i
                 libpath.write_text('', encoding='utf-8')
             found = cc._find_library_real('foo', env, [tmpdir], '', LibType.PREFER_SHARED, lib_prefix_warning=True)
             self.assertEqual(os.path.basename(found[0]), 'libfoo.so.54.0')
+            found = cc._find_library_real('bar', env, [tmpdir], '', LibType.PREFER_SHARED, lib_prefix_warning=True)
+            self.assertEqual(os.path.basename(found[0]), 'libbar.so.7.10')
 
     def test_find_library_patterns(self):
         '''
@@ -947,23 +951,23 @@ class InternalTests(unittest.TestCase):
 
     def test_log_once(self):
         f = io.StringIO()
-        with mock.patch('mesonbuild.mlog.log_file', f), \
-                mock.patch('mesonbuild.mlog._logged_once', set()):
-            mesonbuild.mlog.log_once('foo')
-            mesonbuild.mlog.log_once('foo')
+        with mock.patch('mesonbuild.mlog._logger.log_file', f), \
+                mock.patch('mesonbuild.mlog._logger.logged_once', set()):
+            mesonbuild.mlog.log('foo', once=True)
+            mesonbuild.mlog.log('foo', once=True)
             actual = f.getvalue().strip()
             self.assertEqual(actual, 'foo', actual)
 
     def test_log_once_ansi(self):
         f = io.StringIO()
-        with mock.patch('mesonbuild.mlog.log_file', f), \
-                mock.patch('mesonbuild.mlog._logged_once', set()):
-            mesonbuild.mlog.log_once(mesonbuild.mlog.bold('foo'))
-            mesonbuild.mlog.log_once(mesonbuild.mlog.bold('foo'))
+        with mock.patch('mesonbuild.mlog._logger.log_file', f), \
+                mock.patch('mesonbuild.mlog._logger.logged_once', set()):
+            mesonbuild.mlog.log(mesonbuild.mlog.bold('foo'), once=True)
+            mesonbuild.mlog.log(mesonbuild.mlog.bold('foo'), once=True)
             actual = f.getvalue().strip()
             self.assertEqual(actual.count('foo'), 1, actual)
 
-            mesonbuild.mlog.log_once('foo')
+            mesonbuild.mlog.log('foo', once=True)
             actual = f.getvalue().strip()
             self.assertEqual(actual.count('foo'), 1, actual)
 
@@ -1579,12 +1583,12 @@ class InternalTests(unittest.TestCase):
             ('ppc', 'ppc'),
             ('macppc', 'ppc'),
             ('power macintosh', 'ppc'),
-            ('mips64el', 'mips64'),
-            ('mips64', 'mips64'),
+            ('mips64el', 'mips'),
+            ('mips64', 'mips'),
             ('mips', 'mips'),
             ('mipsel', 'mips'),
-            ('ip30', 'mips64'),
-            ('ip35', 'mips64'),
+            ('ip30', 'mips'),
+            ('ip35', 'mips'),
             ('parisc64', 'parisc'),
             ('sun4u', 'sparc64'),
             ('sun4v', 'sparc64'),
@@ -1595,15 +1599,27 @@ class InternalTests(unittest.TestCase):
             ('aarch64_be', 'aarch64'),
         ]
 
+        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, False, mock.Mock())
+
         with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=False)):
             for test, expected in cases:
                 with self.subTest(test, has_define=False), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu_family({})
+                    actual = mesonbuild.environment.detect_cpu_family({'c': cc})
                     self.assertEqual(actual, expected)
 
         with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=True)):
-            for test, expected in [('x86_64', 'x86'), ('aarch64', 'arm'), ('ppc', 'ppc64')]:
+            for test, expected in [('x86_64', 'x86'), ('aarch64', 'arm'), ('ppc', 'ppc64'), ('mips64', 'mips64')]:
                 with self.subTest(test, has_define=True), mock_trial(test):
+                    actual = mesonbuild.environment.detect_cpu_family({'c': cc})
+                    self.assertEqual(actual, expected)
+
+        # machine_info_can_run calls detect_cpu_family with no compilers at all
+        with mock.patch(
+            'mesonbuild.environment.any_compiler_has_define',
+            mock.Mock(side_effect=AssertionError('Should not be called')),
+        ):
+            for test, expected in [('mips64', 'mips64')]:
+                with self.subTest(test, has_compiler=False), mock_trial(test):
                     actual = mesonbuild.environment.detect_cpu_family({})
                     self.assertEqual(actual, expected)
 
@@ -1624,23 +1640,34 @@ class InternalTests(unittest.TestCase):
             ('x64', 'x86_64'),
             ('i86pc', 'x86_64'),
             ('earm', 'arm'),
-            ('mips64el', 'mips64'),
-            ('mips64', 'mips64'),
+            ('mips64el', 'mips'),
+            ('mips64', 'mips'),
             ('mips', 'mips'),
             ('mipsel', 'mips'),
             ('aarch64', 'aarch64'),
             ('aarch64_be', 'aarch64'),
         ]
 
+        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, False, mock.Mock())
+
         with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=False)):
             for test, expected in cases:
                 with self.subTest(test, has_define=False), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu({})
+                    actual = mesonbuild.environment.detect_cpu({'c': cc})
                     self.assertEqual(actual, expected)
 
         with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=True)):
-            for test, expected in [('x86_64', 'i686'), ('aarch64', 'arm'), ('ppc', 'ppc64')]:
+            for test, expected in [('x86_64', 'i686'), ('aarch64', 'arm'), ('ppc', 'ppc64'), ('mips64', 'mips64')]:
                 with self.subTest(test, has_define=True), mock_trial(test):
+                    actual = mesonbuild.environment.detect_cpu({'c': cc})
+                    self.assertEqual(actual, expected)
+
+        with mock.patch(
+            'mesonbuild.environment.any_compiler_has_define',
+            mock.Mock(side_effect=AssertionError('Should not be called')),
+        ):
+            for test, expected in [('mips64', 'mips64')]:
+                with self.subTest(test, has_compiler=False), mock_trial(test):
                     actual = mesonbuild.environment.detect_cpu({})
                     self.assertEqual(actual, expected)
 

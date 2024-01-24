@@ -46,7 +46,7 @@ if T.TYPE_CHECKING:
     from ..compilers import Compiler
     from ..environment import Environment
     from ..interpreter import Interpreter, Test
-    from ..linkers import StaticLinker
+    from ..linkers.linkers import StaticLinker
     from ..mesonlib import FileMode, FileOrString
 
     from typing_extensions import TypedDict
@@ -256,6 +256,13 @@ def get_backend_from_name(backend: str, build: T.Optional[build.Build] = None, i
         return nonebackend.NoneBackend(build, interpreter)
     return None
 
+
+def get_genvslite_backend(genvsname: str, build: T.Optional[build.Build] = None, interpreter: T.Optional['Interpreter'] = None) -> T.Optional['Backend']:
+    if genvsname == 'vs2022':
+        from . import vs2022backend
+        return vs2022backend.Vs2022Backend(build, interpreter, gen_lite = True)
+    return None
+
 # This class contains the basic functionality that is needed by all backends.
 # Feel free to move stuff in and out of it as you see fit.
 class Backend:
@@ -280,7 +287,15 @@ class Backend:
         self.src_to_build = mesonlib.relpath(self.environment.get_build_dir(),
                                              self.environment.get_source_dir())
 
-    def generate(self) -> None:
+    # If requested via 'capture = True', returns captured compile args per
+    # target (e.g. captured_args[target]) that can be used later, for example,
+    # to populate things like intellisense fields in generated visual studio
+    # projects (as is the case when using '--genvslite').
+    #
+    # 'vslite_ctx' is only provided when
+    # we expect this backend setup/generation to make use of previously captured
+    # compile args (as is the case when using '--genvslite').
+    def generate(self, capture: bool = False, vslite_ctx: dict = None) -> T.Optional[dict]:
         raise RuntimeError(f'generate is not implemented in {type(self).__name__}')
 
     def get_target_filename(self, t: T.Union[build.Target, build.CustomTargetIndex], *, warn_multi_output: bool = True) -> str:
@@ -499,7 +514,8 @@ class Backend:
             feed: T.Optional[bool] = None,
             env: T.Optional[build.EnvironmentVariables] = None,
             tag: T.Optional[str] = None,
-            verbose: bool = False) -> 'ExecutableSerialisation':
+            verbose: bool = False,
+            installdir_map: T.Optional[T.Dict[str, str]] = None) -> 'ExecutableSerialisation':
 
         # XXX: cmd_args either need to be lowered to strings, or need to be checked for non-string arguments, right?
         exe, *raw_cmd_args = cmd
@@ -560,7 +576,7 @@ class Backend:
         workdir = workdir or self.environment.get_build_dir()
         return ExecutableSerialisation(exe_cmd + cmd_args, env,
                                        exe_wrapper, workdir,
-                                       extra_paths, capture, feed, tag, verbose)
+                                       extra_paths, capture, feed, tag, verbose, installdir_map)
 
     def as_meson_exe_cmdline(self, exe: T.Union[str, mesonlib.File, build.BuildTarget, build.CustomTarget, programs.ExternalProgram],
                              cmd_args: T.Sequence[T.Union[str, mesonlib.File, build.BuildTarget, build.CustomTarget, programs.ExternalProgram]],
@@ -738,21 +754,8 @@ class Backend:
         paths: OrderedSet[str] = OrderedSet()
         srcdir = self.environment.get_source_dir()
 
-        def add_path(libdir: str) -> None:
-            try:
-                commonpath = os.path.commonpath((libdir, srcdir))
-            except ValueError: # when paths are on different drives on Windows
-                commonpath = ''
-
-            if commonpath == srcdir:
-                rel_to_src = libdir[len(srcdir) + 1:]
-                assert not os.path.isabs(rel_to_src), f'rel_to_src: {rel_to_src} is absolute'
-                paths.add(os.path.join(self.build_to_src, rel_to_src))
-            else:
-                paths.add(libdir)
-
         for dep in target.external_deps:
-            if not isinstance(dep, (dependencies.ExternalLibrary, dependencies.PkgConfigDependency)):
+            if dep.type_name not in {'library', 'pkgconfig'}:
                 continue
             for libpath in dep.link_args:
                 # For all link args that are absolute paths to a library file, add RPATH args
@@ -766,31 +769,22 @@ class Backend:
                 if libdir in self.get_external_rpath_dirs(target):
                     continue
                 # Windows doesn't support rpaths, but we use this function to
-                # emulate rpaths by setting PATH, so also accept DLLs here
-                if os.path.splitext(libpath)[1] not in ['.dll', '.lib', '.so', '.dylib']:
+                # emulate rpaths by setting PATH
+                # .dll is there for mingw gcc
+                if os.path.splitext(libpath)[1] not in {'.dll', '.lib', '.so', '.dylib'}:
                     continue
 
-                if mesonlib.is_windows() and libpath.endswith('.lib'):
+                try:
+                    commonpath = os.path.commonpath((libdir, srcdir))
+                except ValueError: # when paths are on different drives on Windows
+                    commonpath = ''
 
-                    if isinstance(dep, dependencies.PkgConfigDependency):
-                        # If by chance pkg-config knows the bin dir...
-                        bindir = dep.get_pkgconfig_variable('bindir', [], default='')
-                        if bindir:
-                            add_path(bindir)
-                            continue
-
-                    # If the dll is not in the same dir, try to replace 'lib' with 'bin' in the path.
-                    # This is not 100% proof, since the bin dir could be elsewhere or with a different
-                    # name, and the DLL could have a different name as well, but this is better than nothing.
-                    p = Path(libpath).with_suffix('.dll')
-                    if not p.exists():
-                        # replace last occurence:
-                        binpath = '/bin/'.join(p.as_posix().rsplit('/lib/', maxsplit=1))
-                        if Path(binpath).exists():
-                            libdir = os.path.dirname(binpath)
-
-                add_path(libdir)
-
+                if commonpath == srcdir:
+                    rel_to_src = libdir[len(srcdir) + 1:]
+                    assert not os.path.isabs(rel_to_src), f'rel_to_src: {rel_to_src} is absolute'
+                    paths.add(os.path.join(self.build_to_src, rel_to_src))
+                else:
+                    paths.add(libdir)
             # Don't remove rpaths specified by the dependency
             paths.difference_update(self.get_rpath_dirs_from_link_args(dep.link_args))
         for i in chain(target.link_targets, target.link_whole_targets):
@@ -864,6 +858,8 @@ class Backend:
     def _determine_ext_objs(self, extobj: 'build.ExtractedObjects', proj_dir_to_build_root: str) -> T.List[str]:
         result: T.List[str] = []
 
+        targetdir = self.get_target_private_dir(extobj.target)
+
         # Merge sources and generated sources
         raw_sources = list(extobj.srclist)
         for gensrc in extobj.genlist:
@@ -880,11 +876,17 @@ class Backend:
             elif self.environment.is_object(s):
                 result.append(s.relative_name())
 
+        # MSVC generate an object file for PCH
+        if extobj.pch:
+            for lang, pch in extobj.target.pch.items():
+                compiler = extobj.target.compilers[lang]
+                if compiler.get_argument_syntax() == 'msvc':
+                    objname = self.get_msvc_pch_objname(lang, pch)
+                    result.append(os.path.join(proj_dir_to_build_root, targetdir, objname))
+
         # extobj could contain only objects and no sources
         if not sources:
             return result
-
-        targetdir = self.get_target_private_dir(extobj.target)
 
         # With unity builds, sources don't map directly to objects,
         # we only support extracting all the objects in this mode,
@@ -920,6 +922,12 @@ class Backend:
             args += compiler.get_pch_use_args(pchpath, p[0])
         return includeargs + args
 
+    def get_msvc_pch_objname(self, lang: str, pch: T.List[str]) -> str:
+        if len(pch) == 1:
+            # Same name as in create_msvc_pch_implementation() below.
+            return f'meson_pch-{lang}.obj'
+        return os.path.splitext(pch[1])[0] + '.obj'
+
     def create_msvc_pch_implementation(self, target: build.BuildTarget, lang: str, pch_header: str) -> str:
         # We have to include the language in the file name, otherwise
         # pch.c and pch.cpp will both end up as pch.obj in VS backends.
@@ -936,6 +944,12 @@ class Backend:
             f.write(content)
         mesonlib.replace_if_different(pch_file, pch_file_tmp)
         return pch_rel_to_build
+
+    def target_uses_pch(self, target: build.BuildTarget) -> bool:
+        try:
+            return T.cast('bool', target.get_option(OptionKey('b_pch')))
+        except KeyError:
+            return False
 
     @staticmethod
     def escape_extra_args(args: T.List[str]) -> T.List[str]:
@@ -1027,7 +1041,8 @@ class Backend:
                 continue
 
             if compiler.language == 'vala':
-                if isinstance(dep, dependencies.PkgConfigDependency):
+                if dep.type_name == 'pkgconfig':
+                    assert isinstance(dep, dependencies.ExternalDependency)
                     if dep.name == 'glib-2.0' and dep.version_reqs is not None:
                         for req in dep.version_reqs:
                             if req.startswith(('>=', '==')):
@@ -1083,6 +1098,57 @@ class Backend:
                 paths.update(cc.get_library_dirs(self.environment))
         return list(paths)
 
+    @classmethod
+    @lru_cache(maxsize=None)
+    def extract_dll_paths(cls, target: build.BuildTarget) -> T.Set[str]:
+        """Find paths to all DLLs needed for a given target, since
+        we link against import libs, and we don't know the actual
+        path of the DLLs.
+
+        1. If there are DLLs in the same directory than the .lib dir, use it
+        2. If there is a sibbling directory named 'bin' with DLLs in it, use it
+        """
+        results = set()
+        for dep in target.external_deps:
+
+            if dep.type_name == 'pkgconfig':
+                # If by chance pkg-config knows the bin dir...
+                bindir = dep.get_pkgconfig_variable('bindir', [], default='')
+                if bindir:
+                    results.add(bindir)
+
+            for link_arg in dep.link_args:
+                if link_arg.startswith(('-l', '-L')):
+                    link_arg = link_arg[2:]
+                p = Path(link_arg)
+                if not p.is_absolute():
+                    continue
+
+                try:
+                    p = p.resolve(strict=True)
+                except FileNotFoundError:
+                    continue
+
+                for _ in p.parent.glob('*.dll'):
+                    # path contains dlls
+                    results.add(str(p.parent))
+                    break
+
+                else:
+                    if p.is_file():
+                        p = p.parent
+                    # Heuristic: replace *last* occurence of '/lib'
+                    binpath = Path('/bin'.join(p.as_posix().rsplit('/lib', maxsplit=1)))
+                    for _ in binpath.glob('*.dll'):
+                        results.add(str(binpath))
+                        break
+
+        for i in chain(target.link_targets, target.link_whole_targets):
+            if isinstance(i, build.BuildTarget):
+                results.update(cls.extract_dll_paths(i))
+
+        return results
+
     def determine_windows_extra_paths(
             self, target: T.Union[build.BuildTarget, build.CustomTarget, programs.ExternalProgram, mesonlib.File, str],
             extra_bdeps: T.Sequence[T.Union[build.BuildTarget, build.CustomTarget]]) -> T.List[str]:
@@ -1097,8 +1163,8 @@ class Backend:
         if isinstance(target, build.BuildTarget):
             prospectives.update(target.get_transitive_link_deps())
             # External deps
-            for deppath in self.rpaths_for_non_system_absolute_shared_libraries(target, exclude_system=False):
-                result.add(os.path.normpath(os.path.join(self.environment.get_build_dir(), deppath)))
+            result.update(self.extract_dll_paths(target))
+
         for bdep in extra_bdeps:
             prospectives.add(bdep)
             if isinstance(bdep, build.BuildTarget):
@@ -1149,6 +1215,11 @@ class Backend:
                 if isinstance(exe, build.CustomTarget):
                     extra_bdeps = list(exe.get_transitive_build_target_deps())
                 extra_paths = self.determine_windows_extra_paths(exe, extra_bdeps)
+                for a in t.cmd_args:
+                    if isinstance(a, build.BuildTarget):
+                        for p in self.determine_windows_extra_paths(a, []):
+                            if p not in extra_paths:
+                                extra_paths.append(p)
             else:
                 extra_paths = []
 
@@ -1161,8 +1232,6 @@ class Backend:
                     depends.add(a)
                 elif isinstance(a, build.CustomTargetIndex):
                     depends.add(a.target)
-                if isinstance(a, build.BuildTarget):
-                    extra_paths += self.determine_windows_extra_paths(a, [])
 
                 if isinstance(a, mesonlib.File):
                     a = os.path.join(self.environment.get_build_dir(), a.rel_to_builddir(self.build_to_src))
@@ -1542,7 +1611,6 @@ class Backend:
             mlog.log(f'Running postconf script {name!r}')
             run_exe(s, env)
 
-    @lru_cache(maxsize=1)
     def create_install_data(self) -> InstallData:
         strip_bin = self.environment.lookup_binary_entry(MachineChoice.HOST, 'strip')
         if strip_bin is None:

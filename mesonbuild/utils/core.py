@@ -99,6 +99,11 @@ class EnvironmentVariables(HoldableObject):
     def get_names(self) -> T.Set[str]:
         return self.varnames
 
+    def merge(self, other: EnvironmentVariables) -> None:
+        for method, name, values, separator in other.envvars:
+            self.varnames.add(name)
+            self.envvars.append((method, name, values, separator))
+
     def set(self, name: str, values: T.List[str], separator: str = os.pathsep) -> None:
         self.varnames.add(name)
         self.envvars.append((self._set, name, values, separator))
@@ -147,6 +152,7 @@ class ExecutableSerialisation:
     feed: T.Optional[bool] = None
     tag: T.Optional[str] = None
     verbose: bool = False
+    installdir_map: T.Optional[T.Dict[str, str]] = None
 
     def __post_init__(self) -> None:
         self.pickled = False

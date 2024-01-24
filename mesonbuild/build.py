@@ -17,7 +17,6 @@ from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field, InitVar
 from functools import lru_cache
 import abc
-import copy
 import hashlib
 import itertools, pathlib
 import os
@@ -52,7 +51,7 @@ if T.TYPE_CHECKING:
     from .compilers import Compiler
     from .interpreter.interpreter import Test, SourceOutputs, Interpreter
     from .interpreterbase import SubProject
-    from .linkers import StaticLinker
+    from .linkers.linkers import StaticLinker
     from .mesonlib import FileMode, FileOrString
     from .modules import ModuleState
     from .mparser import BaseNode
@@ -74,7 +73,7 @@ lang_arg_kwargs |= {
 }
 
 vala_kwargs = {'vala_header', 'vala_gir', 'vala_vapi'}
-rust_kwargs = {'rust_crate_type'}
+rust_kwargs = {'rust_crate_type', 'rust_dependency_map'}
 cs_kwargs = {'resources', 'cs_args'}
 
 buildtarget_kwargs = {
@@ -413,6 +412,7 @@ class ExtractedObjects(HoldableObject):
     genlist: T.List['GeneratedTypes'] = field(default_factory=list)
     objlist: T.List[T.Union[str, 'File', 'ExtractedObjects']] = field(default_factory=list)
     recursive: bool = True
+    pch: bool = False
 
     def __post_init__(self) -> None:
         if self.target.is_unity:
@@ -452,7 +452,7 @@ class ExtractedObjects(HoldableObject):
 
         for comp, srcs in extracted_cmpsrcs.items():
             if set(srcs) != set(cmpsrcs[comp]):
-                raise MesonException('Single object files can not be extracted '
+                raise MesonException('Single object files cannot be extracted '
                                      'in Unity builds. You can only extract all '
                                      'the object files for each compiler at once.')
 
@@ -698,6 +698,15 @@ class BuildTarget(Target):
 
     install_dir: T.List[T.Union[str, Literal[False]]]
 
+    # This set contains all the languages a linker can link natively
+    # without extra flags. For instance, nvcc (cuda) can link C++
+    # without injecting -lc++/-lstdc++, see
+    #   https://github.com/mesonbuild/meson/issues/10570
+    _MASK_LANGS: T.FrozenSet[T.Tuple[str, str]] = frozenset([
+        # (language, linker)
+        ('cpp', 'cuda'),
+    ])
+
     def __init__(
             self,
             name: str,
@@ -710,7 +719,7 @@ class BuildTarget(Target):
             environment: environment.Environment,
             compilers: T.Dict[str, 'Compiler'],
             kwargs):
-        super().__init__(name, subdir, subproject, True, for_machine, environment)
+        super().__init__(name, subdir, subproject, True, for_machine, environment, install=kwargs.get('install', False))
         self.all_compilers = compilers
         self.compilers = OrderedDict() # type: OrderedDict[str, Compiler]
         self.objects: T.List[ObjectTypes] = []
@@ -728,11 +737,11 @@ class BuildTarget(Target):
         # The list of all files outputted by this target. Useful in cases such
         # as Vala which generates .vapi and .h besides the compiled output.
         self.outputs = [self.filename]
-        self.need_install = False
         self.pch: T.Dict[str, T.List[str]] = {}
         self.extra_args: T.Dict[str, T.List['FileOrString']] = {}
         self.sources: T.List[File] = []
         self.generated: T.List['GeneratedTypes'] = []
+        self.extra_files: T.List[File] = []
         self.d_features = defaultdict(list)
         self.pic = False
         self.pie = False
@@ -744,6 +753,20 @@ class BuildTarget(Target):
         # 2. Compiled objects created by and extracted from another target
         self.process_objectlist(objects)
         self.process_kwargs(kwargs)
+        self.missing_languages = self.process_compilers()
+
+        # self.link_targets and self.link_whole_targets contains libraries from
+        # dependencies (see add_deps()). They have not been processed yet because
+        # we have to call process_compilers() first and we need to process libraries
+        # from link_with and link_whole first.
+        # See https://github.com/mesonbuild/meson/pull/11957#issuecomment-1629243208.
+        link_targets = extract_as_list(kwargs, 'link_with') + self.link_targets
+        link_whole_targets = extract_as_list(kwargs, 'link_whole') + self.link_whole_targets
+        self.link_targets.clear()
+        self.link_whole_targets.clear()
+        self.link(link_targets)
+        self.link_whole(link_whole_targets)
+
         if not any([self.sources, self.generated, self.objects, self.link_whole_targets, self.structured_sources,
                     kwargs.pop('_allow_no_sources', False)]):
             mlog.warning(f'Build target {name} has no sources. '
@@ -761,6 +784,16 @@ class BuildTarget(Target):
             raise MesonException('cannot mix structured sources and unstructured sources')
         if self.structured_sources and 'rust' not in self.compilers:
             raise MesonException('structured sources are only supported in Rust targets')
+        if self.uses_rust():
+            # relocation-model=pic is rustc's default and Meson does not
+            # currently have a way to disable PIC.
+            self.pic = True
+        if 'vala' in self.compilers and self.is_linkable_target():
+            self.outputs += [self.vala_header, self.vala_vapi]
+            self.install_tag += ['devel', 'devel']
+            if self.vala_gir:
+                self.outputs.append(self.vala_gir)
+                self.install_tag.append('devel')
 
     def __repr__(self):
         repr_str = "<{0} {1}: {2}>"
@@ -775,7 +808,7 @@ class BuildTarget(Target):
         return unity_opt == 'on' or (unity_opt == 'subprojects' and self.subproject != '')
 
     def validate_install(self):
-        if self.for_machine is MachineChoice.BUILD and self.need_install:
+        if self.for_machine is MachineChoice.BUILD and self.install:
             if self.environment.is_cross_build():
                 raise InvalidArguments('Tried to install a target for the build machine in a cross build.')
             else:
@@ -834,14 +867,14 @@ class BuildTarget(Target):
                 removed = True
         return removed
 
-    def process_compilers_late(self, extra_languages: T.List[str]):
+    def process_compilers_late(self):
         """Processes additional compilers after kwargs have been evaluated.
 
         This can add extra compilers that might be required by keyword
         arguments, such as link_with or dependencies. It will also try to guess
         which compiler to use if one hasn't been selected already.
         """
-        for lang in extra_languages:
+        for lang in self.missing_languages:
             self.compilers[lang] = self.all_compilers[lang]
 
         # did user override clink_langs for this target?
@@ -987,18 +1020,6 @@ class BuildTarget(Target):
                     'Link_depends arguments must be strings, Files, '
                     'or a Custom Target, or lists thereof.')
 
-    def get_original_kwargs(self):
-        return self.kwargs
-
-    def copy_kwargs(self, kwargs):
-        self.kwargs = copy.copy(kwargs)
-        for k, v in self.kwargs.items():
-            if isinstance(v, list):
-                self.kwargs[k] = listify(v, flatten=True)
-        for t in ['dependencies', 'link_with', 'include_directories', 'sources']:
-            if t in self.kwargs:
-                self.kwargs[t] = listify(self.kwargs[t], flatten=True)
-
     def extract_objects(self, srclist: T.List[T.Union['FileOrString', 'GeneratedTypes']]) -> ExtractedObjects:
         sources_set = set(self.sources)
         generated_set = set(self.generated)
@@ -1026,7 +1047,7 @@ class BuildTarget(Target):
 
     def extract_all_objects(self, recursive: bool = True) -> ExtractedObjects:
         return ExtractedObjects(self, self.sources, self.generated, self.objects,
-                                recursive)
+                                recursive, pch=True)
 
     def get_all_link_deps(self) -> ImmutableListProtocol[BuildTargetTypes]:
         return self.get_transitive_link_deps()
@@ -1072,23 +1093,7 @@ class BuildTarget(Target):
 
     def process_kwargs(self, kwargs):
         self.process_kwargs_base(kwargs)
-        self.copy_kwargs(kwargs)
-        kwargs.get('modules', [])
-        self.need_install = kwargs.get('install', self.need_install)
-        llist = extract_as_list(kwargs, 'link_with')
-        for linktarget in llist:
-            if isinstance(linktarget, dependencies.ExternalLibrary):
-                raise MesonException(textwrap.dedent('''\
-                    An external library was used in link_with keyword argument, which
-                    is reserved for libraries built as part of this project. External
-                    libraries must be passed using the dependencies keyword argument
-                    instead, because they are conceptually "external dependencies",
-                    just like those detected with the dependency() function.
-                '''))
-            self.link(linktarget)
-        lwhole = extract_as_list(kwargs, 'link_whole')
-        for linktarget in lwhole:
-            self.link_whole(linktarget)
+        self.original_kwargs = kwargs
 
         for lang in all_languages:
             lang_args = extract_as_list(kwargs, f'{lang}_args')
@@ -1168,10 +1173,12 @@ class BuildTarget(Target):
         extra_files = extract_as_list(kwargs, 'extra_files')
         for i in extra_files:
             assert isinstance(i, File)
+            if i in self.extra_files:
+                continue
             trial = os.path.join(self.environment.get_source_dir(), i.subdir, i.fname)
             if not os.path.isfile(trial):
                 raise InvalidArguments(f'Tried to add non-existing extra file {i}.')
-        self.extra_files = extra_files
+            self.extra_files.append(i)
         self.install_rpath: str = kwargs.get('install_rpath', '')
         if not isinstance(self.install_rpath, str):
             raise InvalidArguments('Install_rpath is not a string.')
@@ -1236,6 +1243,13 @@ class BuildTarget(Target):
             if self.gnu_symbol_visibility not in permitted:
                 raise InvalidArguments('GNU symbol visibility arg {} not one of: {}'.format(self.gnu_symbol_visibility, ', '.join(permitted)))
 
+        rust_dependency_map = kwargs.get('rust_dependency_map', {})
+        if not isinstance(rust_dependency_map, dict):
+            raise InvalidArguments(f'Invalid rust_dependency_map "{rust_dependency_map}": must be a dictionary.')
+        if any(not isinstance(v, str) for v in rust_dependency_map.values()):
+            raise InvalidArguments(f'Invalid rust_dependency_map "{rust_dependency_map}": must be a dictionary with string values.')
+        self.rust_dependency_map = rust_dependency_map
+
     def validate_win_subsystem(self, value: str) -> str:
         value = value.lower()
         if re.fullmatch(r'(boot_application|console|efi_application|efi_boot_service_driver|efi_rom|efi_runtime_driver|native|posix|windows)(,\d+(\.\d+)?)?', value) is None:
@@ -1270,17 +1284,36 @@ class BuildTarget(Target):
     def get_extra_args(self, language):
         return self.extra_args.get(language, [])
 
-    def get_dependencies(self, exclude=None):
-        transitive_deps = []
-        if exclude is None:
-            exclude = []
+    @lru_cache(maxsize=None)
+    def get_dependencies(self) -> OrderedSet[Target]:
+        # Get all targets needed for linking. This includes all link_with and
+        # link_whole targets, and also all dependencies of static libraries
+        # recursively. The algorithm here is closely related to what we do in
+        # get_internal_static_libraries(): Installed static libraries include
+        # objects from all their dependencies already.
+        result: OrderedSet[Target] = OrderedSet()
         for t in itertools.chain(self.link_targets, self.link_whole_targets):
-            if t in transitive_deps or t in exclude:
+            if t not in result:
+                result.add(t)
+                if isinstance(t, StaticLibrary):
+                    t.get_dependencies_recurse(result)
+        return result
+
+    def get_dependencies_recurse(self, result: OrderedSet[Target], include_internals: bool = True) -> None:
+        # self is always a static library because we don't need to pull dependencies
+        # of shared libraries. If self is installed (not internal) it already
+        # include objects extracted from all its internal dependencies so we can
+        # skip them.
+        include_internals = include_internals and self.is_internal()
+        for t in self.link_targets:
+            if t in result:
                 continue
-            transitive_deps.append(t)
+            if include_internals or not t.is_internal():
+                result.add(t)
             if isinstance(t, StaticLibrary):
-                transitive_deps += t.get_dependencies(transitive_deps + exclude)
-        return transitive_deps
+                t.get_dependencies_recurse(result, include_internals)
+        for t in self.link_whole_targets:
+            t.get_dependencies_recurse(result, include_internals)
 
     def get_source_subdir(self):
         return self.subdir
@@ -1295,7 +1328,7 @@ class BuildTarget(Target):
         return self.generated
 
     def should_install(self) -> bool:
-        return self.need_install
+        return self.install
 
     def has_pch(self) -> bool:
         return bool(self.pch)
@@ -1315,19 +1348,18 @@ class BuildTarget(Target):
             if isinstance(dep, dependencies.InternalDependency):
                 # Those parts that are internal.
                 self.process_sourcelist(dep.sources)
+                self.extra_files.extend(f for f in dep.extra_files if f not in self.extra_files)
                 self.add_include_dirs(dep.include_directories, dep.get_include_type())
                 self.objects.extend(dep.objects)
-                for l in dep.libraries:
-                    self.link(l)
-                for l in dep.whole_libraries:
-                    self.link_whole(l)
+                self.link_targets.extend(dep.libraries)
+                self.link_whole_targets.extend(dep.whole_libraries)
                 if dep.get_compile_args() or dep.get_link_args():
                     # Those parts that are external.
                     extpart = dependencies.InternalDependency('undefined',
                                                               [],
                                                               dep.get_compile_args(),
                                                               dep.get_link_args(),
-                                                              [], [], [], [], {}, [], [], [])
+                                                              [], [], [], [], [], {}, [], [], [])
                     self.external_deps.append(extpart)
                 # Deps of deps.
                 self.add_deps(dep.ext_deps)
@@ -1369,30 +1401,25 @@ You probably should put it in link_with instead.''')
     def is_internal(self) -> bool:
         return False
 
-    def link(self, target):
-        for t in listify(target):
-            if isinstance(self, StaticLibrary) and self.need_install:
-                if isinstance(t, (CustomTarget, CustomTargetIndex)):
-                    if not t.should_install():
-                        mlog.warning(f'Try to link an installed static library target {self.name} with a'
-                                     'custom target that is not installed, this might cause problems'
-                                     'when you try to use this static library')
-                elif t.is_internal() and not t.uses_rust():
-                    # When we're a static library and we link_with to an
-                    # internal/convenience library, promote to link_whole.
-                    #
-                    # There are cases we cannot do this, however. In Rust, for
-                    # example, this can't be done with Rust ABI libraries, though
-                    # it could be done with C ABI libraries, though there are
-                    # several meson issues that need to be fixed:
-                    # https://github.com/mesonbuild/meson/issues/10722
-                    # https://github.com/mesonbuild/meson/issues/10723
-                    # https://github.com/mesonbuild/meson/issues/10724
-                    return self.link_whole(t)
+    def link(self, targets):
+        for t in targets:
             if not isinstance(t, (Target, CustomTargetIndex)):
+                if isinstance(t, dependencies.ExternalLibrary):
+                    raise MesonException(textwrap.dedent('''\
+                        An external library was used in link_with keyword argument, which
+                        is reserved for libraries built as part of this project. External
+                        libraries must be passed using the dependencies keyword argument
+                        instead, because they are conceptually "external dependencies",
+                        just like those detected with the dependency() function.
+                    '''))
                 raise InvalidArguments(f'{t!r} is not a target.')
             if not t.is_linkable_target():
                 raise InvalidArguments(f"Link target '{t!s}' is not linkable.")
+            if isinstance(self, StaticLibrary) and self.install and t.is_internal():
+                # When we're a static library and we link_with to an
+                # internal/convenience library, promote to link_whole.
+                self.link_whole([t], promoted=True)
+                continue
             if isinstance(self, SharedLibrary) and isinstance(t, StaticLibrary) and not t.pic:
                 msg = f"Can't link non-PIC static library {t.name!r} into shared library {self.name!r}. "
                 msg += "Use the 'pic' option to static_library to build with PIC."
@@ -1405,16 +1432,13 @@ You probably should put it in link_with instead.''')
                     mlog.warning(msg + ' This will fail in cross build.')
             self.link_targets.append(t)
 
-    def link_whole(self, target):
-        for t in listify(target):
+    def link_whole(self, targets, promoted: bool = False):
+        for t in targets:
             if isinstance(t, (CustomTarget, CustomTargetIndex)):
                 if not t.is_linkable_target():
                     raise InvalidArguments(f'Custom target {t!r} is not linkable.')
                 if t.links_dynamically():
                     raise InvalidArguments('Can only link_whole custom targets that are static archives.')
-                if isinstance(self, StaticLibrary):
-                    # FIXME: We could extract the .a archive to get object files
-                    raise InvalidArguments('Cannot link_whole a custom target into a static library')
             elif not isinstance(t, StaticLibrary):
                 raise InvalidArguments(f'{t!r} is not a static library.')
             elif isinstance(self, SharedLibrary) and not t.pic:
@@ -1427,18 +1451,50 @@ You probably should put it in link_with instead.''')
                     raise InvalidArguments(msg + ' This is not possible in a cross build.')
                 else:
                     mlog.warning(msg + ' This will fail in cross build.')
-            if isinstance(self, StaticLibrary):
+            if isinstance(self, StaticLibrary) and not self.uses_rust():
                 # When we're a static library and we link_whole: to another static
                 # library, we need to add that target's objects to ourselves.
-                self.objects += t.extract_all_objects_recurse()
+                self.check_can_extract_objects(t, origin=self, promoted=promoted)
+                self.objects += [t.extract_all_objects()]
+                # If we install this static library we also need to include objects
+                # from all uninstalled static libraries it depends on.
+                if self.install:
+                    for lib in t.get_internal_static_libraries(origin=self):
+                        self.objects += [lib.extract_all_objects()]
             self.link_whole_targets.append(t)
 
-    def extract_all_objects_recurse(self) -> T.List[T.Union[str, 'ExtractedObjects']]:
-        objs = [self.extract_all_objects()]
+    @lru_cache(maxsize=None)
+    def get_internal_static_libraries(self, origin: StaticLibrary) -> OrderedSet[Target]:
+        result: OrderedSet[Target] = OrderedSet()
+        self.get_internal_static_libraries_recurse(result, origin)
+        return result
+
+    def get_internal_static_libraries_recurse(self, result: OrderedSet[Target], origin: StaticLibrary) -> None:
         for t in self.link_targets:
+            if t.is_internal() and t not in result:
+                self.check_can_extract_objects(t, origin, promoted=True)
+                result.add(t)
+                t.get_internal_static_libraries_recurse(result, origin)
+        for t in self.link_whole_targets:
             if t.is_internal():
-                objs += t.extract_all_objects_recurse()
-        return objs
+                t.get_internal_static_libraries_recurse(result, origin)
+
+    def check_can_extract_objects(self, t: T.Union[Target, CustomTargetIndex], origin: StaticLibrary, promoted: bool = False) -> None:
+        if isinstance(t, (CustomTarget, CustomTargetIndex)) or t.uses_rust():
+            # To extract objects from a custom target we would have to extract
+            # the archive, WIP implementation can be found in
+            # https://github.com/mesonbuild/meson/pull/9218.
+            # For Rust C ABI we could in theory have access to objects, but there
+            # are several meson issues that need to be fixed:
+            # https://github.com/mesonbuild/meson/issues/10722
+            # https://github.com/mesonbuild/meson/issues/10723
+            # https://github.com/mesonbuild/meson/issues/10724
+            m = (f'Cannot link_whole a custom or Rust target {t.name!r} into a static library {origin.name!r}. '
+                 'Instead, pass individual object files with the "objects:" keyword argument if possible.')
+            if promoted:
+                m += (f' Meson had to promote link to link_whole because {origin.name!r} is installed but not {t.name!r},'
+                      f' and thus has to include objects from {t.name!r} to be usable.')
+            raise InvalidArguments(m)
 
     def add_pch(self, language: str, pchlist: T.List[str]) -> None:
         if not pchlist:
@@ -1564,14 +1620,6 @@ You probably should put it in link_with instead.''')
         # Languages used by dependencies
         dep_langs = self.get_langs_used_by_deps()
 
-        # This set contains all the languages a linker can link natively
-        # without extra flags. For instance, nvcc (cuda) can link C++
-        # without injecting -lc++/-lstdc++, see
-        #   https://github.com/mesonbuild/meson/issues/10570
-        MASK_LANGS = frozenset([
-            # (language, linker)
-            ('cpp', 'cuda'),
-        ])
         # Pick a compiler based on the language priority-order
         for l in clink_langs:
             if l in self.compilers or l in dep_langs:
@@ -1582,10 +1630,7 @@ You probably should put it in link_with instead.''')
                         f'Could not get a dynamic linker for build target {self.name!r}. '
                         f'Requires a linker for language "{l}", but that is not '
                         'a project language.')
-                stdlib_args: T.List[str] = []
-                for dl in itertools.chain(self.compilers, dep_langs):
-                    if dl != linker.language and (dl, linker.language) not in MASK_LANGS:
-                        stdlib_args += all_compilers[dl].language_stdlib_only_link_flags(self.environment)
+                stdlib_args: T.List[str] = self.get_used_stdlib_args(linker.language)
                 # Type of var 'linker' is Compiler.
                 # Pretty hard to fix because the return value is passed everywhere
                 return linker, stdlib_args
@@ -1600,6 +1645,18 @@ You probably should put it in link_with instead.''')
                 pass
 
         raise AssertionError(f'Could not get a dynamic linker for build target {self.name!r}')
+
+    def get_used_stdlib_args(self, link_language: str) -> T.List[str]:
+        all_compilers = self.environment.coredata.compilers[self.for_machine]
+        all_langs = set(self.compilers).union(self.get_langs_used_by_deps())
+        stdlib_args: T.List[str] = []
+        for dl in all_langs:
+            if dl != link_language and (dl, link_language) not in self._MASK_LANGS:
+                # We need to use all_compilers here because
+                # get_langs_used_by_deps could return a language from a
+                # subproject
+                stdlib_args.extend(all_compilers[dl].language_stdlib_only_link_flags(self.environment))
+        return stdlib_args
 
     def uses_rust(self) -> bool:
         return 'rust' in self.compilers
@@ -1656,6 +1713,40 @@ You probably should put it in link_with instead.''')
                                      '\n             '
                                      'use shared_library() with `override_options: [\'b_lundef=false\']` instead.')
                     link_target.force_soname = True
+
+class FileInTargetPrivateDir:
+    """Represents a file with the path '/path/to/build/target_private_dir/fname'.
+       target_private_dir is the return value of get_target_private_dir which is e.g. 'subdir/target.p'.
+    """
+
+    def __init__(self, fname: str):
+        self.fname = fname
+
+    def __str__(self) -> str:
+        return self.fname
+
+class FileMaybeInTargetPrivateDir:
+    """Union between 'File' and 'FileInTargetPrivateDir'"""
+
+    def __init__(self, inner: T.Union[File, FileInTargetPrivateDir]):
+        self.inner = inner
+
+    @property
+    def fname(self) -> str:
+        return self.inner.fname
+
+    def rel_to_builddir(self, build_to_src: str, target_private_dir: str) -> str:
+        if isinstance(self.inner, FileInTargetPrivateDir):
+            return os.path.join(target_private_dir, self.inner.fname)
+        return self.inner.rel_to_builddir(build_to_src)
+
+    def absolute_path(self, srcdir: str, builddir: str) -> str:
+        if isinstance(self.inner, FileInTargetPrivateDir):
+            raise RuntimeError('Unreachable code')
+        return self.inner.absolute_path(srcdir, builddir)
+
+    def __str__(self) -> str:
+        return self.fname
 
 class Generator(HoldableObject):
     def __init__(self, exe: T.Union['Executable', programs.ExternalProgram],
@@ -1716,10 +1807,14 @@ class Generator(HoldableObject):
                 output.depends.add(e)
             if isinstance(e, CustomTargetIndex):
                 output.depends.add(e.target)
-
-            if isinstance(e, (CustomTarget, CustomTargetIndex, GeneratedList)):
+            if isinstance(e, (CustomTarget, CustomTargetIndex)):
                 output.depends.add(e)
                 fs = [File.from_built_file(state.subdir, f) for f in e.get_outputs()]
+            elif isinstance(e, GeneratedList):
+                if preserve_path_from:
+                    raise InvalidArguments("generator.process: 'preserve_path_from' is not allowed if one input is a 'generated_list'.")
+                output.depends.add(e)
+                fs = [FileInTargetPrivateDir(f) for f in e.get_outputs()]
             elif isinstance(e, str):
                 fs = [File.from_source_file(state.environment.source_dir, state.subdir, e)]
             else:
@@ -1730,6 +1825,7 @@ class Generator(HoldableObject):
                     abs_f = f.absolute_path(state.environment.source_dir, state.environment.build_dir)
                     if not self.is_parent_path(preserve_path_from, abs_f):
                         raise InvalidArguments('generator.process: When using preserve_path_from, all input files must be in a subdirectory of the given dir.')
+                f = FileMaybeInTargetPrivateDir(f)
                 output.add_file(f, state)
         return output
 
@@ -1747,9 +1843,9 @@ class GeneratedList(HoldableObject):
     def __post_init__(self) -> None:
         self.name = self.generator.exe
         self.depends: T.Set[GeneratedTypes] = set()
-        self.infilelist: T.List['File'] = []
+        self.infilelist: T.List[FileMaybeInTargetPrivateDir] = []
         self.outfilelist: T.List[str] = []
-        self.outmap: T.Dict[File, T.List[str]] = {}
+        self.outmap: T.Dict[FileMaybeInTargetPrivateDir, T.List[str]] = {}
         self.extra_depends = []  # XXX: Doesn't seem to be used?
         self.depend_files: T.List[File] = []
 
@@ -1765,7 +1861,7 @@ class GeneratedList(HoldableObject):
                 # know the absolute path of
                 self.depend_files.append(File.from_absolute_file(path))
 
-    def add_preserved_path_segment(self, infile: File, outfiles: T.List[str], state: T.Union['Interpreter', 'ModuleState']) -> T.List[str]:
+    def add_preserved_path_segment(self, infile: FileMaybeInTargetPrivateDir, outfiles: T.List[str], state: T.Union['Interpreter', 'ModuleState']) -> T.List[str]:
         result: T.List[str] = []
         in_abs = infile.absolute_path(state.environment.source_dir, state.environment.build_dir)
         assert os.path.isabs(self.preserve_path_from)
@@ -1775,7 +1871,7 @@ class GeneratedList(HoldableObject):
             result.append(os.path.join(path_segment, of))
         return result
 
-    def add_file(self, newfile: File, state: T.Union['Interpreter', 'ModuleState']) -> None:
+    def add_file(self, newfile: FileMaybeInTargetPrivateDir, state: T.Union['Interpreter', 'ModuleState']) -> None:
         self.infilelist.append(newfile)
         outfiles = self.generator.get_base_outnames(newfile.fname)
         if self.preserve_path_from:
@@ -1783,13 +1879,13 @@ class GeneratedList(HoldableObject):
         self.outfilelist += outfiles
         self.outmap[newfile] = outfiles
 
-    def get_inputs(self) -> T.List['File']:
+    def get_inputs(self) -> T.List[FileMaybeInTargetPrivateDir]:
         return self.infilelist
 
     def get_outputs(self) -> T.List[str]:
         return self.outfilelist
 
-    def get_outputs_for(self, filename: 'File') -> T.List[str]:
+    def get_outputs_for(self, filename: FileMaybeInTargetPrivateDir) -> T.List[str]:
         return self.outmap[filename]
 
     def get_generator(self) -> 'Generator':
@@ -1864,12 +1960,15 @@ class Executable(BuildTarget):
             elif ('c' in self.compilers and self.compilers['c'].get_id() in {'ti', 'c2000'} or
                   'cpp' in self.compilers and self.compilers['cpp'].get_id() in {'ti', 'c2000'}):
                 self.suffix = 'out'
+            elif ('c' in self.compilers and self.compilers['c'].get_id() in {'mwccarm', 'mwcceppc'} or
+                  'cpp' in self.compilers and self.compilers['cpp'].get_id() in {'mwccarm', 'mwcceppc'}):
+                self.suffix = 'nef'
             else:
                 self.suffix = machine.get_exe_suffix()
         self.filename = self.name
         if self.suffix:
             self.filename += '.' + self.suffix
-        self.outputs = [self.filename]
+        self.outputs[0] = self.filename
 
         # The import library this target will generate
         self.import_filename = None
@@ -1991,6 +2090,14 @@ class StaticLibrary(BuildTarget):
             if self.rust_crate_type == 'rlib' and any(c in self.name for c in ['-', ' ', '.']):
                 raise InvalidArguments('Rust crate type "rlib" does not allow spaces, periods or dashes in the library name '
                                        'due to a limitation of rustc. Replace them with underscores, for example')
+            if self.rust_crate_type == 'staticlib':
+                # FIXME: In the case of no-std we should not add those libraries,
+                # but we have no way to know currently.
+                rustc = self.compilers['rust']
+                d = dependencies.InternalDependency('undefined', [], [],
+                                                    rustc.native_static_libs,
+                                                    [], [], [], [], [], {}, [], [], [])
+                self.external_deps.append(d)
         # By default a static library is named libfoo.a even on Windows because
         # MSVC does not have a consistent convention for what static libraries
         # are called. The MSVC CRT uses libfoo.lib syntax but nothing else uses
@@ -2010,7 +2117,7 @@ class StaticLibrary(BuildTarget):
             else:
                 self.suffix = 'a'
         self.filename = self.prefix + self.name + '.' + self.suffix
-        self.outputs = [self.filename]
+        self.outputs[0] = self.filename
 
     def get_link_deps_mapping(self, prefix: str) -> T.Mapping[str, str]:
         return {}
@@ -2034,7 +2141,7 @@ class StaticLibrary(BuildTarget):
         return True
 
     def is_internal(self) -> bool:
-        return not self.need_install
+        return not self.install
 
 class SharedLibrary(BuildTarget):
     known_kwargs = known_shlib_kwargs
@@ -2301,7 +2408,7 @@ class SharedLibrary(BuildTarget):
             elif isinstance(path, File):
                 # When passing a generated file.
                 self.vs_module_defs = path
-            elif hasattr(path, 'get_filename'):
+            elif isinstance(path, CustomTarget):
                 # When passing output of a Custom Target
                 self.vs_module_defs = File.from_built_file(path.subdir, path.get_filename())
             else:
@@ -2647,7 +2754,7 @@ class CustomTarget(Target, CommandBase):
             return False
         return CustomTargetIndex(self, self.outputs[0]).is_internal()
 
-    def extract_all_objects_recurse(self) -> T.List[T.Union[str, 'ExtractedObjects']]:
+    def extract_all_objects(self) -> T.List[T.Union[str, 'ExtractedObjects']]:
         return self.get_outputs()
 
     def type_suffix(self):
@@ -2909,8 +3016,8 @@ class CustomTargetIndex(HoldableObject):
         suf = os.path.splitext(self.output)[-1]
         return suf in {'.a', '.lib'} and not self.should_install()
 
-    def extract_all_objects_recurse(self) -> T.List[T.Union[str, 'ExtractedObjects']]:
-        return self.target.extract_all_objects_recurse()
+    def extract_all_objects(self) -> T.List[T.Union[str, 'ExtractedObjects']]:
+        return self.target.extract_all_objects()
 
     def get_custom_install_dir(self) -> T.List[T.Union[str, Literal[False]]]:
         return self.target.get_custom_install_dir()

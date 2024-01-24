@@ -26,7 +26,7 @@ from .. import mesonlib
 from ..mesonlib import (
     HoldableObject,
     EnvironmentException, MesonException,
-    Popen_safe, LibType, TemporaryDirectoryWinProof, OptionKey,
+    Popen_safe_logged, LibType, TemporaryDirectoryWinProof, OptionKey,
 )
 
 from ..arglist import CompilerArgs
@@ -36,7 +36,8 @@ if T.TYPE_CHECKING:
     from ..coredata import MutableKeyedOptionDictType, KeyedOptionDictType
     from ..envconfig import MachineInfo
     from ..environment import Environment
-    from ..linkers import DynamicLinker, RSPFileSyntax
+    from ..linkers import RSPFileSyntax
+    from ..linkers.linkers import DynamicLinker
     from ..mesonlib import MachineChoice
     from ..dependencies import Dependency
 
@@ -133,11 +134,14 @@ def is_header(fname: 'mesonlib.FileOrString') -> bool:
     suffix = fname.split('.')[-1]
     return suffix in header_suffixes
 
+def is_source_suffix(suffix: str) -> bool:
+    return suffix in source_suffixes
+
 def is_source(fname: 'mesonlib.FileOrString') -> bool:
     if isinstance(fname, mesonlib.File):
         fname = fname.fname
     suffix = fname.split('.')[-1].lower()
-    return suffix in source_suffixes
+    return is_source_suffix(suffix)
 
 def is_assembly(fname: 'mesonlib.FileOrString') -> bool:
     if isinstance(fname, mesonlib.File):
@@ -334,6 +338,17 @@ def get_option_value(options: 'KeyedOptionDictType', opt: OptionKey, fallback: '
     return v
 
 
+def are_asserts_disabled(options: KeyedOptionDictType) -> bool:
+    """Should debug assertions be disabled
+
+    :param options: OptionDictionary
+    :return: whether to disable assertions or not
+    """
+    return (options[OptionKey('b_ndebug')].value == 'true' or
+            (options[OptionKey('b_ndebug')].value == 'if-release' and
+             options[OptionKey('buildtype')].value in {'release', 'plain'}))
+
+
 def get_base_compile_args(options: 'KeyedOptionDictType', compiler: 'Compiler') -> T.List[str]:
     args = []  # type T.List[str]
     try:
@@ -365,10 +380,7 @@ def get_base_compile_args(options: 'KeyedOptionDictType', compiler: 'Compiler') 
     except KeyError:
         pass
     try:
-        if (options[OptionKey('b_ndebug')].value == 'true' or
-                (options[OptionKey('b_ndebug')].value == 'if-release' and
-                 options[OptionKey('buildtype')].value in {'release', 'plain'})):
-            args += compiler.get_disable_assert_args()
+        args += compiler.get_assert_args(are_asserts_disabled(options))
     except KeyError:
         pass
     # This does not need a try...except
@@ -600,7 +612,7 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         return self.exelist.copy() if ccache else self.exelist_no_ccache.copy()
 
     def get_linker_exelist(self) -> T.List[str]:
-        return self.linker.get_exelist()
+        return self.linker.get_exelist() if self.linker else self.get_exelist()
 
     @abc.abstractmethod
     def get_output_args(self, outputname: str) -> T.List[str]:
@@ -847,15 +859,12 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
             command_list = self.get_exelist(ccache=not no_ccache) + commands.to_native()
             mlog.debug('Running compile:')
             mlog.debug('Working directory: ', tmpdirname)
-            mlog.debug('Command line: ', ' '.join(command_list), '\n')
             mlog.debug('Code:\n', contents)
             os_env = os.environ.copy()
             os_env['LC_ALL'] = 'C'
             if no_ccache:
                 os_env['CCACHE_DISABLE'] = '1'
-            p, stdo, stde = Popen_safe(command_list, cwd=tmpdirname, env=os_env)
-            mlog.debug('Compiler stdout:\n', stdo)
-            mlog.debug('Compiler stderr:\n', stde)
+            p, stdo, stde = Popen_safe_logged(command_list, msg='Command line', cwd=tmpdirname, env=os_env)
 
             result = CompileResult(stdo, stde, command_list, p.returncode, input_name=srcname)
             if want_output:
@@ -931,6 +940,12 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
                          install_rpath: str) -> T.Tuple[T.List[str], T.Set[bytes]]:
         return self.linker.build_rpath_args(
             env, build_dir, from_dir, rpath_paths, build_rpath, install_rpath)
+
+    def get_archive_name(self, filename: str) -> str:
+        return self.linker.get_archive_name(filename)
+
+    def get_command_to_archive_shlib(self) -> T.List[str]:
+        return self.linker.get_command_to_archive_shlib()
 
     def thread_flags(self, env: 'Environment') -> T.List[str]:
         return []
@@ -1071,7 +1086,12 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
     def get_coverage_link_args(self) -> T.List[str]:
         return self.linker.get_coverage_args()
 
-    def get_disable_assert_args(self) -> T.List[str]:
+    def get_assert_args(self, disable: bool) -> T.List[str]:
+        """Get arguments to enable or disable assertion.
+
+        :param disable: Whether to disable assertions
+        :return: A list of string arguments for this compiler
+        """
         return []
 
     def get_crt_compile_args(self, crt_val: str, buildtype: str) -> T.List[str]:
