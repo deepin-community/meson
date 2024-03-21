@@ -1,16 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2019-2022 The meson development team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
 from __future__ import annotations
 
 """Provides mixins for GNU compilers and GNU-like compilers."""
@@ -27,6 +17,7 @@ import typing as T
 from ... import mesonlib
 from ... import mlog
 from ...mesonlib import OptionKey
+from mesonbuild.compilers.compilers import CompileCheckMode
 
 if T.TYPE_CHECKING:
     from ..._typing import ImmutableListProtocol
@@ -41,21 +32,12 @@ else:
 
 # XXX: prevent circular references.
 # FIXME: this really is a posix interface not a c-like interface
-clike_debug_args = {
+clike_debug_args: T.Dict[bool, T.List[str]] = {
     False: [],
     True: ['-g'],
-}  # type: T.Dict[bool, T.List[str]]
+}
 
-gnulike_buildtype_args = {
-    'plain': [],
-    'debug': [],
-    'debugoptimized': [],
-    'release': [],
-    'minsize': [],
-    'custom': [],
-}  # type: T.Dict[str, T.List[str]]
-
-gnu_optimization_args = {
+gnu_optimization_args: T.Dict[str, T.List[str]] = {
     'plain': [],
     '0': ['-O0'],
     'g': ['-Og'],
@@ -63,9 +45,9 @@ gnu_optimization_args = {
     '2': ['-O2'],
     '3': ['-O3'],
     's': ['-Os'],
-}  # type: T.Dict[str, T.List[str]]
+}
 
-gnulike_instruction_set_args = {
+gnulike_instruction_set_args: T.Dict[str, T.List[str]] = {
     'mmx': ['-mmmx'],
     'sse': ['-msse'],
     'sse2': ['-msse2'],
@@ -76,22 +58,22 @@ gnulike_instruction_set_args = {
     'avx': ['-mavx'],
     'avx2': ['-mavx2'],
     'neon': ['-mfpu=neon'],
-}  # type: T.Dict[str, T.List[str]]
+}
 
-gnu_symbol_visibility_args = {
+gnu_symbol_visibility_args: T.Dict[str, T.List[str]] = {
     '': [],
     'default': ['-fvisibility=default'],
     'internal': ['-fvisibility=internal'],
     'hidden': ['-fvisibility=hidden'],
     'protected': ['-fvisibility=protected'],
     'inlineshidden': ['-fvisibility=hidden', '-fvisibility-inlines-hidden'],
-}  # type: T.Dict[str, T.List[str]]
+}
 
-gnu_color_args = {
+gnu_color_args: T.Dict[str, T.List[str]] = {
     'auto': ['-fdiagnostics-color=auto'],
     'always': ['-fdiagnostics-color=always'],
     'never': ['-fdiagnostics-color=never'],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 # Warnings collected from the GCC source and documentation.  This is an
 # objective set of all the warnings flags that apply to general projects: the
@@ -117,7 +99,7 @@ gnu_color_args = {
 #
 # Omitted warnings enabled elsewhere in meson:
 #   -Winvalid-pch (GCC 3.4.0)
-gnu_common_warning_args = {
+gnu_common_warning_args: T.Dict[str, T.List[str]] = {
     "0.0.0": [
         "-Wcast-qual",
         "-Wconversion",
@@ -212,7 +194,7 @@ gnu_common_warning_args = {
         "-Wopenacc-parallelism",
         "-Wtrivial-auto-var-init",
     ],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 # GCC warnings for C
 # Omitted non-general or legacy warnings:
@@ -222,7 +204,7 @@ gnu_common_warning_args = {
 #   -Wdeclaration-after-statement
 #   -Wtraditional
 #   -Wtraditional-conversion
-gnu_c_warning_args = {
+gnu_c_warning_args: T.Dict[str, T.List[str]] = {
     "0.0.0": [
         "-Wbad-function-cast",
         "-Wmissing-prototypes",
@@ -239,7 +221,7 @@ gnu_c_warning_args = {
     "4.5.0": [
         "-Wunsuffixed-float-constants",
     ],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 # GCC warnings for C++
 # Omitted non-general or legacy warnings:
@@ -249,7 +231,7 @@ gnu_c_warning_args = {
 #   -Wctad-maybe-unsupported
 #   -Wnamespaces
 #   -Wtemplates
-gnu_cpp_warning_args = {
+gnu_cpp_warning_args: T.Dict[str, T.List[str]] = {
     "0.0.0": [
         "-Wctor-dtor-privacy",
         "-Weffc++",
@@ -308,13 +290,13 @@ gnu_cpp_warning_args = {
         "-Wdeprecated-enum-float-conversion",
         "-Winvalid-imported-macros",
     ],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 # GCC warnings for Objective C and Objective C++
 # Omitted non-general or legacy warnings:
 #   -Wtraditional
 #   -Wtraditional-conversion
-gnu_objc_warning_args = {
+gnu_objc_warning_args: T.Dict[str, T.List[str]] = {
     "0.0.0": [
         "-Wselector",
     ],
@@ -325,7 +307,7 @@ gnu_objc_warning_args = {
         "-Wassign-intercept",
         "-Wstrict-selector-match",
     ],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 _LANG_MAP = {
     'c': 'c',
@@ -344,7 +326,7 @@ def gnulike_default_include_dirs(compiler: T.Tuple[str, ...], lang: str) -> 'Imm
     cmd = list(compiler) + [f'-x{lang}', '-E', '-v', '-']
     _, stdout, _ = mesonlib.Popen_safe(cmd, stderr=subprocess.STDOUT, env=env)
     parse_state = 0
-    paths = []  # type: T.List[str]
+    paths: T.List[str] = []
     for line in stdout.split('\n'):
         line = line.strip(' \n\r\t')
         if parse_state == 0:
@@ -399,9 +381,6 @@ class GnuLikeCompiler(Compiler, metaclass=abc.ABCMeta):
     def get_pie_args(self) -> T.List[str]:
         return ['-fPIE']
 
-    def get_buildtype_args(self, buildtype: str) -> T.List[str]:
-        return gnulike_buildtype_args[buildtype]
-
     @abc.abstractmethod
     def get_optimization_args(self, optimization_level: str) -> T.List[str]:
         pass
@@ -450,9 +429,6 @@ class GnuLikeCompiler(Compiler, metaclass=abc.ABCMeta):
     def get_profile_use_args(self) -> T.List[str]:
         return ['-fprofile-use']
 
-    def get_gui_app_args(self, value: bool) -> T.List[str]:
-        return ['-mwindows' if value else '-mconsole']
-
     def compute_parameters_with_absolute_paths(self, parameter_list: T.List[str], build_dir: str) -> T.List[str]:
         for idx, i in enumerate(parameter_list):
             if i[:2] == '-I' or i[:2] == '-L':
@@ -464,7 +440,7 @@ class GnuLikeCompiler(Compiler, metaclass=abc.ABCMeta):
     def _get_search_dirs(self, env: 'Environment') -> str:
         extra_args = ['--print-search-dirs']
         with self._build_wrapper('', env, extra_args=extra_args,
-                                 dependencies=None, mode='compile',
+                                 dependencies=None, mode=CompileCheckMode.COMPILE,
                                  want_output=True) as p:
             return p.stdout
 
@@ -482,7 +458,7 @@ class GnuLikeCompiler(Compiler, metaclass=abc.ABCMeta):
         # pathlib treats empty paths as '.', so filter those out
         paths = [p for p in pathstr.split(pathsep) if p]
 
-        result = []
+        result: T.List[str] = []
         for p in paths:
             # GCC returns paths like this:
             # /usr/lib/gcc/x86_64-linux-gnu/8/../../../../x86_64-linux-gnu/lib
@@ -528,8 +504,8 @@ class GnuLikeCompiler(Compiler, metaclass=abc.ABCMeta):
             args.append('-fno-omit-frame-pointer')
         return args
 
-    def get_output_args(self, target: str) -> T.List[str]:
-        return ['-o', target]
+    def get_output_args(self, outputname: str) -> T.List[str]:
+        return ['-o', outputname]
 
     def get_dependency_gen_args(self, outtarget: str, outfile: str) -> T.List[str]:
         return ['-MD', '-MQ', outtarget, '-MF', outfile]
@@ -589,7 +565,7 @@ class GnuCompiler(GnuLikeCompiler):
         return args
 
     def supported_warn_args(self, warn_args_by_version: T.Dict[str, T.List[str]]) -> T.List[str]:
-        result = []
+        result: T.List[str] = []
         for version, warn_args in warn_args_by_version.items():
             if mesonlib.version_compare(self.version, '>=' + version):
                 result += warn_args
@@ -613,7 +589,7 @@ class GnuCompiler(GnuLikeCompiler):
         return ['-fopenmp']
 
     def has_arguments(self, args: T.List[str], env: 'Environment', code: str,
-                      mode: str) -> T.Tuple[bool, bool]:
+                      mode: CompileCheckMode) -> T.Tuple[bool, bool]:
         # For some compiler command line arguments, the GNU compilers will
         # emit a warning on stderr indicating that an option is valid for a
         # another language, but still complete with exit_success

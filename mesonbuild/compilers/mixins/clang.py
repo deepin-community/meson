@@ -1,16 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2019-2022 The meson development team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
 from __future__ import annotations
 
 """Abstractions for the LLVM/Clang compiler family."""
@@ -30,13 +20,13 @@ if T.TYPE_CHECKING:
     from ...environment import Environment
     from ...dependencies import Dependency  # noqa: F401
 
-clang_color_args = {
-    'auto': ['-fcolor-diagnostics'],
-    'always': ['-fcolor-diagnostics'],
-    'never': ['-fno-color-diagnostics'],
-}  # type: T.Dict[str, T.List[str]]
+clang_color_args: T.Dict[str, T.List[str]] = {
+    'auto': ['-fdiagnostics-color=auto'],
+    'always': ['-fdiagnostics-color=always'],
+    'never': ['-fdiagnostics-color=never'],
+}
 
-clang_optimization_args = {
+clang_optimization_args: T.Dict[str, T.List[str]] = {
     'plain': [],
     '0': ['-O0'],
     'g': ['-Og'],
@@ -44,7 +34,7 @@ clang_optimization_args = {
     '2': ['-O2'],
     '3': ['-O3'],
     's': ['-Oz'],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 class ClangCompiler(GnuLikeCompiler):
 

@@ -1,16 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2013-2016 The Meson development team
 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from __future__ import annotations
 
 
@@ -123,8 +113,8 @@ class Elf(DataSizes):
     def __init__(self, bfile: str, verbose: bool = True) -> None:
         self.bfile = bfile
         self.verbose = verbose
-        self.sections = []  # type: T.List[SectionHeader]
-        self.dynamic = []   # type: T.List[DynamicEntry]
+        self.sections: T.List[SectionHeader] = []
+        self.dynamic: T.List[DynamicEntry] = []
         self.open_bf(bfile)
         try:
             (self.ptrsize, self.is_le) = self.detect_elf_type()
@@ -154,7 +144,7 @@ class Elf(DataSizes):
     def close_bf(self) -> None:
         if self.bf is not None:
             if self.bf_perms is not None:
-                os.fchmod(self.bf.fileno(), self.bf_perms)
+                os.chmod(self.bf.fileno(), self.bf_perms)
                 self.bf_perms = None
             self.bf.close()
             self.bf = None
@@ -329,7 +319,7 @@ class Elf(DataSizes):
         old_rpath = self.read_str()
         # Some rpath entries may come from multiple sources.
         # Only add each one once.
-        new_rpaths = OrderedSet()  # type: OrderedSet[bytes]
+        new_rpaths: OrderedSet[bytes] = OrderedSet()
         if new_rpath:
             new_rpaths.update(new_rpath.split(b':'))
         if old_rpath:
