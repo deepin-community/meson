@@ -21,7 +21,7 @@ from ..interpreterbase import (
                                typed_pos_args, typed_kwargs, typed_operator,
                                noArgsFlattening, noPosargs, noKwargs, unholder_return,
                                flatten, resolve_second_level_holders, InterpreterException, InvalidArguments, InvalidCode)
-from ..interpreter.type_checking import NoneType, ENV_SEPARATOR_KW
+from ..interpreter.type_checking import NoneType, ENV_KW, ENV_SEPARATOR_KW, PKGCONFIG_DEFINE_KW
 from ..dependencies import Dependency, ExternalLibrary, InternalDependency
 from ..programs import ExternalProgram
 from ..mesonlib import HoldableObject, OptionKey, listify, Popen_safe
@@ -203,7 +203,7 @@ class RunProcess(MesonInterpreterObject):
     def __init__(self,
                  cmd: ExternalProgram,
                  args: T.List[str],
-                 env: build.EnvironmentVariables,
+                 env: mesonlib.EnvironmentVariables,
                  source_dir: str,
                  build_dir: str,
                  subdir: str,
@@ -224,7 +224,7 @@ class RunProcess(MesonInterpreterObject):
     def run_command(self,
                     cmd: ExternalProgram,
                     args: T.List[str],
-                    env: build.EnvironmentVariables,
+                    env: mesonlib.EnvironmentVariables,
                     source_dir: str,
                     build_dir: str,
                     subdir: str,
@@ -280,11 +280,12 @@ class RunProcess(MesonInterpreterObject):
     def stderr_method(self, args: T.List[TYPE_var], kwargs: TYPE_kwargs) -> str:
         return self.stderr
 
-class EnvironmentVariablesHolder(ObjectHolder[build.EnvironmentVariables], MutableInterpreterObject):
+class EnvironmentVariablesHolder(ObjectHolder[mesonlib.EnvironmentVariables], MutableInterpreterObject):
 
-    def __init__(self, obj: build.EnvironmentVariables, interpreter: 'Interpreter'):
+    def __init__(self, obj: mesonlib.EnvironmentVariables, interpreter: 'Interpreter'):
         super().__init__(obj, interpreter)
         self.methods.update({'set': self.set_method,
+                             'unset': self.unset_method,
                              'append': self.append_method,
                              'prepend': self.prepend_method,
                              })
@@ -308,6 +309,12 @@ class EnvironmentVariablesHolder(ObjectHolder[build.EnvironmentVariables], Mutab
     def set_method(self, args: T.Tuple[str, T.List[str]], kwargs: 'EnvironmentSeparatorKW') -> None:
         name, values = args
         self.held_object.set(name, values, kwargs['separator'])
+
+    @FeatureNew('environment.unset', '1.4.0')
+    @typed_pos_args('environment.unset', str)
+    @noKwargs
+    def unset_method(self, args: T.Tuple[str], kwargs: TYPE_kwargs) -> None:
+        self.held_object.unset(args[0])
 
     @typed_pos_args('environment.append', str, varargs=str, min_varargs=1)
     @typed_kwargs('environment.append', ENV_SEPARATOR_KW)
@@ -487,17 +494,21 @@ class DependencyHolder(ObjectHolder[Dependency]):
     @typed_pos_args('dependency.get_pkgconfig_variable', str)
     @typed_kwargs(
         'dependency.get_pkgconfig_variable',
-        KwargInfo('default', (str, NoneType)),
-        KwargInfo(
-            'define_variable',
-            ContainerTypeInfo(list, str, pairs=True),
-            default=[],
-            listify=True,
-            validator=lambda x: 'must be of length 2 or empty' if len(x) not in {0, 2} else None,
-        ),
+        KwargInfo('default', str, default=''),
+        PKGCONFIG_DEFINE_KW.evolve(name='define_variable')
     )
     def pkgconfig_method(self, args: T.Tuple[str], kwargs: 'kwargs.DependencyPkgConfigVar') -> str:
-        return self.held_object.get_pkgconfig_variable(args[0], **kwargs)
+        from ..dependencies.pkgconfig import PkgConfigDependency
+        if not isinstance(self.held_object, PkgConfigDependency):
+            raise InvalidArguments(f'{self.held_object.get_name()!r} is not a pkgconfig dependency')
+        if kwargs['define_variable'] and len(kwargs['define_variable']) > 1:
+            FeatureNew.single_use('dependency.get_pkgconfig_variable keyword argument "define_variable"  with more than one pair',
+                                  '1.3.0', self.subproject, location=self.current_node)
+        return self.held_object.get_variable(
+            pkgconfig=args[0],
+            default_value=kwargs['default'],
+            pkgconfig_define=kwargs['define_variable'],
+        )
 
     @FeatureNew('dependency.get_configtool_variable', '0.44.0')
     @FeatureDeprecated('dependency.get_configtool_variable', '0.56.0',
@@ -505,7 +516,13 @@ class DependencyHolder(ObjectHolder[Dependency]):
     @noKwargs
     @typed_pos_args('dependency.get_config_tool_variable', str)
     def configtool_method(self, args: T.Tuple[str], kwargs: TYPE_kwargs) -> str:
-        return self.held_object.get_configtool_variable(args[0])
+        from ..dependencies.configtool import ConfigToolDependency
+        if not isinstance(self.held_object, ConfigToolDependency):
+            raise InvalidArguments(f'{self.held_object.get_name()!r} is not a config-tool dependency')
+        return self.held_object.get_variable(
+            configtool=args[0],
+            default_value='',
+        )
 
     @FeatureNew('dependency.partial_dependency', '0.46.0')
     @noPosargs
@@ -523,12 +540,16 @@ class DependencyHolder(ObjectHolder[Dependency]):
         KwargInfo('configtool', (str, NoneType)),
         KwargInfo('internal', (str, NoneType), since='0.54.0'),
         KwargInfo('default_value', (str, NoneType)),
-        KwargInfo('pkgconfig_define', ContainerTypeInfo(list, str, pairs=True), default=[], listify=True),
+        PKGCONFIG_DEFINE_KW,
     )
     def variable_method(self, args: T.Tuple[T.Optional[str]], kwargs: 'kwargs.DependencyGetVariable') -> str:
         default_varname = args[0]
         if default_varname is not None:
             FeatureNew('Positional argument to dependency.get_variable()', '0.58.0').use(self.subproject, self.current_node)
+        if kwargs['pkgconfig_define'] and len(kwargs['pkgconfig_define']) > 1:
+            FeatureNew.single_use('dependency.get_variable keyword argument "pkgconfig_define" with more than one pair',
+                                  '1.3.0', self.subproject, 'In previous versions, this silently returned a malformed value.',
+                                  self.current_node)
         return self.held_object.get_variable(
             cmake=kwargs['cmake'] or default_varname,
             pkgconfig=kwargs['pkgconfig'] or default_varname,
@@ -559,8 +580,10 @@ class DependencyHolder(ObjectHolder[Dependency]):
         new_dep = self.held_object.generate_link_whole_dependency()
         return new_dep
 
-class ExternalProgramHolder(ObjectHolder[ExternalProgram]):
-    def __init__(self, ep: ExternalProgram, interpreter: 'Interpreter') -> None:
+_EXTPROG = T.TypeVar('_EXTPROG', bound=ExternalProgram)
+
+class _ExternalProgramHolder(ObjectHolder[_EXTPROG]):
+    def __init__(self, ep: _EXTPROG, interpreter: 'Interpreter') -> None:
         super().__init__(ep, interpreter)
         self.methods.update({'found': self.found_method,
                              'path': self.path_method,
@@ -605,6 +628,9 @@ class ExternalProgramHolder(ObjectHolder[ExternalProgram]):
 
     def found(self) -> bool:
         return self.held_object.found()
+
+class ExternalProgramHolder(_ExternalProgramHolder[ExternalProgram]):
+    pass
 
 class ExternalLibraryHolder(ObjectHolder[ExternalLibrary]):
     def __init__(self, el: ExternalLibrary, interpreter: 'Interpreter'):
@@ -682,7 +708,16 @@ class IncludeDirsHolder(ObjectHolder[build.IncludeDirs]):
     pass
 
 class FileHolder(ObjectHolder[mesonlib.File]):
-    pass
+    def __init__(self, file: mesonlib.File, interpreter: 'Interpreter'):
+        super().__init__(file, interpreter)
+        self.methods.update({'full_path': self.full_path_method,
+                             })
+
+    @noPosargs
+    @noKwargs
+    @FeatureNew('file.full_path', '1.4.0')
+    def full_path_method(self, args: T.List[TYPE_var], kwargs: TYPE_kwargs) -> str:
+        return self.held_object.absolute_path(self.env.source_dir, self.env.build_dir)
 
 class HeadersHolder(ObjectHolder[build.Headers]):
     pass
@@ -707,11 +742,11 @@ class GeneratedObjectsHolder(ObjectHolder[build.ExtractedObjects]):
 
 class Test(MesonInterpreterObject):
     def __init__(self, name: str, project: str, suite: T.List[str],
-                 exe: T.Union[ExternalProgram, build.Executable, build.CustomTarget],
+                 exe: T.Union[ExternalProgram, build.Executable, build.CustomTarget, build.CustomTargetIndex],
                  depends: T.List[T.Union[build.CustomTarget, build.BuildTarget]],
                  is_parallel: bool,
                  cmd_args: T.List[T.Union[str, mesonlib.File, build.Target]],
-                 env: build.EnvironmentVariables,
+                 env: mesonlib.EnvironmentVariables,
                  should_fail: bool, timeout: int, workdir: T.Optional[str], protocol: str,
                  priority: int, verbose: bool):
         super().__init__()
@@ -730,7 +765,7 @@ class Test(MesonInterpreterObject):
         self.priority = priority
         self.verbose = verbose
 
-    def get_exe(self) -> T.Union[ExternalProgram, build.Executable, build.CustomTarget]:
+    def get_exe(self) -> T.Union[ExternalProgram, build.Executable, build.CustomTarget, build.CustomTargetIndex]:
         return self.exe
 
     def get_name(self) -> str:
@@ -969,8 +1004,10 @@ class CustomTargetIndexHolder(ObjectHolder[build.CustomTargetIndex]):
         assert self.interpreter.backend is not None
         return self.interpreter.backend.get_target_filename_abs(self.held_object)
 
-class CustomTargetHolder(ObjectHolder[build.CustomTarget]):
-    def __init__(self, target: 'build.CustomTarget', interp: 'Interpreter'):
+_CT = T.TypeVar('_CT', bound=build.CustomTarget)
+
+class _CustomTargetHolder(ObjectHolder[_CT]):
+    def __init__(self, target: _CT, interp: 'Interpreter'):
         super().__init__(target, interp)
         self.methods.update({'full_path': self.full_path_method,
                              'to_list': self.to_list_method,
@@ -1007,6 +1044,9 @@ class CustomTargetHolder(ObjectHolder[build.CustomTarget]):
         except IndexError:
             raise InvalidArguments(f'Index {other} out of bounds of custom target {self.held_object.name} output of size {len(self.held_object)}.')
 
+class CustomTargetHolder(_CustomTargetHolder[build.CustomTarget]):
+    pass
+
 class RunTargetHolder(ObjectHolder[build.RunTarget]):
     pass
 
@@ -1026,6 +1066,7 @@ class GeneratorHolder(ObjectHolder[build.Generator]):
         'generator.process',
         KwargInfo('preserve_path_from', (str, NoneType), since='0.45.0'),
         KwargInfo('extra_args', ContainerTypeInfo(list, str), listify=True, default=[]),
+        ENV_KW.evolve(since='1.3.0')
     )
     def process_method(self,
                        args: T.Tuple[T.List[T.Union[str, mesonlib.File, 'build.GeneratedTypes']]],
@@ -1043,7 +1084,7 @@ class GeneratorHolder(ObjectHolder[build.Generator]):
                 '0.57.0', self.interpreter.subproject)
 
         gl = self.held_object.process_files(args[0], self.interpreter,
-                                            preserve_path_from, extra_args=kwargs['extra_args'])
+                                            preserve_path_from, extra_args=kwargs['extra_args'], env=kwargs['env'])
 
         return gl
 

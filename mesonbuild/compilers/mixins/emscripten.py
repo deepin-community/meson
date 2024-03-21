@@ -1,16 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2019 The meson development team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
 from __future__ import annotations
 
 """Provides a mixin for shared code between C and C++ Emscripten compilers."""
@@ -22,6 +12,7 @@ from ... import coredata
 from ... import mesonlib
 from ...mesonlib import OptionKey
 from ...mesonlib import LibType
+from mesonbuild.compilers.compilers import CompileCheckMode
 
 if T.TYPE_CHECKING:
     from ...environment import Environment
@@ -36,7 +27,7 @@ else:
 
 
 def wrap_js_includes(args: T.List[str]) -> T.List[str]:
-    final_args = []
+    final_args: T.List[str] = []
     for i in args:
         if i.endswith('.js') and not i.startswith('-'):
             final_args += ['--js-library', i]
@@ -46,14 +37,12 @@ def wrap_js_includes(args: T.List[str]) -> T.List[str]:
 
 class EmscriptenMixin(Compiler):
 
-    def _get_compile_output(self, dirname: str, mode: str) -> str:
-        # In pre-processor mode, the output is sent to stdout and discarded
-        if mode == 'preprocess':
-            return None
+    def _get_compile_output(self, dirname: str, mode: CompileCheckMode) -> str:
+        assert mode != CompileCheckMode.PREPROCESS, 'In pre-processor mode, the output is sent to stdout and discarded'
         # Unlike sane toolchains, emcc infers the kind of output from its name.
         # This is the only reason why this method is overridden; compiler tests
         # do not work well with the default exe/obj suffices.
-        if mode == 'link':
+        if mode == CompileCheckMode.LINK:
             suffix = 'js'
         else:
             suffix = 'o'

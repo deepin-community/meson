@@ -1,16 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2014-2016 The Meson development team
+# Copyright © 2023 Intel Corporation
 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from __future__ import annotations
 
 import itertools
@@ -26,15 +17,24 @@ from . import environment
 from . import mesonlib
 from . import mintro
 from . import mlog
-from .ast import AstIDGenerator
+from .ast import AstIDGenerator, IntrospectionInterpreter
 from .mesonlib import MachineChoice, OptionKey
 
 if T.TYPE_CHECKING:
+    from typing_extensions import Protocol
     import argparse
+
+    class CMDOptions(coredata.SharedCMDOptions, Protocol):
+
+        builddir: str
+        clearcache: bool
+        pager: bool
 
     # cannot be TV_Loggable, because non-ansidecorators do direct string concat
     LOGLINE = T.Union[str, mlog.AnsiDecorator]
 
+# Note: when adding arguments, please also add them to the completion
+# scripts in $MESONSRC/data/shell-completions/
 def add_arguments(parser: 'argparse.ArgumentParser') -> None:
     coredata.register_builtin_arguments(parser)
     parser.add_argument('builddir', nargs='?', default='.')
@@ -81,7 +81,7 @@ class Conf:
             # Make sure that log entries in other parts of meson don't interfere with the JSON output
             with mlog.no_logging():
                 self.source_dir = os.path.abspath(os.path.realpath(self.build_dir))
-                intr = mintro.IntrospectionInterpreter(self.source_dir, '', 'ninja', visitors = [AstIDGenerator()])
+                intr = IntrospectionInterpreter(self.source_dir, '', 'ninja', visitors = [AstIDGenerator()])
                 intr.analyze()
             self.coredata = intr.coredata
             self.default_values_only = True
@@ -301,9 +301,7 @@ class Conf:
         for m in mismatching:
             mlog.log(f'{m[0]:21}{m[1]:10}{m[2]:10}')
 
-def run(options: argparse.Namespace) -> int:
-    coredata.parse_cmd_line_options(options)
-    builddir = os.path.abspath(os.path.realpath(options.builddir))
+def run_impl(options: CMDOptions, builddir: str) -> int:
     print_only = not options.cmd_line_options and not options.clearcache
     c = None
     try:
@@ -334,3 +332,8 @@ def run(options: argparse.Namespace) -> int:
         # Pager quit before we wrote everything.
         pass
     return 0
+
+def run(options: CMDOptions) -> int:
+    coredata.parse_cmd_line_options(options)
+    builddir = os.path.abspath(os.path.realpath(options.builddir))
+    return run_impl(options, builddir)

@@ -1,16 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2021 The Meson development team
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import json
 import os
@@ -18,6 +7,7 @@ import pickle
 import tempfile
 import subprocess
 import textwrap
+import shutil
 from unittest import skipIf, SkipTest
 from pathlib import Path
 
@@ -183,6 +173,13 @@ class PlatformAgnosticTests(BasePlatformTests):
         Path(self.builddir, 'dummy').touch()
         self.init(testdir, extra_args=['--reconfigure'])
 
+        # Setup a valid builddir should update options but not reconfigure
+        self.assertEqual(self.getconf('buildtype'), 'debug')
+        o = self.init(testdir, extra_args=['-Dbuildtype=release'])
+        self.assertIn('Directory already configured', o)
+        self.assertNotIn('The Meson build system', o)
+        self.assertEqual(self.getconf('buildtype'), 'release')
+
         # Wipe of empty builddir should work
         self.new_builddir()
         self.init(testdir, extra_args=['--wipe'])
@@ -242,7 +239,7 @@ class PlatformAgnosticTests(BasePlatformTests):
         thing to do as new features are added, but keeping track of them is
         good.
         '''
-        testdir = os.path.join(self.unit_test_dir, '114 empty project')
+        testdir = os.path.join(self.unit_test_dir, '116 empty project')
 
         self.init(testdir)
         self._run(self.meson_command + ['--internal', 'regenerate', '--profile-self', testdir, self.builddir])
@@ -255,9 +252,45 @@ class PlatformAgnosticTests(BasePlatformTests):
         self.assertEqual(data['modules'], expected)
         self.assertEqual(data['count'], 68)
 
+    def test_meson_package_cache_dir(self):
+        # Copy testdir into temporary directory to not pollute meson source tree.
+        testdir = os.path.join(self.unit_test_dir, '118 meson package cache dir')
+        srcdir = os.path.join(self.builddir, 'srctree')
+        shutil.copytree(testdir, srcdir)
+        builddir = os.path.join(srcdir, '_build')
+        self.change_builddir(builddir)
+        self.init(srcdir, override_envvars={'MESON_PACKAGE_CACHE_DIR': os.path.join(srcdir, 'cache_dir')})
+
     def test_cmake_openssl_not_found_bug(self):
         """Issue #12098"""
-        testdir = os.path.join(self.unit_test_dir, '117 openssl cmake bug')
+        testdir = os.path.join(self.unit_test_dir, '119 openssl cmake bug')
         self.meson_native_files.append(os.path.join(testdir, 'nativefile.ini'))
         out = self.init(testdir, allow_fail=True)
         self.assertNotIn('Unhandled python exception', out)
+
+    def test_error_configuring_subdir(self):
+        testdir = os.path.join(self.common_test_dir, '152 index customtarget')
+        out = self.init(os.path.join(testdir, 'subdir'), allow_fail=True)
+
+        self.assertIn('first statement must be a call to project()', out)
+        # provide guidance diagnostics by finding a file whose first AST statement is project()
+        self.assertIn(f'Did you mean to run meson from the directory: "{testdir}"?', out)
+
+    def test_reconfigure_base_options(self):
+        testdir = os.path.join(self.unit_test_dir, '122 reconfigure base options')
+        out = self.init(testdir, extra_args=['-Db_ndebug=true'])
+        self.assertIn('\nMessage: b_ndebug: true\n', out)
+        self.assertIn('\nMessage: c_std: c89\n', out)
+
+        out = self.init(testdir, extra_args=['--reconfigure', '-Db_ndebug=if-release', '-Dsub:b_ndebug=false', '-Dc_std=c99', '-Dsub:c_std=c11'])
+        self.assertIn('\nMessage: b_ndebug: if-release\n', out)
+        self.assertIn('\nMessage: c_std: c99\n', out)
+        self.assertIn('\nsub| Message: b_ndebug: false\n', out)
+        self.assertIn('\nsub| Message: c_std: c11\n', out)
+
+    def test_setup_with_unknown_option(self):
+        testdir = os.path.join(self.common_test_dir, '1 trivial')
+
+        for option in ('not_an_option', 'b_not_an_option'):
+            out = self.init(testdir, extra_args=['--wipe', f'-D{option}=1'], allow_fail=True)
+            self.assertIn(f'ERROR: Unknown options: "{option}"', out)

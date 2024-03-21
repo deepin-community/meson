@@ -1,26 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2012-2022 The Meson development team
 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from __future__ import annotations
 
+import functools
 import subprocess, os.path
 import textwrap
 import re
 import typing as T
 
-from .. import coredata, mlog
-from ..mesonlib import EnvironmentException, MesonException, Popen_safe, OptionKey, join_args
-from .compilers import Compiler, rust_buildtype_args, clike_debug_args
+from .. import coredata
+from ..mesonlib import EnvironmentException, MesonException, Popen_safe_logged, OptionKey
+from .compilers import Compiler, clike_debug_args
 
 if T.TYPE_CHECKING:
     from ..coredata import MutableKeyedOptionDictType, KeyedOptionDictType
@@ -32,7 +23,7 @@ if T.TYPE_CHECKING:
     from ..dependencies import Dependency
 
 
-rust_optimization_args = {
+rust_optimization_args: T.Dict[str, T.List[str]] = {
     'plain': [],
     '0': [],
     'g': ['-C', 'opt-level=0'],
@@ -40,7 +31,7 @@ rust_optimization_args = {
     '2': ['-C', 'opt-level=2'],
     '3': ['-C', 'opt-level=3'],
     's': ['-C', 'opt-level=s'],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 class RustCompiler(Compiler):
 
@@ -53,6 +44,17 @@ class RustCompiler(Compiler):
         '1': [],
         '2': [],
         '3': ['-W', 'warnings'],
+    }
+
+    # Those are static libraries, but we use dylib= here as workaround to avoid
+    # rust --tests to use /WHOLEARCHIVE.
+    # https://github.com/rust-lang/rust/issues/116910
+    MSVCRT_ARGS: T.Mapping[str, T.List[str]] = {
+        'none': [],
+        'md': [], # this is the default, no need to inject anything
+        'mdd': ['-l', 'dylib=msvcrtd'],
+        'mt': ['-l', 'dylib=libcmt'],
+        'mtd': ['-l', 'dylib=libcmtd'],
     }
 
     def __init__(self, exelist: T.List[str], version: str, for_machine: MachineChoice,
@@ -82,13 +84,7 @@ class RustCompiler(Compiler):
                 '''))
 
         cmdlist = self.exelist + ['-o', output_name, source_name]
-        pc, stdo, stde = Popen_safe(cmdlist, cwd=work_dir)
-        mlog.debug('Sanity check compiler command line:', join_args(cmdlist))
-        mlog.debug('Sanity check compile stdout:')
-        mlog.debug(stdo)
-        mlog.debug('-----\nSanity check compile stderr:')
-        mlog.debug(stde)
-        mlog.debug('-----')
+        pc, stdo, stde = Popen_safe_logged(cmdlist, cwd=work_dir)
         if pc.returncode != 0:
             raise EnvironmentException(f'Rust compiler {self.name_string()} cannot compile programs.')
         if self.is_cross:
@@ -104,7 +100,7 @@ class RustCompiler(Compiler):
             raise EnvironmentException(f'Executables created by Rust compiler {self.name_string()} are not runnable.')
         # Get libraries needed to link with a Rust staticlib
         cmdlist = self.exelist + ['--crate-type', 'staticlib', '--print', 'native-static-libs', source_name]
-        p, stdo, stde = Popen_safe(cmdlist, cwd=work_dir)
+        p, stdo, stde = Popen_safe_logged(cmdlist, cwd=work_dir)
         if p.returncode == 0:
             match = re.search('native-static-libs: (.*)$', stde, re.MULTILINE)
             if match:
@@ -118,13 +114,16 @@ class RustCompiler(Compiler):
     def get_dependency_gen_args(self, outtarget: str, outfile: str) -> T.List[str]:
         return ['--dep-info', outfile]
 
-    def get_buildtype_args(self, buildtype: str) -> T.List[str]:
-        return rust_buildtype_args[buildtype]
-
     def get_sysroot(self) -> str:
         cmd = self.get_exelist(ccache=False) + ['--print', 'sysroot']
-        p, stdo, stde = Popen_safe(cmd)
+        p, stdo, stde = Popen_safe_logged(cmd)
         return stdo.split('\n', maxsplit=1)[0]
+
+    @functools.lru_cache(maxsize=None)
+    def get_crt_static(self) -> bool:
+        cmd = self.get_exelist(ccache=False) + ['--print', 'cfg']
+        p, stdo, stde = Popen_safe_logged(cmd)
+        return bool(re.search('^target_feature="crt-static"$', stdo, re.MULTILINE))
 
     def get_debug_args(self, is_debug: bool) -> T.List[str]:
         return clike_debug_args[is_debug]
@@ -183,6 +182,11 @@ class RustCompiler(Compiler):
         # Rust handles this for us, we don't need to do anything
         return []
 
+    def get_crt_link_args(self, crt_val: str, buildtype: str) -> T.List[str]:
+        if self.linker.id not in {'link', 'lld-link'}:
+            return []
+        return self.MSVCRT_ARGS[self.get_crt_val(crt_val, buildtype)]
+
     def get_colorout_args(self, colortype: str) -> T.List[str]:
         if colortype in {'always', 'never', 'auto'}:
             return [f'--color={colortype}']
@@ -202,9 +206,6 @@ class RustCompiler(Compiler):
     def get_warn_args(self, level: str) -> T.List[str]:
         # TODO: I'm not really sure what to put here, Rustc doesn't have warning
         return self._WARNING_LEVELS[level]
-
-    def get_no_warn_args(self) -> T.List[str]:
-        return self._WARNING_LEVELS["0"]
 
     def get_pic_args(self) -> T.List[str]:
         # relocation-model=pic is rustc's default already.

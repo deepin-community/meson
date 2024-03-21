@@ -1,19 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2013-2019 The Meson development team
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# This file contains the detection logic for external dependencies useful for
-# development purposes, such as testing, debugging, etc..
 
 from __future__ import annotations
 
@@ -232,6 +218,7 @@ class LLVMDependencyConfigTool(ConfigToolDependency):
 
         cargs = mesonlib.OrderedSet(self.get_config_value(['--cppflags'], 'compile_args'))
         self.compile_args = list(cargs.difference(self.__cpp_blacklist))
+        self.compile_args = strip_system_includedirs(environment, self.for_machine, self.compile_args)
 
         if version_compare(self.version, '>= 3.9'):
             self._set_new_link_args(environment)
@@ -342,7 +329,7 @@ class LLVMDependencyConfigTool(ConfigToolDependency):
 
         Old versions of LLVM bring an extra level of insanity with them.
         llvm-config will provide the correct arguments for static linking, but
-        not for shared-linnking, we have to figure those out ourselves, because
+        not for shared-linking, we have to figure those out ourselves, because
         of course we do.
         """
         if self.static:
@@ -420,13 +407,13 @@ class LLVMDependencyCMake(CMakeDependency):
 
         super().__init__(name, env, kwargs, language='cpp', force_use_global_compilers=True)
 
-        if self.traceparser is None:
+        if not self.cmakebin.found():
             return
 
         if not self.is_found:
             return
 
-        #CMake will return not found due to not defined LLVM_DYLIB_COMPONENTS
+        # CMake will return not found due to not defined LLVM_DYLIB_COMPONENTS
         if not self.static and version_compare(self.version, '< 7.0') and self.llvm_modules:
             mlog.warning('Before version 7.0 cmake does not export modules for dynamic linking, cannot check required modules')
             return

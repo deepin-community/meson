@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import typing as T
 
@@ -11,7 +13,7 @@ if T.TYPE_CHECKING:
     from ..mesonlib import MachineChoice
     from ..envconfig import MachineInfo
 
-nasm_optimization_args = {
+nasm_optimization_args: T.Dict[str, T.List[str]] = {
     'plain': [],
     '0': ['-O0'],
     'g': ['-O0'],
@@ -19,7 +21,7 @@ nasm_optimization_args = {
     '2': ['-Ox'],
     '3': ['-Ox'],
     's': ['-Ox'],
-}  # type: T.Dict[str, T.List[str]]
+}
 
 
 class NasmCompiler(Compiler):
@@ -69,7 +71,7 @@ class NasmCompiler(Compiler):
         return ['-o', outputname]
 
     def unix_args_to_native(self, args: T.List[str]) -> T.List[str]:
-        outargs = []
+        outargs: T.List[str] = []
         for arg in args:
             if arg == '-pthread':
                 continue
@@ -96,10 +98,6 @@ class NasmCompiler(Compiler):
         if self.info.cpu_family not in {'x86', 'x86_64'}:
             raise EnvironmentException(f'ASM compiler {self.id!r} does not support {self.info.cpu_family} CPU family')
 
-    def get_buildtype_args(self, buildtype: str) -> T.List[str]:
-        # FIXME: Not implemented
-        return []
-
     def get_pic_args(self) -> T.List[str]:
         return []
 
@@ -124,28 +122,7 @@ class NasmCompiler(Compiler):
     def get_crt_link_args(self, crt_val: str, buildtype: str) -> T.List[str]:
         if not self.info.is_windows():
             return []
-        if crt_val in self.crt_args:
-            return self.crt_args[crt_val]
-        assert crt_val in {'from_buildtype', 'static_from_buildtype'}
-        dbg = 'mdd'
-        rel = 'md'
-        if crt_val == 'static_from_buildtype':
-            dbg = 'mtd'
-            rel = 'mt'
-        # Match what build type flags used to do.
-        if buildtype == 'plain':
-            return []
-        elif buildtype == 'debug':
-            return self.crt_args[dbg]
-        elif buildtype == 'debugoptimized':
-            return self.crt_args[rel]
-        elif buildtype == 'release':
-            return self.crt_args[rel]
-        elif buildtype == 'minsize':
-            return self.crt_args[rel]
-        else:
-            assert buildtype == 'custom'
-            raise EnvironmentException('Requested C runtime based on buildtype, but buildtype is "custom".')
+        return self.crt_args[self.get_crt_val(crt_val, buildtype)]
 
 class YasmCompiler(NasmCompiler):
     id = 'yasm'
@@ -204,10 +181,6 @@ class MasmCompiler(Compiler):
         if self.info.cpu_family not in {'x86', 'x86_64'}:
             raise EnvironmentException(f'ASM compiler {self.id!r} does not support {self.info.cpu_family} CPU family')
 
-    def get_buildtype_args(self, buildtype: str) -> T.List[str]:
-        # FIXME: Not implemented
-        return []
-
     def get_pic_args(self) -> T.List[str]:
         return []
 
@@ -259,10 +232,6 @@ class MasmARMCompiler(Compiler):
         if self.info.cpu_family not in {'arm', 'aarch64'}:
             raise EnvironmentException(f'ASM compiler {self.id!r} does not support {self.info.cpu_family} CPU family')
 
-    def get_buildtype_args(self, buildtype: str) -> T.List[str]:
-        # FIXME: Not implemented
-        return []
-
     def get_pic_args(self) -> T.List[str]:
         return []
 
@@ -295,10 +264,18 @@ class MetrowerksAsmCompiler(MetrowerksCompiler, Compiler):
         Compiler.__init__(self, ccache, exelist, version, for_machine, info, linker, full_version, is_cross)
         MetrowerksCompiler.__init__(self)
 
-        self.warn_args = {'0': [], '1': [], '2': [], '3': [], 'everything': []}  # type: T.Dict[str, T.List[str]]
+        self.warn_args: T.Dict[str, T.List[str]] = {
+            '0': [],
+            '1': [],
+            '2': [],
+            '3': [],
+            'everything': []}
         self.can_compile_suffixes.add('s')
 
     def get_crt_compile_args(self, crt_val: str, buildtype: str) -> T.List[str]:
+        return []
+
+    def get_optimization_args(self, optimization_level: str) -> T.List[str]:
         return []
 
     def get_pic_args(self) -> T.List[str]:
