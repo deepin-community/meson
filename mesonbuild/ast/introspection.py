@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2018 The Meson development team
+# Copyright © 2024-2025 Intel Corporation
 
 # This class contains the basic functionality needed to run any interpreter
 # or an interpreter-based tool
@@ -9,13 +10,14 @@ import copy
 import os
 import typing as T
 
-from .. import compilers, environment, mesonlib, optinterpreter
+from .. import compilers, environment, mesonlib, options
 from .. import coredata as cdata
 from ..build import Executable, Jar, SharedLibrary, SharedModule, StaticLibrary
 from ..compilers import detect_compiler_for
 from ..interpreterbase import InvalidArguments, SubProject
-from ..mesonlib import MachineChoice, OptionKey
-from ..mparser import BaseNode, ArithmeticNode, ArrayNode, ElementaryNode, IdNode, FunctionNode, BaseStringNode
+from ..mesonlib import MachineChoice
+from ..options import OptionKey
+from ..mparser import BaseNode, ArithmeticNode, ArrayNode, ElementaryNode, IdNode, FunctionNode, StringNode
 from .interpreter import AstInterpreter
 
 if T.TYPE_CHECKING:
@@ -53,17 +55,11 @@ class IntrospectionInterpreter(AstInterpreter):
                  subproject: SubProject = SubProject(''),
                  subproject_dir: str = 'subprojects',
                  env: T.Optional[environment.Environment] = None):
-        visitors = visitors if visitors is not None else []
-        super().__init__(source_root, subdir, subproject, visitors=visitors)
-
         options = IntrospectionHelper(cross_file)
+        env_ = env or environment.Environment(source_root, None, options)
+        super().__init__(source_root, subdir, subproject, subproject_dir, env_, visitors=visitors)
+
         self.cross_file = cross_file
-        if env is None:
-            self.environment = environment.Environment(source_root, None, options)
-        else:
-            self.environment = env
-        self.subproject_dir = subproject_dir
-        self.coredata = self.environment.get_coredata()
         self.backend = backend
         self.default_options = {OptionKey('backend'): self.backend}
         self.project_data: T.Dict[str, T.Any] = {}
@@ -91,32 +87,55 @@ class IntrospectionInterpreter(AstInterpreter):
         if len(args) < 1:
             raise InvalidArguments('Not enough arguments to project(). Needs at least the project name.')
 
+        def _str_list(node: T.Any) -> T.Optional[T.List[str]]:
+            if isinstance(node, ArrayNode):
+                r = []
+                for v in node.args.arguments:
+                    if not isinstance(v, StringNode):
+                        return None
+                    r.append(v.value)
+                return r
+            if isinstance(node, StringNode):
+                return [node.value]
+            return None
+
         proj_name = args[0]
         proj_vers = kwargs.get('version', 'undefined')
-        proj_langs = self.flatten_args(args[1:])
         if isinstance(proj_vers, ElementaryNode):
             proj_vers = proj_vers.value
         if not isinstance(proj_vers, str):
             proj_vers = 'undefined'
-        self.project_data = {'descriptive_name': proj_name, 'version': proj_vers}
+        proj_langs = self.flatten_args(args[1:])
+        # Match the value returned by ``meson.project_license()`` when
+        # no ``license`` argument is specified in the ``project()`` call.
+        proj_license = _str_list(kwargs.get('license', None)) or ['unknown']
+        proj_license_files = _str_list(kwargs.get('license_files', None)) or []
+        self.project_data = {'descriptive_name': proj_name, 'version': proj_vers, 'license': proj_license, 'license_files': proj_license_files}
 
-        optfile = os.path.join(self.source_root, self.subdir, 'meson.options')
-        if not os.path.exists(optfile):
-            optfile = os.path.join(self.source_root, self.subdir, 'meson_options.txt')
-        if os.path.exists(optfile):
-            oi = optinterpreter.OptionInterpreter(self.subproject)
-            oi.process(optfile)
-            self.coredata.update_project_options(oi.options)
+        self._load_option_file()
 
         def_opts = self.flatten_args(kwargs.get('default_options', []))
         _project_default_options = mesonlib.stringlistify(def_opts)
-        self.project_default_options = cdata.create_options_dict(_project_default_options, self.subproject)
+        string_dict = cdata.create_options_dict(_project_default_options, self.subproject)
+        self.project_default_options = {OptionKey(s): v for s, v in string_dict.items()}
         self.default_options.update(self.project_default_options)
-        self.coredata.set_default_options(self.default_options, self.subproject, self.environment)
+        if self.environment.first_invocation or (self.subproject != '' and self.subproject not in self.coredata.initialized_subprojects):
+            if self.subproject == '':
+                self.coredata.optstore.initialize_from_top_level_project_call(
+                    T.cast('T.Dict[T.Union[OptionKey, str], str]', string_dict),
+                    {},  # TODO: not handled by this Interpreter.
+                    self.environment.options)
+            else:
+                self.coredata.optstore.initialize_from_subproject_call(
+                    self.subproject,
+                    {},  # TODO: this isn't handled by the introspection interpreter...
+                    T.cast('T.Dict[T.Union[OptionKey, str], str]', string_dict),
+                    {})  # TODO: this isn't handled by the introspection interpreter...
+                self.coredata.initialized_subprojects.add(self.subproject)
 
         if not self.is_subproject() and 'subproject_dir' in kwargs:
             spdirname = kwargs['subproject_dir']
-            if isinstance(spdirname, BaseStringNode):
+            if isinstance(spdirname, StringNode):
                 assert isinstance(spdirname.value, str)
                 self.subproject_dir = spdirname.value
         if not self.is_subproject():
@@ -128,7 +147,7 @@ class IntrospectionInterpreter(AstInterpreter):
                         self.do_subproject(SubProject(i))
 
         self.coredata.init_backend_options(self.backend)
-        options = {k: v for k, v in self.environment.options.items() if k.is_backend()}
+        options = {k: v for k, v in self.environment.options.items() if self.environment.coredata.optstore.is_backend_option(k)}
 
         self.coredata.set_options(options)
         self._add_languages(proj_langs, True, MachineChoice.HOST)
@@ -143,13 +162,13 @@ class IntrospectionInterpreter(AstInterpreter):
             subi.project_data['name'] = dirname
             self.project_data['subprojects'] += [subi.project_data]
         except (mesonlib.MesonException, RuntimeError):
-            return
+            pass
 
     def func_add_languages(self, node: BaseNode, args: T.List[TYPE_var], kwargs: T.Dict[str, TYPE_var]) -> None:
         kwargs = self.flatten_kwargs(kwargs)
         required = kwargs.get('required', True)
-        assert isinstance(required, (bool, cdata.UserFeatureOption)), 'for mypy'
-        if isinstance(required, cdata.UserFeatureOption):
+        assert isinstance(required, (bool, options.UserFeatureOption)), 'for mypy'
+        if isinstance(required, options.UserFeatureOption):
             required = required.is_enabled()
         if 'native' in kwargs:
             native = kwargs.get('native', False)
@@ -163,7 +182,7 @@ class IntrospectionInterpreter(AstInterpreter):
         for l in self.flatten_args(raw_langs):
             if isinstance(l, str):
                 langs.append(l)
-            elif isinstance(l, BaseStringNode):
+            elif isinstance(l, StringNode):
                 langs.append(l.value)
 
         for lang in sorted(langs, key=compilers.sort_clink):
@@ -180,7 +199,7 @@ class IntrospectionInterpreter(AstInterpreter):
                 if self.subproject:
                     options = {}
                     for k in comp.get_options():
-                        v = copy.copy(self.coredata.options[k])
+                        v = copy.copy(self.coredata.optstore.get_value_object(k))
                         k = k.evolve(subproject=self.subproject)
                         options[k] = v
                     self.coredata.add_compiler_options(options, lang, for_machine, self.environment, self.subproject)
@@ -252,7 +271,7 @@ class IntrospectionInterpreter(AstInterpreter):
                 # Pop the first element if the function is a build target function
                 if isinstance(curr, FunctionNode) and curr.func_name.value in BUILD_TARGET_FUNCTIONS:
                     arg_nodes.pop(0)
-                elementary_nodes = [x for x in arg_nodes if isinstance(x, (str, BaseStringNode))]
+                elementary_nodes = [x for x in arg_nodes if isinstance(x, (str, StringNode))]
                 inqueue += [x for x in arg_nodes if isinstance(x, (FunctionNode, ArrayNode, IdNode, ArithmeticNode))]
                 if elementary_nodes:
                     res += [curr]
@@ -265,7 +284,7 @@ class IntrospectionInterpreter(AstInterpreter):
         kwargs_reduced = {k: v for k, v in kwargs.items() if k in targetclass.known_kwargs and k in {'install', 'build_by_default', 'build_always'}}
         kwargs_reduced = {k: v.value if isinstance(v, ElementaryNode) else v for k, v in kwargs_reduced.items()}
         kwargs_reduced = {k: v for k, v in kwargs_reduced.items() if not isinstance(v, BaseNode)}
-        for_machine = MachineChoice.HOST
+        for_machine = MachineChoice.BUILD if kwargs.get('native', False) else MachineChoice.HOST
         objects: T.List[T.Any] = []
         empty_sources: T.List[T.Any] = []
         # Passing the unresolved sources list causes errors
@@ -276,6 +295,7 @@ class IntrospectionInterpreter(AstInterpreter):
 
         new_target = {
             'name': target.get_basename(),
+            'machine': target.for_machine.get_lower_case_name(),
             'id': target.get_id(),
             'type': target.get_typename(),
             'defined_in': os.path.normpath(os.path.join(self.source_root, self.subdir, environment.build_filename)),
@@ -293,7 +313,7 @@ class IntrospectionInterpreter(AstInterpreter):
         return new_target
 
     def build_library(self, node: BaseNode, args: T.List[TYPE_var], kwargs: T.Dict[str, TYPE_var]) -> T.Optional[T.Dict[str, T.Any]]:
-        default_library = self.coredata.get_option(OptionKey('default_library'))
+        default_library = self.coredata.optstore.get_value_for(OptionKey('default_library'))
         if default_library == 'shared':
             return self.build_target(node, args, kwargs, SharedLibrary)
         elif default_library == 'static':
@@ -367,6 +387,17 @@ class IntrospectionInterpreter(AstInterpreter):
             assert isinstance(kw, IdNode), 'for mypy'
             if kw.value == 'subproject_dir':
                 # mypy does not understand "and isinstance"
-                if isinstance(val, BaseStringNode):
+                if isinstance(val, StringNode):
                     return val.value
         return None
+
+    def flatten_kwargs(self, kwargs: T.Dict[str, TYPE_var], include_unknown_args: bool = False) -> T.Dict[str, TYPE_var]:
+        flattened_kwargs = {}
+        for key, val in kwargs.items():
+            if isinstance(val, BaseNode):
+                resolved = self.resolve_node(val, include_unknown_args)
+                if resolved is not None:
+                    flattened_kwargs[key] = resolved
+            elif isinstance(val, (str, bool, int, float)) or include_unknown_args:
+                flattened_kwargs[key] = val
+        return flattened_kwargs
