@@ -4,6 +4,7 @@ from dataclasses import dataclass, InitVar
 import os, subprocess
 import argparse
 import asyncio
+import fnmatch
 import threading
 import copy
 import shutil
@@ -176,7 +177,9 @@ class Runner:
         latest_version = info['versions'][0]
         new_branch, new_revision = latest_version.rsplit('-', 1)
         if new_branch != branch or new_revision != revision:
-            filename = self.wrap.filename if self.wrap.has_wrap else f'{self.wrap.filename}.wrap'
+            filename = self.wrap.original_filename
+            if not filename:
+                filename = os.path.join(self.wrap.subprojects_dir, f'{self.wrap.name}.wrap')
             update_wrap_file(filename, self.wrap.name,
                              new_branch, new_revision,
                              options.allow_insecure)
@@ -322,7 +325,8 @@ class Runner:
                 self.log('  -> Not a git repository.')
                 self.log('Pass --reset option to delete directory and redownload.')
                 return False
-        revision = self.wrap.values.get('revision')
+        revision_val = self.wrap.values.get('revision')
+        revision = revision_val if revision_val.upper() != 'HEAD' else 'HEAD'
         url = self.wrap.values.get('url')
         push_url = self.wrap.values.get('push-url')
         if not revision or not url:
@@ -521,16 +525,10 @@ class Runner:
             return True
 
         if self.wrap.redirected:
-            redirect_file = Path(self.wrap.original_filename).resolve()
+            wrapfile = Path(self.wrap.original_filename).resolve()
             if options.confirm:
-                redirect_file.unlink()
-            mlog.log(f'Deleting {redirect_file}')
-
-        if self.wrap.type == 'redirect':
-            redirect_file = Path(self.wrap.filename).resolve()
-            if options.confirm:
-                redirect_file.unlink()
-            self.log(f'Deleting {redirect_file}')
+                wrapfile.unlink()
+            mlog.log(f'Deleting {wrapfile}')
 
         if options.include_cache:
             packagecache = Path(self.wrap_resolver.cachedir).resolve()
@@ -643,9 +641,14 @@ def add_common_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument('--allow-insecure', default=False, action='store_true',
                    help='Allow insecure server connections.')
 
-def add_subprojects_argument(p: argparse.ArgumentParser) -> None:
-    p.add_argument('subprojects', nargs='*',
-                   help='List of subprojects (default: all)')
+def add_subprojects_argument(p: argparse.ArgumentParser, name: str = None) -> None:
+    helpstr = 'Patterns of subprojects to operate on (default: all)'
+    if name:
+        p.add_argument(name, dest='subprojects', metavar='pattern', nargs=1, action='append',
+                       default=[], help=helpstr)
+    else:
+        p.add_argument('subprojects', metavar='pattern', nargs='*', default=[],
+                       help=helpstr)
 
 def add_wrap_update_parser(subparsers: 'SubParsers') -> argparse.ArgumentParser:
     p = subparsers.add_parser('update', help='Update wrap files from WrapDB (Since 0.63.0)')
@@ -695,7 +698,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     p.add_argument('args', nargs=argparse.REMAINDER,
                    help=argparse.SUPPRESS)
     add_common_arguments(p)
-    p.set_defaults(subprojects=[])
+    add_subprojects_argument(p, '--filter')
     p.set_defaults(subprojects_func=Runner.foreach)
 
     p = subparsers.add_parser('purge', help='Remove all wrap-based subproject artifacts')
@@ -727,7 +730,8 @@ def run(options: 'Arguments') -> int:
         return 0
     r = Resolver(source_dir, subproject_dir, wrap_frontend=True, allow_insecure=options.allow_insecure, silent=True)
     if options.subprojects:
-        wraps = [wrap for name, wrap in r.wraps.items() if name in options.subprojects]
+        wraps = [wrap for name, wrap in r.wraps.items()
+                 if any(fnmatch.fnmatch(name, pat) for pat in options.subprojects)]
     else:
         wraps = list(r.wraps.values())
     types = [t.strip() for t in options.types.split(',')] if options.types else []

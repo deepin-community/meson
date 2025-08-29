@@ -6,6 +6,12 @@ e = executable('rust-program', 'prog.rs',
 )
 test('rusttest', e)
 
+e = executable('rust-dynamic', 'prog.rs',
+  override_options: {'rust_dynamic_std': true},
+  install : true
+)
+test('rusttest-dynamic', e)
+
 subdir('subdir')
 
 # this should fail due to debug_assert
@@ -18,3 +24,6 @@ test(
   ),
   should_fail : true,
 )
+
+rustc = meson.get_compiler('rust')
+assert(rustc.run('fn main(){}').returncode() == 0)

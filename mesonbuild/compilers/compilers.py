@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2012-2022 The Meson development team
-# Copyright © 2023 Intel Corporation
+# Copyright © 2023-2025 Intel Corporation
 
 from __future__ import annotations
 
@@ -9,22 +9,24 @@ import contextlib, os.path, re
 import enum
 import itertools
 import typing as T
+from dataclasses import dataclass, field
 from functools import lru_cache
 
-from .. import coredata
 from .. import mlog
 from .. import mesonlib
+from .. import options
 from ..mesonlib import (
     HoldableObject,
     EnvironmentException, MesonException,
-    Popen_safe_logged, LibType, TemporaryDirectoryWinProof, OptionKey,
+    Popen_safe_logged, LibType, TemporaryDirectoryWinProof,
 )
-
+from ..options import OptionKey
 from ..arglist import CompilerArgs
 
 if T.TYPE_CHECKING:
+    from .. import coredata
     from ..build import BuildTarget, DFeatures
-    from ..coredata import MutableKeyedOptionDictType, KeyedOptionDictType
+    from ..options import MutableKeyedOptionDictType
     from ..envconfig import MachineInfo
     from ..environment import Environment
     from ..linkers import RSPFileSyntax
@@ -33,22 +35,23 @@ if T.TYPE_CHECKING:
     from ..dependencies import Dependency
 
     CompilerType = T.TypeVar('CompilerType', bound='Compiler')
-    _T = T.TypeVar('_T')
+
+_T = T.TypeVar('_T')
 
 """This file contains the data files of all compilers Meson knows
 about. To support a new compiler, add its information below.
 Also add corresponding autodetection code in detect.py."""
 
-header_suffixes = {'h', 'hh', 'hpp', 'hxx', 'H', 'ipp', 'moc', 'vapi', 'di'}
+header_suffixes = {'h', 'hh', 'hpp', 'hxx', 'H', 'ipp', 'moc', 'vapi', 'di', 'pxd', 'pxi'}
 obj_suffixes = {'o', 'obj', 'res'}
 # To the emscripten compiler, .js files are libraries
 lib_suffixes = {'a', 'lib', 'dll', 'dll.a', 'dylib', 'so', 'js'}
 # Mapping of language to suffixes of files that should always be in that language
 # This means we can't include .h headers here since they could be C, C++, ObjC, etc.
 # First suffix is the language's default.
-lang_suffixes = {
+lang_suffixes: T.Mapping[str, T.Tuple[str, ...]] = {
     'c': ('c',),
-    'cpp': ('cpp', 'cc', 'cxx', 'c++', 'hh', 'hpp', 'ipp', 'hxx', 'ino', 'ixx', 'C', 'H'),
+    'cpp': ('cpp', 'cppm', 'cc', 'cp', 'cxx', 'c++', 'hh', 'hp', 'hpp', 'ipp', 'hxx', 'h++', 'ino', 'ixx', 'CPP', 'C', 'HPP', 'H'),
     'cuda': ('cu',),
     # f90, f95, f03, f08 are for free-form fortran ('f90' recommended)
     # f, for, ftn, fpp are for fixed-form fortran ('f' or 'for' recommended)
@@ -62,8 +65,9 @@ lang_suffixes = {
     'swift': ('swift',),
     'java': ('java',),
     'cython': ('pyx', ),
-    'nasm': ('asm',),
+    'nasm': ('asm', 'nasm',),
     'masm': ('masm',),
+    'linearasm': ('sa',),
 }
 all_languages = lang_suffixes.keys()
 c_cpp_suffixes = {'h'}
@@ -80,7 +84,7 @@ clib_langs = ('objcpp', 'cpp', 'objc', 'c', 'nasm', 'fortran')
 # List of languages that can be linked with C code directly by the linker
 # used in build.py:process_compilers() and build.py:get_dynamic_linker()
 # This must be sorted, see sort_clink().
-clink_langs = ('d', 'cuda') + clib_langs
+clink_langs = ('rust', 'd', 'cuda') + clib_langs
 
 SUFFIX_TO_LANG = dict(itertools.chain(*(
     [(suffix, lang) for suffix in v] for lang, v in lang_suffixes.items())))
@@ -128,17 +132,30 @@ def is_header(fname: 'mesonlib.FileOrString') -> bool:
 def is_source_suffix(suffix: str) -> bool:
     return suffix in source_suffixes
 
+@lru_cache(maxsize=None)
+def cached_is_source_by_name(fname: str) -> bool:
+    suffix = fname.split('.')[-1].lower()
+    return is_source_suffix(suffix)
+
 def is_source(fname: 'mesonlib.FileOrString') -> bool:
     if isinstance(fname, mesonlib.File):
         fname = fname.fname
-    suffix = fname.split('.')[-1].lower()
-    return is_source_suffix(suffix)
+    return cached_is_source_by_name(fname)
 
 def is_assembly(fname: 'mesonlib.FileOrString') -> bool:
     if isinstance(fname, mesonlib.File):
         fname = fname.fname
     suffix = fname.split('.')[-1]
     return suffix in assembler_suffixes
+
+def is_java(fname: mesonlib.FileOrString) -> bool:
+    if isinstance(fname, mesonlib.File):
+        fname = fname.fname
+    suffix = fname.split('.')[-1]
+    return suffix in lang_suffixes['java']
+
+def is_separate_compile(fname: mesonlib.FileOrString) -> bool:
+    return not fname.endswith('.rs')
 
 def is_llvm_ir(fname: 'mesonlib.FileOrString') -> bool:
     if isinstance(fname, mesonlib.File):
@@ -147,14 +164,14 @@ def is_llvm_ir(fname: 'mesonlib.FileOrString') -> bool:
     return suffix in llvm_ir_suffixes
 
 @lru_cache(maxsize=None)
-def cached_by_name(fname: 'mesonlib.FileOrString') -> bool:
+def cached_is_object_by_name(fname: str) -> bool:
     suffix = fname.split('.')[-1]
     return suffix in obj_suffixes
 
 def is_object(fname: 'mesonlib.FileOrString') -> bool:
     if isinstance(fname, mesonlib.File):
         fname = fname.fname
-    return cached_by_name(fname)
+    return cached_is_object_by_name(fname)
 
 def is_library(fname: 'mesonlib.FileOrString') -> bool:
     if isinstance(fname, mesonlib.File):
@@ -204,55 +221,27 @@ clike_debug_args: T.Dict[bool, T.List[str]] = {
 }
 
 
-MSCRT_VALS = ['none', 'md', 'mdd', 'mt', 'mtd']
-
-base_options: 'KeyedOptionDictType' = {
-    OptionKey('b_pch'): coredata.UserBooleanOption('Use precompiled headers', True),
-    OptionKey('b_lto'): coredata.UserBooleanOption('Use link time optimization', False),
-    OptionKey('b_lto_threads'): coredata.UserIntegerOption('Use multiple threads for Link Time Optimization', (None, None, 0)),
-    OptionKey('b_lto_mode'): coredata.UserComboOption('Select between different LTO modes.',
-                                                      ['default', 'thin'],
-                                                      'default'),
-    OptionKey('b_thinlto_cache'): coredata.UserBooleanOption('Use LLVM ThinLTO caching for faster incremental builds', False),
-    OptionKey('b_thinlto_cache_dir'): coredata.UserStringOption('Directory to store ThinLTO cache objects', ''),
-    OptionKey('b_sanitize'): coredata.UserComboOption('Code sanitizer to use',
-                                                      ['none', 'address', 'thread', 'undefined', 'memory', 'leak', 'address,undefined'],
-                                                      'none'),
-    OptionKey('b_lundef'): coredata.UserBooleanOption('Use -Wl,--no-undefined when linking', True),
-    OptionKey('b_asneeded'): coredata.UserBooleanOption('Use -Wl,--as-needed when linking', True),
-    OptionKey('b_pgo'): coredata.UserComboOption('Use profile guided optimization',
-                                                 ['off', 'generate', 'use'],
-                                                 'off'),
-    OptionKey('b_coverage'): coredata.UserBooleanOption('Enable coverage tracking.', False),
-    OptionKey('b_colorout'): coredata.UserComboOption('Use colored output',
-                                                      ['auto', 'always', 'never'],
-                                                      'always'),
-    OptionKey('b_ndebug'): coredata.UserComboOption('Disable asserts', ['true', 'false', 'if-release'], 'false'),
-    OptionKey('b_staticpic'): coredata.UserBooleanOption('Build static libraries as position independent', True),
-    OptionKey('b_pie'): coredata.UserBooleanOption('Build executables as position independent', False),
-    OptionKey('b_bitcode'): coredata.UserBooleanOption('Generate and embed bitcode (only macOS/iOS/tvOS)', False),
-    OptionKey('b_vscrt'): coredata.UserComboOption('VS run-time library type to use.',
-                                                   MSCRT_VALS + ['from_buildtype', 'static_from_buildtype'],
-                                                   'from_buildtype'),
-}
-
-def option_enabled(boptions: T.Set[OptionKey], options: 'KeyedOptionDictType',
-                   option: OptionKey) -> bool:
+def option_enabled(boptions: T.Set[OptionKey],
+                   target: 'BuildTarget',
+                   env: 'Environment',
+                   option: T.Union[str, OptionKey]) -> bool:
+    if isinstance(option, str):
+        option = OptionKey(option)
     try:
         if option not in boptions:
             return False
-        ret = options[option].value
+        ret = env.coredata.get_option_for_target(target, option)
         assert isinstance(ret, bool), 'must return bool'  # could also be str
         return ret
     except KeyError:
         return False
 
 
-def get_option_value(options: 'KeyedOptionDictType', opt: OptionKey, fallback: '_T') -> '_T':
+def get_option_value_for_target(env: 'Environment', target: 'BuildTarget', opt: OptionKey, fallback: '_T') -> '_T':
     """Get the value of an option, or the fallback value."""
     try:
-        v: '_T' = options[opt].value
-    except KeyError:
+        v = env.coredata.get_option_for_target(target, opt)
+    except (KeyError, AttributeError):
         return fallback
 
     assert isinstance(v, type(fallback)), f'Should have {type(fallback)!r} but was {type(v)!r}'
@@ -260,57 +249,81 @@ def get_option_value(options: 'KeyedOptionDictType', opt: OptionKey, fallback: '
     return v
 
 
-def are_asserts_disabled(options: KeyedOptionDictType) -> bool:
+def are_asserts_disabled(target: 'BuildTarget', env: 'Environment') -> bool:
     """Should debug assertions be disabled
 
-    :param options: OptionDictionary
+    :param target: a target to check for
+    :param env: the environment
     :return: whether to disable assertions or not
     """
-    return (options[OptionKey('b_ndebug')].value == 'true' or
-            (options[OptionKey('b_ndebug')].value == 'if-release' and
-             options[OptionKey('buildtype')].value in {'release', 'plain'}))
+    return (env.coredata.get_option_for_target(target, 'b_ndebug') == 'true' or
+            (env.coredata.get_option_for_target(target, 'b_ndebug') == 'if-release' and
+             env.coredata.get_option_for_target(target, 'buildtype') in {'release', 'plain'}))
 
 
-def get_base_compile_args(options: 'KeyedOptionDictType', compiler: 'Compiler') -> T.List[str]:
+def are_asserts_disabled_for_subproject(subproject: str, env: 'Environment') -> bool:
+    key = OptionKey('b_ndebug', subproject)
+    return (env.coredata.optstore.get_value_for(key) == 'true' or
+            (env.coredata.optstore.get_value_for(key) == 'if-release' and
+             env.coredata.optstore.get_value_for(key.evolve(name='buildtype')) in {'release', 'plain'}))
+
+
+def get_base_compile_args(target: 'BuildTarget', compiler: 'Compiler', env: 'Environment') -> T.List[str]:
     args: T.List[str] = []
     try:
-        if options[OptionKey('b_lto')].value:
+        if env.coredata.get_option_for_target(target, 'b_lto'):
+            num_threads = get_option_value_for_target(env, target, OptionKey('b_lto_threads'), 0)
+            ltomode = get_option_value_for_target(env, target, OptionKey('b_lto_mode'), 'default')
             args.extend(compiler.get_lto_compile_args(
-                threads=get_option_value(options, OptionKey('b_lto_threads'), 0),
-                mode=get_option_value(options, OptionKey('b_lto_mode'), 'default')))
+                threads=num_threads,
+                mode=ltomode))
+    except (KeyError, AttributeError):
+        pass
+    try:
+        clrout = env.coredata.get_option_for_target(target, 'b_colorout')
+        assert isinstance(clrout, str)
+        args += compiler.get_colorout_args(clrout)
     except KeyError:
         pass
     try:
-        args += compiler.get_colorout_args(options[OptionKey('b_colorout')].value)
+        sanitize = env.coredata.get_option_for_target(target, 'b_sanitize')
+        assert isinstance(sanitize, list)
+        if sanitize == ['none']:
+            sanitize = []
+        sanitize_args = compiler.sanitizer_compile_args(sanitize)
+        # We consider that if there are no sanitizer arguments returned, then
+        # the language doesn't support them.
+        if sanitize_args:
+            if not compiler.has_multi_arguments(sanitize_args, env)[0]:
+                raise MesonException(f'Compiler {compiler.name_string()} does not support sanitizer arguments {sanitize_args}')
+            args.extend(sanitize_args)
     except KeyError:
         pass
     try:
-        args += compiler.sanitizer_compile_args(options[OptionKey('b_sanitize')].value)
-    except KeyError:
-        pass
-    try:
-        pgo_val = options[OptionKey('b_pgo')].value
+        pgo_val = env.coredata.get_option_for_target(target, 'b_pgo')
         if pgo_val == 'generate':
             args.extend(compiler.get_profile_generate_args())
         elif pgo_val == 'use':
             args.extend(compiler.get_profile_use_args())
-    except KeyError:
+    except (KeyError, AttributeError):
         pass
     try:
-        if options[OptionKey('b_coverage')].value:
+        if env.coredata.get_option_for_target(target, 'b_coverage'):
             args += compiler.get_coverage_args()
-    except KeyError:
+    except (KeyError, AttributeError):
         pass
     try:
-        args += compiler.get_assert_args(are_asserts_disabled(options))
+        args += compiler.get_assert_args(are_asserts_disabled(target, env), env)
     except KeyError:
         pass
     # This does not need a try...except
-    if option_enabled(compiler.base_options, options, OptionKey('b_bitcode')):
+    if option_enabled(compiler.base_options, target, env, 'b_bitcode'):
         args.append('-fembed-bitcode')
     try:
-        crt_val = options[OptionKey('b_vscrt')].value
-        buildtype = options[OptionKey('buildtype')].value
+        crt_val = env.coredata.get_option_for_target(target, 'b_vscrt')
+        assert isinstance(crt_val, str)
+        buildtype = env.coredata.get_option_for_target(target, 'buildtype')
+        assert isinstance(buildtype, str)
         try:
             args += compiler.get_crt_compile_args(crt_val, buildtype)
         except AttributeError:
@@ -319,48 +332,63 @@ def get_base_compile_args(options: 'KeyedOptionDictType', compiler: 'Compiler') 
         pass
     return args
 
-def get_base_link_args(options: 'KeyedOptionDictType', linker: 'Compiler',
-                       is_shared_module: bool, build_dir: str) -> T.List[str]:
+def get_base_link_args(target: 'BuildTarget',
+                       linker: 'Compiler',
+                       env: 'Environment') -> T.List[str]:
     args: T.List[str] = []
+    build_dir = env.get_build_dir()
     try:
-        if options[OptionKey('b_lto')].value:
-            if options[OptionKey('werror')].value:
+        if env.coredata.get_option_for_target(target, 'b_lto'):
+            if env.coredata.get_option_for_target(target, 'werror'):
                 args.extend(linker.get_werror_args())
 
             thinlto_cache_dir = None
-            if get_option_value(options, OptionKey('b_thinlto_cache'), False):
-                thinlto_cache_dir = get_option_value(options, OptionKey('b_thinlto_cache_dir'), '')
+            cachedir_key = OptionKey('b_thinlto_cache')
+            if get_option_value_for_target(env, target, cachedir_key, False):
+                thinlto_cache_dir = get_option_value_for_target(env, target, OptionKey('b_thinlto_cache_dir'), '')
                 if thinlto_cache_dir == '':
                     thinlto_cache_dir = os.path.join(build_dir, 'meson-private', 'thinlto-cache')
+            num_threads = get_option_value_for_target(env, target, OptionKey('b_lto_threads'), 0)
+            lto_mode = get_option_value_for_target(env, target, OptionKey('b_lto_mode'), 'default')
             args.extend(linker.get_lto_link_args(
-                threads=get_option_value(options, OptionKey('b_lto_threads'), 0),
-                mode=get_option_value(options, OptionKey('b_lto_mode'), 'default'),
+                threads=num_threads,
+                mode=lto_mode,
                 thinlto_cache_dir=thinlto_cache_dir))
+    except (KeyError, AttributeError):
+        pass
+    try:
+        sanitizer = env.coredata.get_option_for_target(target, 'b_sanitize')
+        assert isinstance(sanitizer, list)
+        if sanitizer == ['none']:
+            sanitizer = []
+        sanitizer_args = linker.sanitizer_link_args(sanitizer)
+        # We consider that if there are no sanitizer arguments returned, then
+        # the language doesn't support them.
+        if sanitizer_args:
+            if not linker.has_multi_link_arguments(sanitizer_args, env)[0]:
+                raise MesonException(f'Linker {linker.name_string()} does not support sanitizer arguments {sanitizer_args}')
+            args.extend(sanitizer_args)
     except KeyError:
         pass
     try:
-        args += linker.sanitizer_link_args(options[OptionKey('b_sanitize')].value)
-    except KeyError:
-        pass
-    try:
-        pgo_val = options[OptionKey('b_pgo')].value
+        pgo_val = env.coredata.get_option_for_target(target, 'b_pgo')
         if pgo_val == 'generate':
             args.extend(linker.get_profile_generate_args())
         elif pgo_val == 'use':
             args.extend(linker.get_profile_use_args())
-    except KeyError:
+    except (KeyError, AttributeError):
         pass
     try:
-        if options[OptionKey('b_coverage')].value:
+        if env.coredata.get_option_for_target(target, 'b_coverage'):
             args += linker.get_coverage_link_args()
-    except KeyError:
+    except (KeyError, AttributeError):
         pass
 
-    as_needed = option_enabled(linker.base_options, options, OptionKey('b_asneeded'))
-    bitcode = option_enabled(linker.base_options, options, OptionKey('b_bitcode'))
+    as_needed = option_enabled(linker.base_options, target, env, 'b_asneeded')
+    bitcode = option_enabled(linker.base_options, target, env, 'b_bitcode')
     # Shared modules cannot be built with bitcode_bundle because
     # -bitcode_bundle is incompatible with -undefined and -bundle
-    if bitcode and not is_shared_module:
+    if bitcode and not target.typename == 'shared module':
         args.extend(linker.bitcode_args())
     elif as_needed:
         # -Wl,-dead_strip_dylibs is incompatible with bitcode
@@ -369,18 +397,23 @@ def get_base_link_args(options: 'KeyedOptionDictType', linker: 'Compiler',
     # Apple's ld (the only one that supports bitcode) does not like -undefined
     # arguments or -headerpad_max_install_names when bitcode is enabled
     if not bitcode:
+        from ..build import SharedModule
         args.extend(linker.headerpad_args())
-        if (not is_shared_module and
-                option_enabled(linker.base_options, options, OptionKey('b_lundef'))):
+        if (not isinstance(target, SharedModule) and
+                option_enabled(linker.base_options, target, env, 'b_lundef')):
             args.extend(linker.no_undefined_link_args())
         else:
             args.extend(linker.get_allow_undefined_link_args())
 
     try:
-        crt_val = options[OptionKey('b_vscrt')].value
-        buildtype = options[OptionKey('buildtype')].value
+        crt_val = env.coredata.get_option_for_target(target, 'b_vscrt')
+        assert isinstance(crt_val, str)
+        buildtype = env.coredata.get_option_for_target(target, 'buildtype')
+        assert isinstance(buildtype, str)
         try:
-            args += linker.get_crt_link_args(crt_val, buildtype)
+            crtargs = linker.get_crt_link_args(crt_val, buildtype)
+            assert isinstance(crtargs, list)
+            args += crtargs
         except AttributeError:
             pass
     except KeyError:
@@ -391,37 +424,30 @@ def get_base_link_args(options: 'KeyedOptionDictType', linker: 'Compiler',
 class CrossNoRunException(MesonException):
     pass
 
+@dataclass
 class RunResult(HoldableObject):
-    def __init__(self, compiled: bool, returncode: int = 999,
-                 stdout: str = 'UNDEFINED', stderr: str = 'UNDEFINED',
-                 cached: bool = False):
-        self.compiled = compiled
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-        self.cached = cached
+    compiled: bool
+    returncode: int = 999
+    stdout: str = 'UNDEFINED'
+    stderr: str = 'UNDEFINED'
+    cached: bool = False
 
 
+@dataclass
 class CompileResult(HoldableObject):
 
     """The result of Compiler.compiles (and friends)."""
 
-    def __init__(self, stdo: T.Optional[str] = None, stde: T.Optional[str] = None,
-                 command: T.Optional[T.List[str]] = None,
-                 returncode: int = 999,
-                 input_name: T.Optional[str] = None,
-                 output_name: T.Optional[str] = None,
-                 cached: bool = False):
-        self.stdout = stdo
-        self.stderr = stde
-        self.input_name = input_name
-        self.output_name = output_name
-        self.command = command or []
-        self.cached = cached
-        self.returncode = returncode
-
+    stdout: str
+    stderr: str
+    command: T.List[str]
+    returncode: int
+    input_name: str
+    output_name: T.Optional[str] = field(default=None, init=False)
+    cached: bool = field(default=False, init=False)
 
 class Compiler(HoldableObject, metaclass=abc.ABCMeta):
+
     # Libraries to ignore in find_library() since they are provided by the
     # compiler or the C library. Currently only used for MSVC.
     ignore_libs: T.List[str] = []
@@ -443,11 +469,8 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
                  full_version: T.Optional[str] = None, is_cross: bool = False):
         self.exelist = ccache + exelist
         self.exelist_no_ccache = exelist
-        # In case it's been overridden by a child class already
-        if not hasattr(self, 'file_suffixes'):
-            self.file_suffixes = lang_suffixes[self.language]
-        if not hasattr(self, 'can_compile_suffixes'):
-            self.can_compile_suffixes: T.Set[str] = set(self.file_suffixes)
+        self.file_suffixes = lang_suffixes[self.language]
+        self.can_compile_suffixes = set(self.file_suffixes)
         self.default_suffix = self.file_suffixes[0]
         self.version = version
         self.full_version = full_version
@@ -477,6 +500,12 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
 
     def get_modes(self) -> T.List[Compiler]:
         return self.modes
+
+    def get_exe(self) -> str:
+        return self.exelist[0]
+
+    def get_exe_args(self) -> T.List[str]:
+        return self.exelist[1:]
 
     def get_linker_id(self) -> str:
         # There is not guarantee that we have a dynamic linker instance, as
@@ -577,14 +606,25 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         """
         return []
 
+    def make_option_name(self, key: OptionKey) -> str:
+        return f'{self.language}_{key.name}'
+
+    @staticmethod
+    def update_options(options: MutableKeyedOptionDictType, *args: T.Tuple[OptionKey, options.AnyOptionType]) -> MutableKeyedOptionDictType:
+        options.update(args)
+        return options
+
     def get_options(self) -> 'MutableKeyedOptionDictType':
         return {}
 
-    def get_option_compile_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
+    def get_option_compile_args(self, target: 'BuildTarget', env: 'Environment', subproject: T.Optional[str] = None) -> T.List[str]:
         return []
 
-    def get_option_link_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
-        return self.linker.get_option_args(options)
+    def get_option_std_args(self, target: BuildTarget, env: Environment, subproject: T.Optional[str] = None) -> T.List[str]:
+        return []
+
+    def get_option_link_args(self, target: 'BuildTarget', env: 'Environment', subproject: T.Optional[str] = None) -> T.List[str]:
+        return self.linker.get_option_link_args(target, env, subproject)
 
     def check_header(self, hname: str, prefix: str, env: 'Environment', *,
                      extra_args: T.Union[None, T.List[str], T.Callable[[CompileCheckMode], T.List[str]]] = None,
@@ -623,10 +663,33 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
                           dependencies: T.Optional[T.List['Dependency']] = None) -> T.Tuple[bool, bool]:
         raise EnvironmentException('Language %s does not support header symbol checks.' % self.get_display_language())
 
-    def run(self, code: 'mesonlib.FileOrString', env: 'Environment', *,
+    def run(self, code: 'mesonlib.FileOrString', env: 'Environment',
             extra_args: T.Union[T.List[str], T.Callable[[CompileCheckMode], T.List[str]], None] = None,
-            dependencies: T.Optional[T.List['Dependency']] = None) -> RunResult:
-        raise EnvironmentException('Language %s does not support run checks.' % self.get_display_language())
+            dependencies: T.Optional[T.List['Dependency']] = None,
+            run_env: T.Optional[T.Dict[str, str]] = None,
+            run_cwd: T.Optional[str] = None) -> RunResult:
+        need_exe_wrapper = env.need_exe_wrapper(self.for_machine)
+        if need_exe_wrapper and not env.has_exe_wrapper():
+            raise CrossNoRunException('Can not run test applications in this cross environment.')
+        with self._build_wrapper(code, env, extra_args, dependencies, mode=CompileCheckMode.LINK, want_output=True) as p:
+            if p.returncode != 0:
+                mlog.debug(f'Could not compile test file {p.input_name}: {p.returncode}\n')
+                return RunResult(False)
+            if need_exe_wrapper:
+                cmdlist = env.exe_wrapper.get_command() + [p.output_name]
+            else:
+                cmdlist = [p.output_name]
+            try:
+                pe, so, se = mesonlib.Popen_safe(cmdlist, env=run_env, cwd=run_cwd)
+            except Exception as e:
+                mlog.debug(f'Could not run: {cmdlist} (error: {e})\n')
+                return RunResult(False)
+
+        mlog.debug('Program stdout:\n')
+        mlog.debug(so)
+        mlog.debug('Program stderr:\n')
+        mlog.debug(se)
+        return RunResult(True, pe.returncode, so, se)
 
     # Caching run() in general seems too risky (no way to know what the program
     # depends on), but some callers know more about the programs they intend to
@@ -689,7 +752,7 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         return args.copy()
 
     def find_library(self, libname: str, env: 'Environment', extra_dirs: T.List[str],
-                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True) -> T.Optional[T.List[str]]:
+                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True, ignore_system_dirs: bool = False) -> T.Optional[T.List[str]]:
         raise EnvironmentException(f'Language {self.get_display_language()} does not support library finding.')
 
     def get_library_naming(self, env: 'Environment', libtype: LibType,
@@ -766,16 +829,14 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
                                        'testfile.' + self.default_suffix)
                 with open(srcname, 'w', encoding='utf-8') as ofile:
                     ofile.write(code)
+                    if not code.endswith('\n'):
+                        ofile.write('\n')
                 # ccache would result in a cache miss
                 no_ccache = True
-                contents = code
+                code_debug = f'Code:\n{code}'
             else:
                 srcname = code.fname
-                if not is_object(code.fname):
-                    with open(code.fname, encoding='utf-8') as f:
-                        contents = f.read()
-                else:
-                    contents = '<binary>'
+                code_debug = f'Source file: {srcname}'
 
             # Construct the compiler command-line
             commands = self.compiler_args()
@@ -796,7 +857,7 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
             command_list = self.get_exelist(ccache=not no_ccache) + commands.to_native()
             mlog.debug('Running compile:')
             mlog.debug('Working directory: ', tmpdirname)
-            mlog.debug('Code:\n', contents)
+            mlog.debug(code_debug)
             os_env = os.environ.copy()
             os_env['LC_ALL'] = 'C'
             if no_ccache:
@@ -855,8 +916,8 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
     def get_std_shared_lib_link_args(self) -> T.List[str]:
         return self.linker.get_std_shared_lib_args()
 
-    def get_std_shared_module_link_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
-        return self.linker.get_std_shared_module_args(options)
+    def get_std_shared_module_link_args(self, target: 'BuildTarget') -> T.List[str]:
+        return self.linker.get_std_shared_module_args(target)
 
     def get_link_whole_for(self, args: T.List[str]) -> T.List[str]:
         return self.linker.get_link_whole_for(args)
@@ -875,11 +936,10 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         """
         return None
 
-    def build_rpath_args(self, env: 'Environment', build_dir: str, from_dir: str,
-                         rpath_paths: T.Tuple[str, ...], build_rpath: str,
-                         install_rpath: str) -> T.Tuple[T.List[str], T.Set[bytes]]:
+    def build_rpath_args(self, env: Environment, build_dir: str, from_dir: str,
+                         target: BuildTarget, extra_paths: T.Optional[T.List[str]] = None) -> T.Tuple[T.List[str], T.Set[bytes]]:
         return self.linker.build_rpath_args(
-            env, build_dir, from_dir, rpath_paths, build_rpath, install_rpath)
+            env, build_dir, from_dir, target, extra_paths)
 
     def get_archive_name(self, filename: str) -> str:
         return self.linker.get_archive_name(filename)
@@ -895,11 +955,11 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
     def thread_link_flags(self, env: 'Environment') -> T.List[str]:
         return self.linker.thread_flags(env)
 
-    def openmp_flags(self) -> T.List[str]:
+    def openmp_flags(self, env: Environment) -> T.List[str]:
         raise EnvironmentException('Language %s does not support OpenMP flags.' % self.get_display_language())
 
-    def openmp_link_flags(self) -> T.List[str]:
-        return self.openmp_flags()
+    def openmp_link_flags(self, env: Environment) -> T.List[str]:
+        return self.openmp_flags(env)
 
     def language_stdlib_only_link_flags(self, env: 'Environment') -> T.List[str]:
         return []
@@ -928,7 +988,8 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
     def get_pie_link_args(self) -> T.List[str]:
         return self.linker.get_pie_args()
 
-    def get_argument_syntax(self) -> str:
+    @staticmethod
+    def get_argument_syntax() -> str:
         """Returns the argument family type.
 
         Compilers fall into families if they try to emulate the command line
@@ -975,10 +1036,10 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
                           thinlto_cache_dir: T.Optional[str] = None) -> T.List[str]:
         return self.linker.get_lto_args()
 
-    def sanitizer_compile_args(self, value: str) -> T.List[str]:
+    def sanitizer_compile_args(self, value: T.List[str]) -> T.List[str]:
         return []
 
-    def sanitizer_link_args(self, value: str) -> T.List[str]:
+    def sanitizer_link_args(self, value: T.List[str]) -> T.List[str]:
         return self.linker.sanitizer_args(value)
 
     def get_asneeded_args(self) -> T.List[str]:
@@ -1007,7 +1068,7 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         return dep.get_compile_args()
 
     def get_dependency_link_args(self, dep: 'Dependency') -> T.List[str]:
-        return dep.get_link_args()
+        return dep.get_link_args(self.get_language())
 
     @classmethod
     def use_linker_args(cls, linker: str, version: str) -> T.List[str]:
@@ -1021,7 +1082,7 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
     def get_coverage_link_args(self) -> T.List[str]:
         return self.linker.get_coverage_args()
 
-    def get_assert_args(self, disable: bool) -> T.List[str]:
+    def get_assert_args(self, disable: bool, env: 'Environment') -> T.List[str]:
         """Get arguments to enable or disable assertion.
 
         :param disable: Whether to disable assertions
@@ -1030,7 +1091,7 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         return []
 
     def get_crt_val(self, crt_val: str, buildtype: str) -> str:
-        if crt_val in MSCRT_VALS:
+        if crt_val in options.MSCRT_VALS:
             return crt_val
         assert crt_val in {'from_buildtype', 'static_from_buildtype'}
 
@@ -1140,6 +1201,23 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         ```
         is good enough here.
         """
+
+    def run_sanity_check(self, environment: Environment, cmdlist: T.List[str], work_dir: str, use_exe_wrapper_for_cross: bool = True) -> T.Tuple[str, str]:
+        # Run sanity check
+        if self.is_cross and use_exe_wrapper_for_cross:
+            if not environment.has_exe_wrapper():
+                # Can't check if the binaries run so we have to assume they do
+                return ('', '')
+            cmdlist = environment.exe_wrapper.get_command() + cmdlist
+        mlog.debug('Running test binary command: ', mesonlib.join_args(cmdlist))
+        try:
+            pe, stdo, stde = Popen_safe_logged(cmdlist, 'Sanity check', cwd=work_dir)
+        except Exception as e:
+            raise mesonlib.EnvironmentException(f'Could not invoke sanity check executable: {e!s}.')
+
+        if pe.returncode != 0:
+            raise mesonlib.EnvironmentException(f'Executables created by {self.language} compiler {self.name_string()} are not runnable.')
+        return stdo, stde
 
     def split_shlib_to_parts(self, fname: str) -> T.Tuple[T.Optional[str], str]:
         return None, fname
@@ -1288,8 +1366,12 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         # TODO: using a TypeDict here would improve this
         raise EnvironmentException(f'{self.id} does not implement get_feature_args')
 
-    def get_prelink_args(self, prelink_name: str, obj_list: T.List[str]) -> T.List[str]:
+    def get_prelink_args(self, prelink_name: str, obj_list: T.List[str]) -> T.Tuple[T.List[str], T.List[str]]:
         raise EnvironmentException(f'{self.id} does not know how to do prelinking.')
+
+    def get_prelink_append_compile_args(self) -> bool:
+        """Controls whether compile args have to be used for prelinking or not"""
+        return False
 
     def rsp_file_syntax(self) -> 'RSPFileSyntax':
         """The format of the RSP file that this compiler supports.
@@ -1311,37 +1393,26 @@ class Compiler(HoldableObject, metaclass=abc.ABCMeta):
         """
         raise EnvironmentException(f'{self.get_id()} does not support preprocessor')
 
-def get_global_options(lang: str,
-                       comp: T.Type[Compiler],
-                       for_machine: MachineChoice,
-                       env: 'Environment') -> 'KeyedOptionDictType':
-    """Retrieve options that apply to all compilers for a given language."""
-    description = f'Extra arguments passed to the {lang}'
-    argkey = OptionKey('args', lang=lang, machine=for_machine)
-    largkey = argkey.evolve('link_args')
-    envkey = argkey.evolve('env_args')
+    def form_compileropt_key(self, basename: str) -> OptionKey:
+        return OptionKey(f'{self.language}_{basename}', machine=self.for_machine)
 
-    comp_key = argkey if argkey in env.options else envkey
+    def get_compileropt_value(self,
+                              key: T.Union[str, OptionKey],
+                              env: Environment,
+                              target: T.Optional[BuildTarget],
+                              subproject: T.Optional[str] = None
+                              ) -> options.ElementaryOptionValues:
+        if isinstance(key, str):
+            key = self.form_compileropt_key(key)
+        if target:
+            return env.coredata.get_option_for_target(target, key)
+        else:
+            return env.coredata.optstore.get_value_for(key.evolve(subproject=subproject))
 
-    comp_options = env.options.get(comp_key, [])
-    link_options = env.options.get(largkey, [])
-
-    cargs = coredata.UserArrayOption(
-        description + ' compiler',
-        comp_options, split_args=True, allow_dups=True)
-
-    largs = coredata.UserArrayOption(
-        description + ' linker',
-        link_options, split_args=True, allow_dups=True)
-
-    if comp.INVOKES_LINKER and comp_key == envkey:
-        # If the compiler acts as a linker driver, and we're using the
-        # environment variable flags for both the compiler and linker
-        # arguments, then put the compiler flags in the linker flags as well.
-        # This is how autotools works, and the env vars feature is for
-        # autotools compatibility.
-        largs.extend_value(comp_options)
-
-    opts: 'KeyedOptionDictType' = {argkey: cargs, largkey: largs}
-
-    return opts
+    def _update_language_stds(self, opts: MutableKeyedOptionDictType, value: T.List[str]) -> None:
+        key = self.form_compileropt_key('std')
+        std = opts[key]
+        assert isinstance(std, (options.UserStdOption, options.UserComboOption)), 'for mypy'
+        if 'none' not in value:
+            value = ['none'] + value
+        std.choices = value

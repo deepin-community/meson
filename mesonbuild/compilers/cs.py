@@ -14,6 +14,7 @@ from .compilers import Compiler
 from .mixins.islinker import BasicLinkerIsCompilerMixin
 
 if T.TYPE_CHECKING:
+    from ..dependencies import Dependency
     from ..envconfig import MachineInfo
     from ..environment import Environment
     from ..mesonlib import MachineChoice
@@ -60,6 +61,12 @@ class CsCompiler(BasicLinkerIsCompilerMixin, Compiler):
     def get_pic_args(self) -> T.List[str]:
         return []
 
+    def get_dependency_compile_args(self, dep: Dependency) -> T.List[str]:
+        # Historically we ignored all compile args.  Accept what we can, but
+        # filter out -I arguments, which are in some pkg-config files and
+        # aren't accepted by mcs.
+        return [a for a in dep.get_compile_args() if not a.startswith('-I')]
+
     def compute_parameters_with_absolute_paths(self, parameter_list: T.List[str],
                                                build_dir: str) -> T.List[str]:
         for idx, i in enumerate(parameter_list):
@@ -95,10 +102,7 @@ class CsCompiler(BasicLinkerIsCompilerMixin, Compiler):
             cmdlist = [self.runner, obj]
         else:
             cmdlist = [os.path.join(work_dir, obj)]
-        pe = subprocess.Popen(cmdlist, cwd=work_dir)
-        pe.wait()
-        if pe.returncode != 0:
-            raise EnvironmentException('Executables created by Mono compiler %s are not runnable.' % self.name_string())
+        self.run_sanity_check(environment, cmdlist, work_dir, use_exe_wrapper_for_cross=False)
 
     def needs_static_linker(self) -> bool:
         return False
