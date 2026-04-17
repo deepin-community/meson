@@ -4,6 +4,7 @@
 from configparser import ConfigParser
 from pathlib import Path
 from unittest import mock
+import argparse
 import contextlib
 import io
 import json
@@ -13,6 +14,7 @@ import pickle
 import stat
 import subprocess
 import tempfile
+import textwrap
 import typing as T
 import unittest
 
@@ -23,27 +25,28 @@ import mesonbuild.dependencies.factory
 import mesonbuild.envconfig
 import mesonbuild.environment
 import mesonbuild.modules.gnome
+import mesonbuild.scripts.env2mfile
 from mesonbuild import coredata
 from mesonbuild.compilers.c import ClangCCompiler, GnuCCompiler
 from mesonbuild.compilers.cpp import VisualStudioCPPCompiler
 from mesonbuild.compilers.d import DmdDCompiler
+from mesonbuild.compilers.detect import detect_c_compiler
+from mesonbuild.compilers.mixins.visualstudio import MSVCCompiler, ClangClCompiler
 from mesonbuild.linkers import linkers
 from mesonbuild.interpreterbase import typed_pos_args, InvalidArguments, ObjectHolder
 from mesonbuild.interpreterbase import typed_pos_args, InvalidArguments, typed_kwargs, ContainerTypeInfo, KwargInfo
 from mesonbuild.mesonlib import (
     LibType, MachineChoice, PerMachine, Version, is_windows, is_osx,
-    is_cygwin, is_openbsd, search_version, MesonException, OptionKey,
-    OptionType
+    is_cygwin, is_openbsd, search_version, MesonException, python_command,
 )
+from mesonbuild.options import OptionKey
 from mesonbuild.interpreter.type_checking import in_set_validator, NoneType
 from mesonbuild.dependencies.pkgconfig import PkgConfigDependency, PkgConfigInterface, PkgConfigCLI
 from mesonbuild.programs import ExternalProgram
 import mesonbuild.modules.pkgconfig
+from mesonbuild import utils
 
-
-from run_tests import (
-    FakeCompilerOptions, get_fake_env, get_fake_options
-)
+from run_tests import get_fake_env, get_fake_options
 
 from .helpers import *
 
@@ -108,7 +111,7 @@ class InternalTests(unittest.TestCase):
                          stat.S_IRGRP | stat.S_IXGRP)
 
     def test_compiler_args_class_none_flush(self):
-        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, False, mock.Mock())
+        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, get_fake_env())
         a = cc.compiler_args(['-I.'])
         #first we are checking if the tree construction deduplicates the correct -I argument
         a += ['-I..']
@@ -125,14 +128,14 @@ class InternalTests(unittest.TestCase):
         self.assertEqual(a, ['-I.', '-I./tests2/', '-I./tests/', '-I..'])
 
     def test_compiler_args_class_d(self):
-        d = DmdDCompiler([], 'fake', MachineChoice.HOST, 'info', 'arch')
+        d = DmdDCompiler([], 'fake', MachineChoice.HOST, get_fake_env(), 'arch')
         # check include order is kept when deduplicating
         a = d.compiler_args(['-Ifirst', '-Isecond', '-Ithird'])
         a += ['-Ifirst']
         self.assertEqual(a, ['-Ifirst', '-Isecond', '-Ithird'])
 
     def test_compiler_args_class_clike(self):
-        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, False, mock.Mock())
+        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, get_fake_env())
         # Test that empty initialization works
         a = cc.compiler_args()
         self.assertEqual(a, [])
@@ -205,17 +208,19 @@ class InternalTests(unittest.TestCase):
         l.append_direct('-lbar')
         self.assertEqual(l, ['-Lfoodir', '-lfoo', '-Lbardir', '-lbar', '-lbar'])
         # Direct-adding with absolute path deduplicates
-        l.append_direct('/libbaz.a')
-        self.assertEqual(l, ['-Lfoodir', '-lfoo', '-Lbardir', '-lbar', '-lbar', '/libbaz.a'])
+        abspath = str(Path('/libbaz.a').resolve())
+        l.append_direct(abspath)
+        self.assertEqual(l, ['-Lfoodir', '-lfoo', '-Lbardir', '-lbar', '-lbar', abspath])
         # Adding libbaz again does nothing
-        l.append_direct('/libbaz.a')
-        self.assertEqual(l, ['-Lfoodir', '-lfoo', '-Lbardir', '-lbar', '-lbar', '/libbaz.a'])
+        l.append_direct(abspath)
+        self.assertEqual(l, ['-Lfoodir', '-lfoo', '-Lbardir', '-lbar', '-lbar', abspath])
 
 
     def test_compiler_args_class_visualstudio(self):
-        linker = linkers.MSVCDynamicLinker(MachineChoice.HOST, [])
+        env = get_fake_env()
+        linker = linkers.MSVCDynamicLinker(env, MachineChoice.HOST, [])
         # Version just needs to be > 19.0.0
-        cc = VisualStudioCPPCompiler([], [], '20.00', MachineChoice.HOST, False, mock.Mock(), 'x64', linker=linker)
+        cc = VisualStudioCPPCompiler([], [], '20.00', MachineChoice.HOST, env, 'x64', linker=linker)
 
         a = cc.compiler_args(cc.get_always_args())
         self.assertEqual(a.to_native(copy=True), ['/nologo', '/showIncludes', '/utf-8', '/Zc:__cplusplus'])
@@ -233,10 +238,43 @@ class InternalTests(unittest.TestCase):
         self.assertEqual(a.to_native(copy=True), ['/nologo', '/showIncludes', '/Zc:__cplusplus', '/validate-charset-'])
 
 
+    def test_msvc_unix_args_to_native(self):
+        # joined
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-isystemfoo']), ['/Ifoo'])
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-idirafterfoo']), ['/Ifoo'])
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-iquotefoo']), ['/Ifoo'])
+
+        # with = separator
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-isystem=foo']), ['/Ifoo'])
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-idirafter=foo']), ['/Ifoo'])
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-iquote=foo']), ['/Ifoo'])
+
+        # as separate argument
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-isystem', 'foo']), ['/Ifoo'])
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-idirafter', 'foo']), ['/Ifoo'])
+        self.assertEqual(MSVCCompiler.unix_args_to_native(['-iquote', 'foo']), ['/Ifoo'])
+
+    def test_clangcl_unix_args_to_native(self):
+        # joined
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-isystemfoo']), ['/clang:-isystemfoo'])
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-idirafterfoo']), ['/clang:-idirafterfoo'])
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-iquotefoo']), ['/clang:-iquotefoo'])
+
+        # with = separator
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-isystem=foo']), ['/clang:-isystemfoo'])
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-idirafter=foo']), ['/clang:-idirafterfoo'])
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-iquote=foo']), ['/clang:-iquotefoo'])
+
+        # as separate argument
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-isystem', 'foo']), ['/clang:-isystemfoo'])
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-idirafter', 'foo']), ['/clang:-idirafterfoo'])
+        self.assertEqual(ClangClCompiler.unix_args_to_native(['-iquote', 'foo']), ['/clang:-iquotefoo'])
+
     def test_compiler_args_class_gnuld(self):
         ## Test --start/end-group
-        linker = linkers.GnuBFDDynamicLinker([], MachineChoice.HOST, '-Wl,', [])
-        gcc = GnuCCompiler([], [], 'fake', False, MachineChoice.HOST, mock.Mock(), linker=linker)
+        env = get_fake_env()
+        linker = linkers.GnuBFDDynamicLinker([], env, MachineChoice.HOST, '-Wl,', [])
+        gcc = GnuCCompiler([], [], 'fake', MachineChoice.HOST, env, linker=linker)
         ## Ensure that the fake compiler is never called by overriding the relevant function
         gcc.get_default_include_dirs = lambda: ['/usr/include', '/usr/share/include', '/usr/local/include']
         ## Test that 'direct' append and extend works
@@ -249,22 +287,24 @@ class InternalTests(unittest.TestCase):
         l.append_direct('-lbar')
         self.assertEqual(l.to_native(copy=True), ['-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', '-Wl,--end-group'])
         # Direct-adding with absolute path deduplicates
-        l.append_direct('/libbaz.a')
-        self.assertEqual(l.to_native(copy=True), ['-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', '/libbaz.a', '-Wl,--end-group'])
+        abspath = str(Path('/libbaz.a').resolve())
+        l.append_direct(abspath)
+        self.assertEqual(l.to_native(copy=True), ['-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', abspath, '-Wl,--end-group'])
         # Adding libbaz again does nothing
-        l.append_direct('/libbaz.a')
-        self.assertEqual(l.to_native(copy=True), ['-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', '/libbaz.a', '-Wl,--end-group'])
+        l.append_direct(abspath)
+        self.assertEqual(l.to_native(copy=True), ['-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', abspath, '-Wl,--end-group'])
         # Adding a non-library argument doesn't include it in the group
         l += ['-Lfoo', '-Wl,--export-dynamic']
-        self.assertEqual(l.to_native(copy=True), ['-Lfoo', '-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', '/libbaz.a', '-Wl,--end-group', '-Wl,--export-dynamic'])
+        self.assertEqual(l.to_native(copy=True), ['-Lfoo', '-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', abspath, '-Wl,--end-group', '-Wl,--export-dynamic'])
         # -Wl,-lfoo is detected as a library and gets added to the group
         l.append('-Wl,-ldl')
-        self.assertEqual(l.to_native(copy=True), ['-Lfoo', '-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', '/libbaz.a', '-Wl,--export-dynamic', '-Wl,-ldl', '-Wl,--end-group'])
+        self.assertEqual(l.to_native(copy=True), ['-Lfoo', '-Lfoodir', '-Wl,--start-group', '-lfoo', '-Lbardir', '-lbar', '-lbar', abspath, '-Wl,--export-dynamic', '-Wl,-ldl', '-Wl,--end-group'])
 
     def test_compiler_args_remove_system(self):
         ## Test --start/end-group
-        linker = linkers.GnuBFDDynamicLinker([], MachineChoice.HOST, '-Wl,', [])
-        gcc = GnuCCompiler([], [], 'fake', False, MachineChoice.HOST, mock.Mock(), linker=linker)
+        env = get_fake_env()
+        linker = linkers.GnuBFDDynamicLinker([], env, MachineChoice.HOST, '-Wl,', [])
+        gcc = GnuCCompiler([], [], 'fake', MachineChoice.HOST, env, linker=linker)
         ## Ensure that the fake compiler is never called by overriding the relevant function
         gcc.get_default_include_dirs = lambda: ['/usr/include', '/usr/share/include', '/usr/local/include']
         ## Test that 'direct' append and extend works
@@ -287,6 +327,7 @@ class InternalTests(unittest.TestCase):
         outputs = []
         ret = dictfunc(inputs, outputs)
         d = {'@INPUT@': inputs, '@INPUT0@': inputs[0],
+             '@PLAINNAME0@': 'foo.c.in', '@BASENAME0@': 'foo.c',
              '@PLAINNAME@': 'foo.c.in', '@BASENAME@': 'foo.c'}
         # Check dictionary
         self.assertEqual(ret, d)
@@ -309,6 +350,7 @@ class InternalTests(unittest.TestCase):
         outputs = ['out.c']
         ret = dictfunc(inputs, outputs)
         d = {'@INPUT@': inputs, '@INPUT0@': inputs[0],
+             '@PLAINNAME0@': 'foo.c.in', '@BASENAME0@': 'foo.c',
              '@PLAINNAME@': 'foo.c.in', '@BASENAME@': 'foo.c',
              '@OUTPUT@': outputs, '@OUTPUT0@': outputs[0], '@OUTDIR@': '.'}
         # Check dictionary
@@ -316,6 +358,9 @@ class InternalTests(unittest.TestCase):
         # Check substitutions
         cmd = ['some', 'ordinary', 'strings']
         self.assertEqual(substfunc(cmd, d), cmd)
+        cmd = ['@INPUT@ @OUTPUT@']
+        self.assertEqual(substfunc(cmd, d),
+                         [f'{inputs[0]} {outputs[0]}'])
         cmd = ['@INPUT@.out', '@OUTPUT@', 'strings']
         self.assertEqual(substfunc(cmd, d),
                          [inputs[0] + '.out'] + outputs + cmd[2:])
@@ -330,6 +375,7 @@ class InternalTests(unittest.TestCase):
         outputs = ['dir/out.c']
         ret = dictfunc(inputs, outputs)
         d = {'@INPUT@': inputs, '@INPUT0@': inputs[0],
+             '@PLAINNAME0@': 'foo.c.in', '@BASENAME0@': 'foo.c',
              '@PLAINNAME@': 'foo.c.in', '@BASENAME@': 'foo.c',
              '@OUTPUT@': outputs, '@OUTPUT0@': outputs[0], '@OUTDIR@': 'dir'}
         # Check dictionary
@@ -339,7 +385,9 @@ class InternalTests(unittest.TestCase):
         inputs = ['bar/foo.c.in', 'baz/foo.c.in']
         outputs = []
         ret = dictfunc(inputs, outputs)
-        d = {'@INPUT@': inputs, '@INPUT0@': inputs[0], '@INPUT1@': inputs[1]}
+        d = {'@INPUT@': inputs, '@INPUT0@': inputs[0], '@INPUT1@': inputs[1],
+             '@PLAINNAME0@': 'foo.c.in', '@PLAINNAME1@': 'foo.c.in',
+             '@BASENAME0@': 'foo.c', '@BASENAME1@': 'foo.c'}
         # Check dictionary
         self.assertEqual(ret, d)
         # Check substitutions
@@ -376,6 +424,8 @@ class InternalTests(unittest.TestCase):
         outputs = ['dir/out.c']
         ret = dictfunc(inputs, outputs)
         d = {'@INPUT@': inputs, '@INPUT0@': inputs[0], '@INPUT1@': inputs[1],
+             '@PLAINNAME0@': 'foo.c.in', '@PLAINNAME1@': 'foo.c.in',
+             '@BASENAME0@': 'foo.c', '@BASENAME1@': 'foo.c',
              '@OUTPUT@': outputs, '@OUTPUT0@': outputs[0], '@OUTDIR@': 'dir'}
         # Check dictionary
         self.assertEqual(ret, d)
@@ -402,6 +452,8 @@ class InternalTests(unittest.TestCase):
         outputs = ['dir/out.c', 'dir/out2.c']
         ret = dictfunc(inputs, outputs)
         d = {'@INPUT@': inputs, '@INPUT0@': inputs[0], '@INPUT1@': inputs[1],
+             '@PLAINNAME0@': 'foo.c.in', '@PLAINNAME1@': 'foo.c.in',
+             '@BASENAME0@': 'foo.c', '@BASENAME1@': 'foo.c',
              '@OUTPUT@': outputs, '@OUTPUT0@': outputs[0], '@OUTPUT1@': outputs[1],
              '@OUTDIR@': 'dir'}
         # Check dictionary
@@ -521,18 +573,18 @@ class InternalTests(unittest.TestCase):
         kwargs = {'sources': [1, [2, [3]]]}
         self.assertEqual([1, 2, 3], extract(kwargs, 'sources'))
 
-    def _test_all_naming(self, cc, env, patterns, platform):
+    def _test_all_naming(self, cc, patterns, platform):
         shr = patterns[platform]['shared']
         stc = patterns[platform]['static']
         shrstc = shr + tuple(x for x in stc if x not in shr)
         stcshr = stc + tuple(x for x in shr if x not in stc)
-        p = cc.get_library_naming(env, LibType.SHARED)
+        p = cc.get_library_naming(LibType.SHARED)
         self.assertEqual(p, shr)
-        p = cc.get_library_naming(env, LibType.STATIC)
+        p = cc.get_library_naming(LibType.STATIC)
         self.assertEqual(p, stc)
-        p = cc.get_library_naming(env, LibType.PREFER_STATIC)
+        p = cc.get_library_naming(LibType.PREFER_STATIC)
         self.assertEqual(p, stcshr)
-        p = cc.get_library_naming(env, LibType.PREFER_SHARED)
+        p = cc.get_library_naming(LibType.PREFER_SHARED)
         self.assertEqual(p, shrstc)
         # Test find library by mocking up openbsd
         if platform != 'openbsd':
@@ -541,10 +593,14 @@ class InternalTests(unittest.TestCase):
             for i in ['libfoo.so.6.0', 'libfoo.so.5.0', 'libfoo.so.54.0', 'libfoo.so.66a.0b', 'libfoo.so.70.0.so.1',
                       'libbar.so.7.10', 'libbar.so.7.9', 'libbar.so.7.9.3']:
                 libpath = Path(tmpdir) / i
-                libpath.write_text('', encoding='utf-8')
-            found = cc._find_library_real('foo', env, [tmpdir], '', LibType.PREFER_SHARED, lib_prefix_warning=True)
+                src = libpath.with_suffix('.c')
+                with src.open('w', encoding='utf-8') as f:
+                    f.write('int meson_foobar (void) { return 0; }')
+                subprocess.check_call(['gcc', str(src), '-o', str(libpath), '-shared'])
+
+            found = cc._find_library_real('foo', [tmpdir], 'int main(void) { return 0; }', LibType.PREFER_SHARED, lib_prefix_warning=True, ignore_system_dirs=False)
             self.assertEqual(os.path.basename(found[0]), 'libfoo.so.54.0')
-            found = cc._find_library_real('bar', env, [tmpdir], '', LibType.PREFER_SHARED, lib_prefix_warning=True)
+            found = cc._find_library_real('bar', [tmpdir], 'int main(void) { return 0; }', LibType.PREFER_SHARED, lib_prefix_warning=True, ignore_system_dirs=False)
             self.assertEqual(os.path.basename(found[0]), 'libbar.so.7.10')
 
     def test_find_library_patterns(self):
@@ -571,26 +627,26 @@ class InternalTests(unittest.TestCase):
         env = get_fake_env()
         cc = detect_c_compiler(env, MachineChoice.HOST)
         if is_osx():
-            self._test_all_naming(cc, env, patterns, 'darwin')
+            self._test_all_naming(cc, patterns, 'darwin')
         elif is_cygwin():
-            self._test_all_naming(cc, env, patterns, 'cygwin')
+            self._test_all_naming(cc, patterns, 'cygwin')
         elif is_windows():
             if cc.get_argument_syntax() == 'msvc':
-                self._test_all_naming(cc, env, patterns, 'windows-msvc')
+                self._test_all_naming(cc, patterns, 'windows-msvc')
             else:
-                self._test_all_naming(cc, env, patterns, 'windows-mingw')
+                self._test_all_naming(cc, patterns, 'windows-mingw')
         elif is_openbsd():
-            self._test_all_naming(cc, env, patterns, 'openbsd')
+            self._test_all_naming(cc, patterns, 'openbsd')
         else:
-            self._test_all_naming(cc, env, patterns, 'linux')
+            self._test_all_naming(cc, patterns, 'linux')
             env.machines.host.system = 'openbsd'
-            self._test_all_naming(cc, env, patterns, 'openbsd')
+            self._test_all_naming(cc, patterns, 'openbsd')
             env.machines.host.system = 'darwin'
-            self._test_all_naming(cc, env, patterns, 'darwin')
+            self._test_all_naming(cc, patterns, 'darwin')
             env.machines.host.system = 'cygwin'
-            self._test_all_naming(cc, env, patterns, 'cygwin')
+            self._test_all_naming(cc, patterns, 'cygwin')
             env.machines.host.system = 'windows'
-            self._test_all_naming(cc, env, patterns, 'windows-mingw')
+            self._test_all_naming(cc, patterns, 'windows-mingw')
 
     @skipIfNoPkgconfig
     def test_pkgconfig_parse_libs(self):
@@ -600,23 +656,27 @@ class InternalTests(unittest.TestCase):
         https://github.com/mesonbuild/meson/issues/3951
         '''
         def create_static_lib(name):
-            if not is_osx():
-                name.open('w', encoding='utf-8').close()
-                return
             src = name.with_suffix('.c')
             out = name.with_suffix('.o')
             with src.open('w', encoding='utf-8') as f:
                 f.write('int meson_foobar (void) { return 0; }')
             # use of x86_64 is hardcoded in run_tests.py:get_fake_env()
-            subprocess.check_call(['clang', '-c', str(src), '-o', str(out), '-arch', 'x86_64'])
+            if is_osx():
+                subprocess.check_call(['clang', '-c', str(src), '-o', str(out), '-arch', 'x86_64'])
+            else:
+                subprocess.check_call(['gcc', '-c', str(src), '-o', str(out)])
             subprocess.check_call(['ar', 'csr', str(name), str(out)])
+
+        # The test relies on some open-coded toolchain invocations for
+        # library creation in create_static_lib.
+        if is_windows() or is_cygwin():
+            return
 
         with tempfile.TemporaryDirectory() as tmpdir:
             pkgbin = ExternalProgram('pkg-config', command=['pkg-config'], silent=True)
             env = get_fake_env()
             compiler = detect_c_compiler(env, MachineChoice.HOST)
             env.coredata.compilers.host = {'c': compiler}
-            env.coredata.options[OptionKey('link_args', lang='c')] = FakeCompilerOptions()
             p1 = Path(tmpdir) / '1'
             p2 = Path(tmpdir) / '2'
             p1.mkdir()
@@ -646,7 +706,7 @@ class InternalTests(unittest.TestCase):
 
             with mock.patch.object(PkgConfigInterface, 'instance') as instance_method:
                 instance_method.return_value = FakeInstance(env, MachineChoice.HOST, silent=True)
-                kwargs = {'required': True, 'silent': True}
+                kwargs = {'required': True, 'silent': True, 'native': MachineChoice.HOST}
                 foo_dep = PkgConfigDependency('foo', env, kwargs)
                 self.assertEqual(foo_dep.get_link_args(),
                                  [(p1 / 'libfoo.a').as_posix(), (p2 / 'libbar.a').as_posix()])
@@ -660,6 +720,34 @@ class InternalTests(unittest.TestCase):
                     for link_arg in link_args:
                         for lib in ('pthread', 'm', 'c', 'dl', 'rt'):
                             self.assertNotIn(f'lib{lib}.a', link_arg, msg=link_args)
+
+    def test_program_version(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = Path(tmpdir) / 'script.py'
+            script_path.write_text('import sys\nprint(sys.argv[1])\n', encoding='utf-8')
+            script_path.chmod(0o755)
+
+            for output, expected in {
+                    '': None,
+                    '1': None,
+                    '1.2.4': '1.2.4',
+                    '1 1.2.4': '1.2.4',
+                    'foo version 1.2.4': '1.2.4',
+                    'foo 1.2.4.': '1.2.4',
+                    'foo 1.2.4': '1.2.4',
+                    'foo 1.2.4 bar': '1.2.4',
+                    'foo 10.0.0': '10.0.0',
+                    '50 5.4.0': '5.4.0',
+                    'This is perl 5, version 40, subversion 0 (v5.40.0)': '5.40.0',
+                    'git version 2.48.0.rc1': '2.48.0',
+            }.items():
+                prog = ExternalProgram('script', command=[python_command, str(script_path), output], silent=True)
+
+                if expected is None:
+                    with self.assertRaisesRegex(MesonException, 'Could not find a version number'):
+                        prog.get_version()
+                else:
+                    self.assertEqual(prog.get_version(), expected)
 
     def test_version_compare(self):
         comparefunc = mesonbuild.mesonlib.version_compare_many
@@ -780,29 +868,6 @@ class InternalTests(unittest.TestCase):
                     self.assertTrue(o(ver_a, ver_b), f'{ver_a} {name} {ver_b}')
                 for o, name in [(operator.lt, 'lt'), (operator.le, 'le'), (operator.eq, 'eq')]:
                     self.assertFalse(o(ver_a, ver_b), f'{ver_a} {name} {ver_b}')
-
-    def test_msvc_toolset_version(self):
-        '''
-        Ensure that the toolset version returns the correct value for this MSVC
-        '''
-        env = get_fake_env()
-        cc = detect_c_compiler(env, MachineChoice.HOST)
-        if cc.get_argument_syntax() != 'msvc':
-            raise unittest.SkipTest('Test only applies to MSVC-like compilers')
-        toolset_ver = cc.get_toolset_version()
-        self.assertIsNotNone(toolset_ver)
-        # Visual Studio 2015 and older versions do not define VCToolsVersion
-        # TODO: ICL doesn't set this in the VSC2015 profile either
-        if cc.id == 'msvc' and int(''.join(cc.version.split('.')[0:2])) < 1910:
-            return
-        if 'VCToolsVersion' in os.environ:
-            vctools_ver = os.environ['VCToolsVersion']
-        else:
-            self.assertIn('VCINSTALLDIR', os.environ)
-            # See https://devblogs.microsoft.com/cppblog/finding-the-visual-c-compiler-tools-in-visual-studio-2017/
-            vctools_ver = (Path(os.environ['VCINSTALLDIR']) / 'Auxiliary' / 'Build' / 'Microsoft.VCToolsVersion.default.txt').read_text(encoding='utf-8')
-        self.assertTrue(vctools_ver.startswith(toolset_ver),
-                        msg=f'{vctools_ver!r} does not start with {toolset_ver!r}')
 
     def test_split_args(self):
         split_args = mesonbuild.mesonlib.split_args
@@ -989,14 +1054,14 @@ class InternalTests(unittest.TestCase):
                     'test_dep',
                     methods=[b.DependencyMethods.PKGCONFIG, b.DependencyMethods.CMAKE]
                 )
-                actual = [m() for m in f(env, MachineChoice.HOST, {'required': False})]
+                actual = [m() for m in f(env, {'required': False, 'native': MachineChoice.HOST})]
                 self.assertListEqual([m.type_name for m in actual], ['pkgconfig', 'cmake'])
 
                 f = F.DependencyFactory(
                     'test_dep',
                     methods=[b.DependencyMethods.CMAKE, b.DependencyMethods.PKGCONFIG]
                 )
-                actual = [m() for m in f(env, MachineChoice.HOST, {'required': False})]
+                actual = [m() for m in f(env, {'required': False, 'native': MachineChoice.HOST})]
                 self.assertListEqual([m.type_name for m in actual], ['cmake', 'pkgconfig'])
 
     def test_validate_json(self) -> None:
@@ -1009,7 +1074,7 @@ class InternalTests(unittest.TestCase):
                 from jsonschema import validate, ValidationError as JsonSchemaFailure
                 fast = False
             except:
-                if is_ci():
+                if IS_CI:
                     raise
                 raise unittest.SkipTest('neither Python fastjsonschema nor jsonschema module not found.')
 
@@ -1338,8 +1403,8 @@ class InternalTests(unittest.TestCase):
     def test_typed_kwarg_since(self) -> None:
         @typed_kwargs(
             'testfunc',
-            KwargInfo('input', str, since='1.0', since_message='Its awesome, use it',
-                      deprecated='2.0', deprecated_message='Its terrible, dont use it')
+            KwargInfo('input', str, since='1.0', since_message='It\'s awesome, use it',
+                      deprecated='2.0', deprecated_message='It\'s terrible, don\'t use it')
         )
         def _(obj, node, args: T.Tuple, kwargs: T.Dict[str, str]) -> None:
             self.assertIsInstance(kwargs['input'], str)
@@ -1350,8 +1415,8 @@ class InternalTests(unittest.TestCase):
                 mock.patch('mesonbuild.mesonlib.project_meson_versions', {'': '0.1'}):
             # With Meson 0.1 it should trigger the "introduced" warning but not the "deprecated" warning
             _(None, mock.Mock(subproject=''), [], {'input': 'foo'})
-            self.assertRegex(out.getvalue(), r'WARNING:.*introduced.*input arg in testfunc. Its awesome, use it')
-            self.assertNotRegex(out.getvalue(), r'WARNING:.*deprecated.*input arg in testfunc. Its terrible, dont use it')
+            self.assertRegex(out.getvalue(), r'WARNING:.*introduced.*input arg in testfunc. It\'s awesome, use it')
+            self.assertNotRegex(out.getvalue(), r'WARNING:.*deprecated.*input arg in testfunc. It\'s terrible, don\'t use it')
 
         with self.subTest('no warnings should be triggered'), \
                 mock.patch('sys.stdout', io.StringIO()) as out, \
@@ -1365,8 +1430,8 @@ class InternalTests(unittest.TestCase):
                 mock.patch('mesonbuild.mesonlib.project_meson_versions', {'': '2.0'}):
             # With Meson 2.0 it should trigger the "deprecated" warning but not the "introduced" warning
             _(None, mock.Mock(subproject=''), [], {'input': 'foo'})
-            self.assertRegex(out.getvalue(), r'WARNING:.*deprecated.*input arg in testfunc. Its terrible, dont use it')
-            self.assertNotRegex(out.getvalue(), r'WARNING:.*introduced.*input arg in testfunc. Its awesome, use it')
+            self.assertRegex(out.getvalue(), r'WARNING:.*deprecated.*input arg in testfunc. It\'s terrible, don\'t use it')
+            self.assertNotRegex(out.getvalue(), r'WARNING:.*introduced.*input arg in testfunc. It\'s awesome, use it')
 
     def test_typed_kwarg_validator(self) -> None:
         @typed_kwargs(
@@ -1398,7 +1463,7 @@ class InternalTests(unittest.TestCase):
         @typed_kwargs(
             'testfunc',
             KwargInfo('input', ContainerTypeInfo(list, str), listify=True, default=[], deprecated_values={'foo': '0.9'}, since_values={'bar': '1.1'}),
-            KwargInfo('output', ContainerTypeInfo(dict, str), default={}, deprecated_values={'foo': '0.9', 'foo2': ('0.9', 'dont use it')}, since_values={'bar': '1.1', 'bar2': ('1.1', 'use this')}),
+            KwargInfo('output', ContainerTypeInfo(dict, str), default={}, deprecated_values={'foo': '0.9', 'foo2': ('0.9', 'don\'t use it')}, since_values={'bar': '1.1', 'bar2': ('1.1', 'use this')}),
             KwargInfo('install_dir', (bool, str, NoneType), deprecated_values={False: '0.9'}),
             KwargInfo(
                 'mode',
@@ -1433,7 +1498,7 @@ class InternalTests(unittest.TestCase):
 
         with self.subTest('deprecated dict string value with msg'), mock.patch('sys.stdout', io.StringIO()) as out:
             _(None, mock.Mock(subproject=''), [], {'output': {'foo2': 'a'}})
-            self.assertRegex(out.getvalue(), r"""WARNING:.Project targets '1.0'.*deprecated since '0.9': "testfunc" keyword argument "output" value "foo2" in dict keys. dont use it.*""")
+            self.assertRegex(out.getvalue(), r"""WARNING:.Project targets '1.0'.*deprecated since '0.9': "testfunc" keyword argument "output" value "foo2" in dict keys. don't use it.*""")
 
         with self.subTest('new dict string value'), mock.patch('sys.stdout', io.StringIO()) as out:
             _(None, mock.Mock(subproject=''), [], {'output': {'bar': 'b'}})
@@ -1557,9 +1622,9 @@ class InternalTests(unittest.TestCase):
             """Mock all of the ways we could get the trial at once."""
             mocked = mock.Mock(return_value=value)
 
-            with mock.patch('mesonbuild.environment.detect_windows_arch', mocked), \
-                    mock.patch('mesonbuild.environment.platform.processor', mocked), \
-                    mock.patch('mesonbuild.environment.platform.machine', mocked):
+            with mock.patch('mesonbuild.envconfig.detect_windows_arch', mocked), \
+                    mock.patch('mesonbuild.envconfig.platform.processor', mocked), \
+                    mock.patch('mesonbuild.envconfig.platform.machine', mocked):
                 yield
 
         cases = [
@@ -1590,28 +1655,28 @@ class InternalTests(unittest.TestCase):
             ('aarch64_be', 'aarch64'),
         ]
 
-        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, False, mock.Mock())
+        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, get_fake_env())
 
-        with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=False)):
+        with mock.patch('mesonbuild.envconfig.any_compiler_has_define', mock.Mock(return_value=False)):
             for test, expected in cases:
                 with self.subTest(test, has_define=False), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu_family({'c': cc})
+                    actual = mesonbuild.envconfig.detect_cpu_family({'c': cc})
                     self.assertEqual(actual, expected)
 
-        with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=True)):
+        with mock.patch('mesonbuild.envconfig.any_compiler_has_define', mock.Mock(return_value=True)):
             for test, expected in [('x86_64', 'x86'), ('aarch64', 'arm'), ('ppc', 'ppc64'), ('mips64', 'mips64')]:
                 with self.subTest(test, has_define=True), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu_family({'c': cc})
+                    actual = mesonbuild.envconfig.detect_cpu_family({'c': cc})
                     self.assertEqual(actual, expected)
 
         # machine_info_can_run calls detect_cpu_family with no compilers at all
         with mock.patch(
-            'mesonbuild.environment.any_compiler_has_define',
+            'mesonbuild.envconfig.any_compiler_has_define',
             mock.Mock(side_effect=AssertionError('Should not be called')),
         ):
             for test, expected in [('mips64', 'mips64')]:
                 with self.subTest(test, has_compiler=False), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu_family({})
+                    actual = mesonbuild.envconfig.detect_cpu_family({})
                     self.assertEqual(actual, expected)
 
     def test_detect_cpu(self) -> None:
@@ -1621,9 +1686,9 @@ class InternalTests(unittest.TestCase):
             """Mock all of the ways we could get the trial at once."""
             mocked = mock.Mock(return_value=value)
 
-            with mock.patch('mesonbuild.environment.detect_windows_arch', mocked), \
-                    mock.patch('mesonbuild.environment.platform.processor', mocked), \
-                    mock.patch('mesonbuild.environment.platform.machine', mocked):
+            with mock.patch('mesonbuild.envconfig.detect_windows_arch', mocked), \
+                    mock.patch('mesonbuild.envconfig.platform.processor', mocked), \
+                    mock.patch('mesonbuild.envconfig.platform.machine', mocked):
                 yield
 
         cases = [
@@ -1639,27 +1704,27 @@ class InternalTests(unittest.TestCase):
             ('aarch64_be', 'aarch64'),
         ]
 
-        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, False, mock.Mock())
+        cc = ClangCCompiler([], [], 'fake', MachineChoice.HOST, get_fake_env())
 
-        with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=False)):
+        with mock.patch('mesonbuild.envconfig.any_compiler_has_define', mock.Mock(return_value=False)):
             for test, expected in cases:
                 with self.subTest(test, has_define=False), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu({'c': cc})
+                    actual = mesonbuild.envconfig.detect_cpu({'c': cc})
                     self.assertEqual(actual, expected)
 
-        with mock.patch('mesonbuild.environment.any_compiler_has_define', mock.Mock(return_value=True)):
+        with mock.patch('mesonbuild.envconfig.any_compiler_has_define', mock.Mock(return_value=True)):
             for test, expected in [('x86_64', 'i686'), ('aarch64', 'arm'), ('ppc', 'ppc64'), ('mips64', 'mips64')]:
                 with self.subTest(test, has_define=True), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu({'c': cc})
+                    actual = mesonbuild.envconfig.detect_cpu({'c': cc})
                     self.assertEqual(actual, expected)
 
         with mock.patch(
-            'mesonbuild.environment.any_compiler_has_define',
+            'mesonbuild.envconfig.any_compiler_has_define',
             mock.Mock(side_effect=AssertionError('Should not be called')),
         ):
             for test, expected in [('mips64', 'mips64')]:
                 with self.subTest(test, has_compiler=False), mock_trial(test):
-                    actual = mesonbuild.environment.detect_cpu({})
+                    actual = mesonbuild.envconfig.detect_cpu({})
                     self.assertEqual(actual, expected)
 
     @mock.patch('mesonbuild.interpreter.Interpreter.load_root_meson_file', mock.Mock(return_value=None))
@@ -1690,18 +1755,405 @@ class InternalTests(unittest.TestCase):
 
     def test_option_key_from_string(self) -> None:
         cases = [
-            ('c_args', OptionKey('args', lang='c', _type=OptionType.COMPILER)),
-            ('build.cpp_args', OptionKey('args', machine=MachineChoice.BUILD, lang='cpp', _type=OptionType.COMPILER)),
-            ('prefix', OptionKey('prefix', _type=OptionType.BUILTIN)),
-            ('made_up', OptionKey('made_up', _type=OptionType.PROJECT)),
+            ('c_args', OptionKey('c_args')),
+            ('build.cpp_args', OptionKey('cpp_args', machine=MachineChoice.BUILD)),
+            ('prefix', OptionKey('prefix')),
+            ('made_up', OptionKey('made_up')),
 
             # TODO: the from_String method should be splitting the prefix off of
             # these, as we have the type already, but it doesn't. For now have a
             # test so that we don't change the behavior un-intentionally
-            ('b_lto', OptionKey('b_lto', _type=OptionType.BASE)),
-            ('backend_startup_project', OptionKey('backend_startup_project', _type=OptionType.BACKEND)),
+            ('b_lto', OptionKey('b_lto')),
+            ('backend_startup_project', OptionKey('backend_startup_project')),
         ]
 
         for raw, expected in cases:
             with self.subTest(raw):
                 self.assertEqual(OptionKey.from_string(raw), expected)
+
+    def test_env2mfile_deb(self) -> None:
+        MachineInfo = mesonbuild.scripts.env2mfile.MachineInfo
+        to_machine_info = mesonbuild.scripts.env2mfile.dpkg_architecture_to_machine_info
+
+        # For testing purposes, behave as though all cross-programs
+        # exist in /usr/bin
+        def locate_path(program: str) -> T.List[str]:
+            if os.path.isabs(program):
+                return [program]
+            return ['/usr/bin/' + program]
+
+        def expected_compilers(
+            gnu_tuple: str,
+            gcc_suffix: str = '',
+        ) -> T.Dict[str, T.List[str]]:
+            return {
+                'c': [f'/usr/bin/{gnu_tuple}-gcc{gcc_suffix}'],
+                'cpp': [f'/usr/bin/{gnu_tuple}-g++{gcc_suffix}'],
+                'objc': [f'/usr/bin/{gnu_tuple}-gobjc{gcc_suffix}'],
+                'objcpp': [f'/usr/bin/{gnu_tuple}-gobjc++{gcc_suffix}'],
+                'vala': [f'/usr/bin/{gnu_tuple}-valac'],
+            }
+
+        def expected_binaries(gnu_tuple: str) -> T.Dict[str, T.List[str]]:
+            return {
+                'ar': [f'/usr/bin/{gnu_tuple}-ar'],
+                'strip': [f'/usr/bin/{gnu_tuple}-strip'],
+                'objcopy': [f'/usr/bin/{gnu_tuple}-objcopy'],
+                'ld': [f'/usr/bin/{gnu_tuple}-ld'],
+                'cmake': ['/usr/bin/cmake'],
+                'pkg-config': [f'/usr/bin/{gnu_tuple}-pkg-config'],
+                'cups-config': ['/usr/bin/cups-config'],
+                'exe_wrapper': [f'/usr/bin/{gnu_tuple}-cross-exe-wrapper'],
+                'g-ir-annotation-tool': [f'/usr/bin/{gnu_tuple}-g-ir-annotation-tool'],
+                'g-ir-compiler': [f'/usr/bin/{gnu_tuple}-g-ir-compiler'],
+                'g-ir-doc-tool': [f'/usr/bin/{gnu_tuple}-g-ir-doc-tool'],
+                'g-ir-generate': [f'/usr/bin/{gnu_tuple}-g-ir-generate'],
+                'g-ir-inspect': [f'/usr/bin/{gnu_tuple}-g-ir-inspect'],
+                'g-ir-scanner': [f'/usr/bin/{gnu_tuple}-g-ir-scanner'],
+                'vapigen': [f'/usr/bin/{gnu_tuple}-vapigen'],
+            }
+
+        for title, dpkg_arch, gccsuffix, env, expected in [
+            (
+                # s390x is an example of the common case where the
+                # Meson CPU name, the GNU CPU name, the dpkg architecture
+                # name and uname -m all agree.
+                # (alpha, m68k, ppc64, riscv64, sh4, sparc64 are similar)
+                's390x-linux-gnu',
+                # Output of `dpkg-architecture -a...`, filtered to
+                # only the DEB_HOST_ parts because that's all we use
+                textwrap.dedent(
+                    '''
+                    DEB_HOST_ARCH=s390x
+                    DEB_HOST_ARCH_ABI=base
+                    DEB_HOST_ARCH_BITS=64
+                    DEB_HOST_ARCH_CPU=s390x
+                    DEB_HOST_ARCH_ENDIAN=big
+                    DEB_HOST_ARCH_LIBC=gnu
+                    DEB_HOST_ARCH_OS=linux
+                    DEB_HOST_GNU_CPU=s390x
+                    DEB_HOST_GNU_SYSTEM=linux-gnu
+                    DEB_HOST_GNU_TYPE=s390x-linux-gnu
+                    DEB_HOST_MULTIARCH=s390x-linux-gnu
+                    '''
+                ),
+                '',
+                {'PATH': '/usr/bin'},
+                MachineInfo(
+                    compilers=expected_compilers('s390x-linux-gnu'),
+                    binaries=expected_binaries('s390x-linux-gnu'),
+                    properties={},
+                    compile_args={},
+                    link_args={},
+                    cmake={
+                        'CMAKE_C_COMPILER': ['/usr/bin/s390x-linux-gnu-gcc'],
+                        'CMAKE_CXX_COMPILER': ['/usr/bin/s390x-linux-gnu-g++'],
+                        'CMAKE_SYSTEM_NAME': 'Linux',
+                        'CMAKE_SYSTEM_PROCESSOR': 's390x',
+                    },
+                    system='linux',
+                    subsystem='linux',
+                    kernel='linux',
+                    cpu='s390x',
+                    cpu_family='s390x',
+                    endian='big',
+                ),
+            ),
+            # Debian amd64 vs. GNU, Meson, etc. x86_64.
+            # arm64/aarch64, hppa/parisc, i386/i686/x86, loong64/loongarch64,
+            # powerpc/ppc are similar.
+            (
+                'x86_64-linux-gnu',
+                textwrap.dedent(
+                    '''
+                    DEB_HOST_ARCH=amd64
+                    DEB_HOST_ARCH_ABI=base
+                    DEB_HOST_ARCH_BITS=64
+                    DEB_HOST_ARCH_CPU=amd64
+                    DEB_HOST_ARCH_ENDIAN=little
+                    DEB_HOST_ARCH_LIBC=gnu
+                    DEB_HOST_ARCH_OS=linux
+                    DEB_HOST_GNU_CPU=x86_64
+                    DEB_HOST_GNU_SYSTEM=linux-gnu
+                    DEB_HOST_GNU_TYPE=x86_64-linux-gnu
+                    DEB_HOST_MULTIARCH=x86_64-linux-gnu
+                    '''
+                ),
+                '',
+                {'PATH': '/usr/bin'},
+                MachineInfo(
+                    compilers=expected_compilers('x86_64-linux-gnu'),
+                    binaries=expected_binaries('x86_64-linux-gnu'),
+                    properties={},
+                    compile_args={},
+                    link_args={},
+                    cmake={
+                        'CMAKE_C_COMPILER': ['/usr/bin/x86_64-linux-gnu-gcc'],
+                        'CMAKE_CXX_COMPILER': ['/usr/bin/x86_64-linux-gnu-g++'],
+                        'CMAKE_SYSTEM_NAME': 'Linux',
+                        'CMAKE_SYSTEM_PROCESSOR': 'x86_64',
+                    },
+                    system='linux',
+                    subsystem='linux',
+                    kernel='linux',
+                    cpu='x86_64',
+                    cpu_family='x86_64',
+                    endian='little',
+                ),
+            ),
+            (
+                'arm-linux-gnueabihf with non-default gcc and environment',
+                textwrap.dedent(
+                    '''
+                    DEB_HOST_ARCH=armhf
+                    DEB_HOST_ARCH_ABI=eabihf
+                    DEB_HOST_ARCH_BITS=32
+                    DEB_HOST_ARCH_CPU=arm
+                    DEB_HOST_ARCH_ENDIAN=little
+                    DEB_HOST_ARCH_LIBC=gnu
+                    DEB_HOST_ARCH_OS=linux
+                    DEB_HOST_GNU_CPU=arm
+                    DEB_HOST_GNU_SYSTEM=linux-gnueabihf
+                    DEB_HOST_GNU_TYPE=arm-linux-gnueabihf
+                    DEB_HOST_MULTIARCH=arm-linux-gnueabihf
+                    '''
+                ),
+                '-12',
+                {
+                    'PATH': '/usr/bin',
+                    'CPPFLAGS': '-DNDEBUG',
+                    'CFLAGS': '-std=c99',
+                    'CXXFLAGS': '-std=c++11',
+                    'OBJCFLAGS': '-fobjc-exceptions',
+                    'OBJCXXFLAGS': '-fobjc-nilcheck',
+                    'LDFLAGS': '-Wl,-O1',
+                },
+                MachineInfo(
+                    compilers=expected_compilers('arm-linux-gnueabihf', '-12'),
+                    binaries=expected_binaries('arm-linux-gnueabihf'),
+                    properties={},
+                    compile_args={
+                        'c': ['-DNDEBUG', '-std=c99'],
+                        'cpp': ['-DNDEBUG', '-std=c++11'],
+                        'objc': ['-DNDEBUG', '-fobjc-exceptions'],
+                        'objcpp': ['-DNDEBUG', '-fobjc-nilcheck'],
+                    },
+                    link_args={
+                        'c': ['-std=c99', '-Wl,-O1'],
+                        'cpp': ['-std=c++11', '-Wl,-O1'],
+                        'objc': ['-fobjc-exceptions', '-Wl,-O1'],
+                        'objcpp': ['-fobjc-nilcheck', '-Wl,-O1'],
+                    },
+                    cmake={
+                        'CMAKE_C_COMPILER': ['/usr/bin/arm-linux-gnueabihf-gcc-12'],
+                        'CMAKE_CXX_COMPILER': ['/usr/bin/arm-linux-gnueabihf-g++-12'],
+                        'CMAKE_SYSTEM_NAME': 'Linux',
+                        'CMAKE_SYSTEM_PROCESSOR': 'armv7l',
+                    },
+                    system='linux',
+                    subsystem='linux',
+                    kernel='linux',
+                    # In a native build this would often be armv8l
+                    # (the version of the running CPU) but the architecture
+                    # baseline in Debian is officially ARMv7
+                    cpu='arm7hlf',
+                    cpu_family='arm',
+                    endian='little',
+                ),
+            ),
+            (
+                'special cases for i386 (i686, x86) and Hurd',
+                textwrap.dedent(
+                    '''
+                    DEB_HOST_ARCH=hurd-i386
+                    DEB_HOST_ARCH_ABI=base
+                    DEB_HOST_ARCH_BITS=32
+                    DEB_HOST_ARCH_CPU=i386
+                    DEB_HOST_ARCH_ENDIAN=little
+                    DEB_HOST_ARCH_LIBC=gnu
+                    DEB_HOST_ARCH_OS=hurd
+                    DEB_HOST_GNU_CPU=i686
+                    DEB_HOST_GNU_SYSTEM=gnu
+                    DEB_HOST_GNU_TYPE=i686-gnu
+                    DEB_HOST_MULTIARCH=i386-gnu
+                    '''
+                ),
+                '',
+                {'PATH': '/usr/bin'},
+                MachineInfo(
+                    compilers=expected_compilers('i686-gnu'),
+                    binaries=expected_binaries('i686-gnu'),
+                    properties={},
+                    compile_args={},
+                    link_args={},
+                    cmake={
+                        'CMAKE_C_COMPILER': ['/usr/bin/i686-gnu-gcc'],
+                        'CMAKE_CXX_COMPILER': ['/usr/bin/i686-gnu-g++'],
+                        'CMAKE_SYSTEM_NAME': 'GNU',
+                        'CMAKE_SYSTEM_PROCESSOR': 'i686',
+                    },
+                    system='gnu',
+                    subsystem='gnu',
+                    kernel='gnu',
+                    cpu='i686',
+                    cpu_family='x86',
+                    endian='little',
+                ),
+            ),
+            (
+                'special cases for amd64 (x86_64) and kFreeBSD',
+                textwrap.dedent(
+                    '''
+                    DEB_HOST_ARCH=kfreebsd-amd64
+                    DEB_HOST_ARCH_ABI=base
+                    DEB_HOST_ARCH_BITS=64
+                    DEB_HOST_ARCH_CPU=x86_amd64
+                    DEB_HOST_ARCH_ENDIAN=little
+                    DEB_HOST_ARCH_LIBC=gnu
+                    DEB_HOST_ARCH_OS=kfreebsd
+                    DEB_HOST_GNU_CPU=x86_64
+                    DEB_HOST_GNU_SYSTEM=kfreebsd-gnu
+                    DEB_HOST_GNU_TYPE=x86_64-kfreebsd-gnu
+                    DEB_HOST_MULTIARCH=x86_64-kfreebsd-gnu
+                    '''
+                ),
+                '',
+                {'PATH': '/usr/bin'},
+                MachineInfo(
+                    compilers=expected_compilers('x86_64-kfreebsd-gnu'),
+                    binaries=expected_binaries('x86_64-kfreebsd-gnu'),
+                    properties={},
+                    compile_args={},
+                    link_args={},
+                    cmake={
+                        'CMAKE_C_COMPILER': ['/usr/bin/x86_64-kfreebsd-gnu-gcc'],
+                        'CMAKE_CXX_COMPILER': ['/usr/bin/x86_64-kfreebsd-gnu-g++'],
+                        'CMAKE_SYSTEM_NAME': 'kFreeBSD',
+                        'CMAKE_SYSTEM_PROCESSOR': 'x86_64',
+                    },
+                    system='kfreebsd',
+                    subsystem='kfreebsd',
+                    kernel='freebsd',
+                    cpu='x86_64',
+                    cpu_family='x86_64',
+                    endian='little',
+                ),
+            ),
+            (
+                'special case for mips64el',
+                textwrap.dedent(
+                    '''
+                    DEB_HOST_ARCH=mips64el
+                    DEB_HOST_ARCH_ABI=abi64
+                    DEB_HOST_ARCH_BITS=64
+                    DEB_HOST_ARCH_CPU=mips64el
+                    DEB_HOST_ARCH_ENDIAN=little
+                    DEB_HOST_ARCH_LIBC=gnu
+                    DEB_HOST_ARCH_OS=linux
+                    DEB_HOST_GNU_CPU=mips64el
+                    DEB_HOST_GNU_SYSTEM=linux-gnuabi64
+                    DEB_HOST_GNU_TYPE=mips64el-linux-gnuabi64
+                    DEB_HOST_MULTIARCH=mips64el-linux-gnuabi64
+                    '''
+                ),
+                '',
+                {'PATH': '/usr/bin'},
+                MachineInfo(
+                    compilers=expected_compilers('mips64el-linux-gnuabi64'),
+                    binaries=expected_binaries('mips64el-linux-gnuabi64'),
+                    properties={},
+                    compile_args={},
+                    link_args={},
+                    cmake={
+                        'CMAKE_C_COMPILER': ['/usr/bin/mips64el-linux-gnuabi64-gcc'],
+                        'CMAKE_CXX_COMPILER': ['/usr/bin/mips64el-linux-gnuabi64-g++'],
+                        'CMAKE_SYSTEM_NAME': 'Linux',
+                        'CMAKE_SYSTEM_PROCESSOR': 'mips64',
+                    },
+                    system='linux',
+                    subsystem='linux',
+                    kernel='linux',
+                    cpu='mips64',
+                    cpu_family='mips64',
+                    endian='little',
+                ),
+            ),
+            (
+                'special case for ppc64el',
+                textwrap.dedent(
+                    '''
+                    DEB_HOST_ARCH=ppc64el
+                    DEB_HOST_ARCH_ABI=base
+                    DEB_HOST_ARCH_BITS=64
+                    DEB_HOST_ARCH_CPU=ppc64el
+                    DEB_HOST_ARCH_ENDIAN=little
+                    DEB_HOST_ARCH_LIBC=gnu
+                    DEB_HOST_ARCH_OS=linux
+                    DEB_HOST_GNU_CPU=powerpc64le
+                    DEB_HOST_GNU_SYSTEM=linux-gnu
+                    DEB_HOST_GNU_TYPE=powerpc64le-linux-gnu
+                    DEB_HOST_MULTIARCH=powerpc64le-linux-gnu
+                    '''
+                ),
+                '',
+                {'PATH': '/usr/bin'},
+                MachineInfo(
+                    compilers=expected_compilers('powerpc64le-linux-gnu'),
+                    binaries=expected_binaries('powerpc64le-linux-gnu'),
+                    properties={},
+                    compile_args={},
+                    link_args={},
+                    cmake={
+                        'CMAKE_C_COMPILER': ['/usr/bin/powerpc64le-linux-gnu-gcc'],
+                        'CMAKE_CXX_COMPILER': ['/usr/bin/powerpc64le-linux-gnu-g++'],
+                        'CMAKE_SYSTEM_NAME': 'Linux',
+                        'CMAKE_SYSTEM_PROCESSOR': 'ppc64le',
+                    },
+                    system='linux',
+                    subsystem='linux',
+                    kernel='linux',
+                    # TODO: Currently ppc64, but native builds have ppc64le
+                    # https://github.com/mesonbuild/meson/issues/13741
+                    cpu='TODO',
+                    cpu_family='ppc64',
+                    endian='little',
+                ),
+            ),
+        ]:
+            with self.subTest(title), \
+                    unittest.mock.patch.dict('os.environ', env, clear=True), \
+                    unittest.mock.patch('mesonbuild.scripts.env2mfile.locate_path') as mock_locate_path:
+                mock_locate_path.side_effect = locate_path
+                options = argparse.Namespace()
+                options.gccsuffix = gccsuffix
+                actual = to_machine_info(dpkg_arch, options)
+
+                if expected.system == 'TODO':
+                    print(f'TODO: {title}: system() -> {actual.system}')
+                else:
+                    self.assertEqual(actual.system, expected.system)
+
+                if expected.subsystem == 'TODO':
+                    print(f'TODO: {title}: subsystem() -> {actual.subsystem}')
+                else:
+                    self.assertEqual(actual.subsystem, expected.subsystem)
+
+                if expected.kernel == 'TODO':
+                    print(f'TODO: {title}: kernel() -> {actual.kernel}')
+                else:
+                    self.assertEqual(actual.kernel, expected.kernel)
+
+                if expected.cpu == 'TODO':
+                    print(f'TODO: {title}: cpu() -> {actual.cpu}')
+                else:
+                    self.assertEqual(actual.cpu, expected.cpu)
+
+                self.assertEqual(actual.cpu_family, expected.cpu_family)
+                self.assertEqual(actual.endian, expected.endian)
+
+                self.assertEqual(actual.compilers, expected.compilers)
+                self.assertEqual(actual.binaries, expected.binaries)
+                self.assertEqual(actual.properties, expected.properties)
+                self.assertEqual(actual.compile_args, expected.compile_args)
+                self.assertEqual(actual.link_args, expected.link_args)
+                self.assertEqual(actual.cmake, expected.cmake)

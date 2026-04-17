@@ -1,3 +1,5 @@
+Description: Disable rootdir tests.
+
 diff --git a/test cases/common/221 fs module/meson.build b/test cases/common/221 fs module/meson.build
 index a7327682..c5f90bbb 100644
 --- a/test cases/common/220 fs module/meson.build	

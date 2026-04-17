@@ -27,18 +27,21 @@ from .exceptions import (
     SubdirDoneRequest,
 )
 
+from .. import mlog
+from . import operator
 from .decorators import FeatureNew
 from .disabler import Disabler, is_disabled
 from .helpers import default_resolve_key, flatten, resolve_second_level_holders, stringifyUserArguments
 from .operator import MesonOperator
 from ._unholder import _unholder
 
-import os, copy, re, pathlib
+import os, copy, hashlib, re, pathlib
 import typing as T
 import textwrap
 
 if T.TYPE_CHECKING:
     from .baseobjects import InterpreterObjectTypeVar, SubProject, TYPE_kwargs, TYPE_var
+    from ..ast import AstVisitor
     from ..interpreter import Interpreter
 
     HolderMapType = T.Dict[
@@ -67,22 +70,27 @@ class InvalidCodeOnVoid(InvalidCode):
 
 
 class InterpreterBase:
-    def __init__(self, source_root: str, subdir: str, subproject: 'SubProject'):
+    def __init__(self, source_root: str, subdir: str, subproject: SubProject, subproject_dir: str, env: environment.Environment):
         self.source_root = source_root
         self.funcs: FunctionType = {}
         self.builtin: T.Dict[str, InterpreterObject] = {}
         # Holder maps store a mapping from an HoldableObject to a class ObjectHolder
         self.holder_map: HolderMapType = {}
         self.bound_holder_map: HolderMapType = {}
+        self.build_def_files: mesonlib.OrderedSet[str] = mesonlib.OrderedSet()
+        self.processed_buildfiles: T.Set[str] = set()
         self.subdir = subdir
         self.root_subdir = subdir
         self.subproject = subproject
+        self.subproject_dir = subproject_dir
+        self.environment = env
+        self.coredata = env.get_coredata()
         self.variables: T.Dict[str, InterpreterObject] = {}
         self.argument_depth = 0
         self.current_lineno = -1
         # Current node set during a function call. This can be used as location
         # when printing a warning message during a method call.
-        self.current_node: mparser.BaseNode = None
+        self.current_node = mparser.BaseNode(-1, -1, 'sentinel')
         # This is set to `version_string` when this statement is evaluated:
         # meson.version().compare_version(version_string)
         # If it was part of a if-clause, it is used to temporally override the
@@ -93,12 +101,21 @@ class InterpreterBase:
         # do nothing in an AST interpreter
         return
 
+    def read_buildfile(self, fname: str, errname: str) -> str:
+        try:
+            with open(fname, encoding='utf-8') as f:
+                return f.read()
+        except UnicodeDecodeError as e:
+            node = mparser.BaseNode(1, 1, errname)
+            raise InvalidCode.from_node(f'Build file failed to parse as unicode: {e}', node=node)
+
     def load_root_meson_file(self) -> None:
-        mesonfile = os.path.join(self.source_root, self.subdir, environment.build_filename)
+        build_filename = os.path.join(self.subdir, environment.build_filename)
+        self.build_def_files.add(build_filename)
+        mesonfile = os.path.join(self.source_root, build_filename)
         if not os.path.isfile(mesonfile):
             raise InvalidArguments(f'Missing Meson file in {mesonfile}')
-        with open(mesonfile, encoding='utf-8') as mf:
-            code = mf.read()
+        code = self.read_buildfile(mesonfile, mesonfile)
         if code.isspace():
             raise InvalidCode('Builder file is empty.')
         assert isinstance(code, str)
@@ -176,7 +193,6 @@ class InterpreterBase:
         while i < len(statements):
             cur = statements[i]
             try:
-                self.current_lineno = cur.lineno
                 self.evaluate_statement(cur)
             except Exception as e:
                 if getattr(e, 'lineno', None) is None:
@@ -198,11 +214,12 @@ class InterpreterBase:
             self.assignment(cur)
         elif isinstance(cur, mparser.MethodNode):
             return self.method_call(cur)
-        elif isinstance(cur, mparser.BaseStringNode):
-            if isinstance(cur, mparser.MultilineFormatStringNode):
-                return self.evaluate_multiline_fstring(cur)
-            elif isinstance(cur, mparser.FormatStringNode):
-                return self.evaluate_fstring(cur)
+        elif isinstance(cur, mparser.StringNode):
+            if cur.is_fstring:
+                if cur.is_multiline:
+                    return self.evaluate_multiline_fstring(cur)
+                else:
+                    return self.evaluate_fstring(cur)
             else:
                 return self._holderify(cur.value)
         elif isinstance(cur, mparser.BooleanNode):
@@ -256,7 +273,7 @@ class InterpreterBase:
     @FeatureNew('dict', '0.47.0')
     def evaluate_dictstatement(self, cur: mparser.DictNode) -> InterpreterObject:
         def resolve_key(key: mparser.BaseNode) -> str:
-            if not isinstance(key, mparser.BaseStringNode):
+            if not isinstance(key, mparser.StringNode):
                 FeatureNew.single_use('Dictionary entry using non literal key', '0.53.0', self.subproject)
             key_holder = self.evaluate_statement(key)
             if key_holder is None:
@@ -328,24 +345,14 @@ class InterpreterBase:
         if isinstance(val2, Disabler):
             return val2
 
-        # New code based on InterpreterObjects
-        operator = {
-            'in': MesonOperator.IN,
-            'notin': MesonOperator.NOT_IN,
-            '==': MesonOperator.EQUALS,
-            '!=': MesonOperator.NOT_EQUALS,
-            '>': MesonOperator.GREATER,
-            '<': MesonOperator.LESS,
-            '>=': MesonOperator.GREATER_EQUALS,
-            '<=': MesonOperator.LESS_EQUALS,
-        }[node.ctype]
+        op = operator.MAPPING[node.ctype]
 
         # Check if the arguments should be reversed for simplicity (this essentially converts `in` to `contains`)
-        if operator in (MesonOperator.IN, MesonOperator.NOT_IN):
+        if op in (MesonOperator.IN, MesonOperator.NOT_IN):
             val1, val2 = val2, val1
 
         val1.current_node = node
-        return self._holderify(val1.operator_call(operator, _unholder(val2)))
+        return self._holderify(val1.operator_call(op, _unholder(val2)))
 
     def evaluate_andstatement(self, cur: mparser.AndNode) -> InterpreterObject:
         l = self.evaluate_statement(cur.left)
@@ -398,15 +405,8 @@ class InterpreterBase:
         if l is None or r is None:
             raise InvalidCodeOnVoid(cur.operation)
 
-        mapping: T.Dict[str, MesonOperator] = {
-            'add': MesonOperator.PLUS,
-            'sub': MesonOperator.MINUS,
-            'mul': MesonOperator.TIMES,
-            'div': MesonOperator.DIV,
-            'mod': MesonOperator.MOD,
-        }
         l.current_node = cur
-        res = l.operator_call(mapping[cur.operation], _unholder(r))
+        res = l.operator_call(operator.MAPPING[cur.operation], _unholder(r))
         return self._holderify(res)
 
     def evaluate_ternary(self, node: mparser.TernaryNode) -> T.Optional[InterpreterObject]:
@@ -424,11 +424,11 @@ class InterpreterBase:
             return self.evaluate_statement(node.falseblock)
 
     @FeatureNew('multiline format strings', '0.63.0')
-    def evaluate_multiline_fstring(self, node: mparser.MultilineFormatStringNode) -> InterpreterObject:
+    def evaluate_multiline_fstring(self, node: mparser.StringNode) -> InterpreterObject:
         return self.evaluate_fstring(node)
 
     @FeatureNew('format strings', '0.58.0')
-    def evaluate_fstring(self, node: T.Union[mparser.FormatStringNode, mparser.MultilineFormatStringNode]) -> InterpreterObject:
+    def evaluate_fstring(self, node: mparser.StringNode) -> InterpreterObject:
         def replace(match: T.Match[str]) -> str:
             var = str(match.group(1))
             try:
@@ -539,12 +539,6 @@ class InterpreterBase:
             return Disabler()
         if not isinstance(obj, InterpreterObject):
             raise InvalidArguments(f'{object_display_name} is not callable.')
-        # TODO: InterpreterBase **really** shouldn't be in charge of checking this
-        if method_name == 'extract_objects':
-            if isinstance(obj, ObjectHolder):
-                self.validate_extraction(obj.held_object)
-            elif not isinstance(obj, Disabler):
-                raise InvalidArguments(f'Invalid operation "extract_objects" on {object_display_name} of type {type(obj).__name__}')
         obj.current_node = self.current_node = node
         res = obj.method_call(method_name, args, kwargs)
         return self._holderify(res) if res is not None else None
@@ -648,8 +642,6 @@ class InterpreterBase:
                 raise mesonlib.MesonBugException(f'set_variable in InterpreterBase called with a non InterpreterObject {variable} of type {type(variable).__name__}')
         if not isinstance(varname, str):
             raise InvalidCode('First argument to set_variable must be a string.')
-        if re.match('[_a-zA-Z][_0-9a-zA-Z]*$', varname) is None:
-            raise InvalidCode('Invalid variable name: ' + varname)
         if varname in self.builtin:
             raise InvalidCode(f'Tried to overwrite internal variable "{varname}"')
         self.variables[varname] = variable
@@ -661,5 +653,74 @@ class InterpreterBase:
             return self.variables[varname]
         raise InvalidCode(f'Unknown variable "{varname}".')
 
-    def validate_extraction(self, buildtarget: mesonlib.HoldableObject) -> None:
-        raise InterpreterException('validate_extraction is not implemented in this context (please file a bug)')
+    def _load_option_file(self) -> None:
+        from .. import optinterpreter  # prevent circular import
+
+        # Load "meson.options" before "meson_options.txt", and produce a warning if
+        # it is being used with an old version. I have added check that if both
+        # exist the warning isn't raised
+        option_file = os.path.join(self.source_root, self.subdir, 'meson.options')
+        old_option_file = os.path.join(self.source_root, self.subdir, 'meson_options.txt')
+
+        if os.path.exists(option_file):
+            if os.path.exists(old_option_file):
+                if os.path.samefile(option_file, old_option_file):
+                    mlog.debug("Not warning about meson.options with version minimum < 1.1 because meson_options.txt also exists")
+                else:
+                    raise mesonlib.MesonException("meson.options and meson_options.txt both exist, but are not the same file.")
+            else:
+                FeatureNew.single_use('meson.options file', '1.1', self.subproject, 'Use meson_options.txt instead')
+        else:
+            option_file = old_option_file
+        if os.path.exists(option_file):
+            with open(option_file, 'rb') as f:
+                # We want fast  not cryptographically secure, this is just to
+                # see if the option file has changed
+                self.coredata.options_files[self.subproject] = (option_file, hashlib.sha1(f.read()).hexdigest())
+            oi = optinterpreter.OptionInterpreter(self.environment.coredata.optstore, self.subproject)
+            oi.process(option_file)
+            self.coredata.optstore.update_project_options(oi.options, self.subproject)
+            self.build_def_files.add(option_file)
+        else:
+            self.coredata.options_files[self.subproject] = None
+
+    def _resolve_subdir(self, rootdir: str, new_subdir: str) -> T.Tuple[str, bool]:
+        subdir = os.path.join(self.subdir, new_subdir)
+        absdir = os.path.join(rootdir, subdir)
+        symlinkless_dir = os.path.realpath(absdir)
+        build_file = os.path.join(symlinkless_dir, environment.build_filename)
+        if build_file in self.processed_buildfiles:
+            return subdir, False
+        self.processed_buildfiles.add(build_file)
+        return subdir, True
+
+    def _evaluate_subdir(self, rootdir: str, subdir: str, visitors: T.Optional[T.Iterable[AstVisitor]] = None) -> bool:
+        buildfilename = os.path.join(subdir, environment.build_filename)
+        self.build_def_files.add(buildfilename)
+
+        absname = os.path.join(rootdir, buildfilename)
+        if not os.path.isfile(absname):
+            return False
+
+        code = self.read_buildfile(absname, buildfilename)
+        try:
+            codeblock = mparser.Parser(code, absname).parse()
+        except mesonlib.MesonException as me:
+            me.file = absname
+            raise me
+        self._evaluate_codeblock(codeblock, subdir, visitors)
+        return True
+
+    def _evaluate_codeblock(self, codeblock: mparser.CodeBlockNode, subdir: str,
+                            visitors: T.Optional[T.Iterable[AstVisitor]] = None) -> None:
+        try:
+            prev_subdir = self.subdir
+            self.subdir = subdir
+            if visitors:
+                for visitor in visitors:
+                    codeblock.accept(visitor)
+            self.evaluate_codeblock(codeblock)
+        except SubdirDoneRequest:
+            pass
+        finally:
+            self.subdir = prev_subdir

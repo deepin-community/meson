@@ -92,9 +92,8 @@ class LinuxCrossArmTests(BaseLinuxCrossTests):
         self.build()
 
     @skipIfNoPkgconfig
+    @skipIfNoExecutable('arm-linux-gnueabihf-pkg-config')
     def test_pkg_config_option(self):
-        if not shutil.which('arm-linux-gnueabihf-pkg-config'):
-            raise unittest.SkipTest('Cross-pkgconfig not found.')
         testdir = os.path.join(self.unit_test_dir, '57 pkg_config_path option')
         self.init(testdir, extra_args=[
             '-Dbuild.pkg_config_path=' + os.path.join(testdir, 'build_extra_path'),
@@ -146,7 +145,7 @@ class LinuxCrossMingwTests(BaseLinuxCrossTests):
         self.meson_cross_files = [os.path.join(testdir, 'broken-cross.txt')]
         # Force tracebacks so we can detect them properly
         env = {'MESON_FORCE_BACKTRACE': '1'}
-        error_message = "An exe_wrapper is needed but was not found. Please define one in cross file and check the command and/or add it to PATH."
+        error_message = "An exe_wrapper is needed for " + self.builddir + "/prog.exe but was not found. Please define one in cross file and check the command and/or add it to PATH."
 
         with self.assertRaises(MesonException) as cm:
             # Must run in-process or we'll get a generic CalledProcessError

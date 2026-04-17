@@ -1,3 +1,5 @@
+Description: Disable OpenMPI in tests.
+
 diff --git a/test cases/frameworks/17 mpi/meson.build b/test cases/frameworks/17 mpi/meson.build
 index 75b463cc..7bf4e7ae 100644
 --- a/test cases/frameworks/17 mpi/meson.build	

@@ -7,6 +7,18 @@ from __future__ import annotations
 import typing as T
 
 
+def api(version: str) -> str:
+    # x.y.z -> x
+    # 0.x.y -> 0.x
+    # 0.0.x -> 0
+    vers = version.split('.')
+    if int(vers[0]) != 0:
+        return vers[0]
+    elif len(vers) >= 2 and int(vers[1]) != 0:
+        return f'0.{vers[1]}'
+    return '0'
+
+
 def convert(cargo_ver: str) -> T.List[str]:
     """Convert a Cargo compatible version into a Meson compatible one.
 
@@ -15,14 +27,27 @@ def convert(cargo_ver: str) -> T.List[str]:
     """
     # Cleanup, just for safety
     cargo_ver = cargo_ver.strip()
+    if not cargo_ver:
+        return []
     cargo_vers = [c.strip() for c in cargo_ver.split(',')]
 
     out: T.List[str] = []
 
     for ver in cargo_vers:
-        # This covers >= and =< as well
         # https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#comparison-requirements
-        if ver.startswith(('>', '<', '=')):
+        # <= 3 allows 3.0.0 where meson version compare does not
+        # So change <= into < with a bumped version
+        if ver.startswith('<='):
+            v = ver[2:].strip().split('.')
+            if len(v) == 1:
+                out.append(f'< {int(v[0]) + 1}')
+            elif len(v) == 2:
+                out.append(f'< {v[0]}.{int(v[1]) + 1}')
+            else:
+                out.append(ver)
+
+        # This covers >= as well
+        elif ver.startswith(('>', '<', '=')):
             out.append(ver)
 
         elif ver.startswith('~'):

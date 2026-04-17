@@ -20,7 +20,7 @@ def parse_generator_expressions(
     '''Parse CMake generator expressions
 
     Most generator expressions are simply ignored for
-    simplicety, however some are required for some common
+    simplicity, however some are required for some common
     use cases.
     '''
 
@@ -170,6 +170,8 @@ def parse_generator_expressions(
         # Evaluate the function
         if func in supported:
             res = supported[func](args)
+        else:
+            mlog.warning(f"Unknown generator expression '$<{func}:{args}>'.", once=True, fatal=False)
 
         return res
 
