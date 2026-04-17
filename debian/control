@@ -2,7 +2,7 @@ Source: meson
 Maintainer: Jussi Pakkanen <jpakkane@gmail.com>
 Section: devel
 Priority: optional
-Standards-Version: 4.6.2
+Standards-Version: 4.7.4
 Homepage: https://mesonbuild.com
 X-Python3-Version: >= 3.7
 Rules-Requires-Root: no
@@ -14,8 +14,9 @@ Build-Depends: debhelper-compat (= 13),
   ninja-build (>= 1.6),
   bash-completion,
 # The following are needed for the unit test suite
+#  python3-pytest-xdist <!nocheck>,
   zlib1g-dev <!nocheck>,
-  pkg-config <!nocheck>,
+  pkgconf <!nocheck>,
   libboost-dev <!nocheck>,
   libboost-thread-dev <!nocheck>,
   libboost-test-dev <!nocheck>,
@@ -37,12 +38,13 @@ Build-Depends: debhelper-compat (= 13),
   default-jdk-headless [!hurd-i386] <!nocheck>,
   valac <!nocheck>,
   gobject-introspection <!nocheck>,
-  libgirepository1.0-dev <!nocheck>,
+  libgirepository-1.0-dev <!nocheck>,
   gfortran <!nocheck>,
   flex <!nocheck>,
   bison <!nocheck>,
-  mono-mcs <!nocheck>,
-  mono-devel <!nocheck>,
+# Removed due to Mono removal issue 1010445
+#  mono-mcs <!nocheck>,
+#  mono-devel <!nocheck>,
   libwxgtk3.2-dev <!nocheck>,
   python3-gi <!nocheck>,
   gtk-doc-tools <!nocheck>,
@@ -51,8 +53,9 @@ Build-Depends: debhelper-compat (= 13),
 # stanza makes dep dep solver install rustc whenever it is available
 # and when not it installs a harmless filler package.
   rustc [i386 amd64 arm64 armhf] <!nocheck> | bash-doc <!nocheck>,
+  bindgen [i386 amd64 arm64 armhf] <!nocheck> | bash-doc <!nocheck>,
   python3-dev <!nocheck>,
-  cython3-legacy <!nocheck>,
+  cython3 <!nocheck>,
 # GDC is available on all platforms but it only
 # works when libgphobos-dev is available
 # and it only exists on a few architectures.
@@ -66,7 +69,7 @@ Build-Depends: debhelper-compat (= 13),
   libsdl2-dev <!nocheck>,
 # OpenMPI tests do not run under pbuilder and the packages are currently
 # (2020-09-10) broken and uninstallable so disable this.
-  openmpi-bin <!nocheck>,
+#  openmpi-bin <!nocheck>,
 #  libopenmpi-dev <!nocheck>,
 # Running OpenMPI executables requires openssh. Yes, really.
   openssh-client <!nocheck>,
@@ -94,7 +97,6 @@ Depends:
  ${misc:Depends},
  ${python3:Depends},
  ninja-build(>=1.6),
- python3-pkg-resources,
  python3-setuptools
 Recommends:
  dpkg-dev,

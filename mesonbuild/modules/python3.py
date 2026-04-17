@@ -7,7 +7,7 @@ import sysconfig
 import typing as T
 
 from .. import mesonlib
-from . import ExtensionModule, ModuleInfo, ModuleState
+from . import ExtensionModule, ModuleInfo
 from ..build import (
     BuildTarget, CustomTarget, CustomTargetIndex, ExtractedObjects,
     GeneratedList, SharedModule, StructuredSources, known_shmod_kwargs
@@ -17,6 +17,7 @@ from ..interpreterbase import typed_kwargs, typed_pos_args, noPosargs, noKwargs,
 from ..programs import ExternalProgram
 
 if T.TYPE_CHECKING:
+    from . import ModuleState
     from ..interpreter.interpreter import BuildTargetSource
     from ..interpreter.kwargs import SharedModule as SharedModuleKW
 
@@ -39,7 +40,7 @@ class Python3Module(ExtensionModule):
 
     @permittedKwargs(known_shmod_kwargs - {'name_prefix', 'name_suffix'})
     @typed_pos_args('python3.extension_module', str, varargs=(str, mesonlib.File, CustomTarget, CustomTargetIndex, GeneratedList, StructuredSources, ExtractedObjects, BuildTarget))
-    @typed_kwargs('python3.extension_module', *_MOD_KWARGS, allow_unknown=True)
+    @typed_kwargs('python3.extension_module', *_MOD_KWARGS)
     def extension_module(self, state: ModuleState, args: T.Tuple[str, T.List[BuildTargetSource]], kwargs: SharedModuleKW):
         host_system = state.environment.machines.host.system
         if host_system == 'darwin':
@@ -49,7 +50,7 @@ class Python3Module(ExtensionModule):
             # On Windows the extension is pyd for some unexplainable reason.
             suffix = 'pyd'
         else:
-            suffix = []
+            suffix = None
         kwargs['name_prefix'] = ''
         kwargs['name_suffix'] = suffix
         return self.interpreter.build_target(state.current_node, args, kwargs, SharedModule)

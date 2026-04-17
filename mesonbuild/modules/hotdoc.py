@@ -14,12 +14,13 @@ from ..build import CustomTarget, CustomTargetIndex
 from ..dependencies import Dependency, InternalDependency
 from ..interpreterbase import (
     InvalidArguments, noPosargs, noKwargs, typed_kwargs, FeatureDeprecated,
-    ContainerTypeInfo, KwargInfo, typed_pos_args
+    ContainerTypeInfo, KwargInfo, typed_pos_args, InterpreterObject
 )
 from ..interpreter.interpreterobjects import _CustomTargetHolder
 from ..interpreter.type_checking import NoneType
 from ..mesonlib import File, MesonException
 from ..programs import ExternalProgram
+from ..options import OptionKey
 
 if T.TYPE_CHECKING:
     from typing_extensions import TypedDict
@@ -145,31 +146,6 @@ class HotdocTargetBuilder:
             self.check_extra_arg_type(arg, value)
             self.set_arg_value(option, value)
 
-    def get_value(self, types, argname, default=None, value_processor=None,
-                  mandatory=False, force_list=False):
-        if not isinstance(types, list):
-            types = [types]
-        try:
-            uvalue = value = self.kwargs.pop(argname)
-            if value_processor:
-                value = value_processor(value)
-
-            for t in types:
-                if isinstance(value, t):
-                    if force_list and not isinstance(value, list):
-                        return [value], uvalue
-                    return value, uvalue
-            raise MesonException(f"{argname} field value {value} is not valid,"
-                                 f" valid types are {types}")
-        except KeyError:
-            if mandatory:
-                raise MesonException(f"{argname} mandatory field not found")
-
-            if default is not None:
-                return default, default
-
-        return None, None
-
     def add_extension_paths(self, paths: T.Union[T.List[str], T.Set[str]]) -> None:
         for path in paths:
             if path in self._extra_extension_paths:
@@ -208,7 +184,7 @@ class HotdocTargetBuilder:
             elif isinstance(dep, (build.StaticLibrary, build.SharedLibrary)):
                 self.extra_depends.append(dep)
                 for incd in dep.get_include_dirs():
-                    cflags.update(incd.get_incdirs())
+                    cflags.update(incd.incdirs)
             elif isinstance(dep, HotdocTarget):
                 # Recurse in hotdoc target dependencies
                 self.process_dependencies(dep.get_target_dependencies())
@@ -243,10 +219,7 @@ class HotdocTargetBuilder:
                 arg = arg.absolute_path(self.state.environment.get_source_dir(),
                                         self.state.environment.get_build_dir())
             elif isinstance(arg, build.IncludeDirs):
-                for inc_dir in arg.get_incdirs():
-                    cmd.append(os.path.join(self.sourcedir, arg.get_curdir(), inc_dir))
-                    cmd.append(os.path.join(self.builddir, arg.get_curdir(), inc_dir))
-
+                cmd.extend(arg.abs_string_list(self.sourcedir, self.builddir))
                 continue
             elif isinstance(arg, (build.BuildTarget, CustomTarget)):
                 self.extra_depends.append(arg)
@@ -330,7 +303,7 @@ class HotdocTargetBuilder:
         for path in self.include_paths:
             self.cmd.extend(['--include-path', path])
 
-        if self.state.environment.coredata.get_option(mesonlib.OptionKey('werror', subproject=self.state.subproject)):
+        if self.state.environment.coredata.optstore.get_value_for(OptionKey('werror', subproject=self.state.subproject)):
             self.cmd.append('--fatal-warnings')
         self.generate_hotdoc_config()
 
@@ -382,12 +355,9 @@ class HotdocTargetBuilder:
 
 
 class HotdocTargetHolder(_CustomTargetHolder['HotdocTarget']):
-    def __init__(self, target: HotdocTarget, interp: Interpreter):
-        super().__init__(target, interp)
-        self.methods.update({'config_path': self.config_path_method})
-
     @noPosargs
     @noKwargs
+    @InterpreterObject.method('config_path')
     def config_path_method(self, *args: T.Any, **kwargs: T.Any) -> str:
         conf = self.held_object.hotdoc_conf.absolute_path(self.interpreter.environment.source_dir,
                                                           self.interpreter.environment.build_dir)

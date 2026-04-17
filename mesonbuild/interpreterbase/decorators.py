@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from .. import mesonlib, mlog
+from .. import coredata, mesonlib, mlog
 from .disabler import Disabler
 from .exceptions import InterpreterException, InvalidArguments
 from ._unholder import _unholder
@@ -59,19 +59,6 @@ def noKwargs(f: TV_func) -> TV_func:
         kwargs = get_callee_args(wrapped_args)[2]
         if kwargs:
             raise InvalidArguments('Function does not take keyword arguments.')
-        return f(*wrapped_args, **wrapped_kwargs)
-    return T.cast('TV_func', wrapped)
-
-def stringArgs(f: TV_func) -> TV_func:
-    @wraps(f)
-    def wrapped(*wrapped_args: T.Any, **wrapped_kwargs: T.Any) -> T.Any:
-        args = get_callee_args(wrapped_args)[1]
-        if not isinstance(args, list):
-            mlog.debug('Not a list:', str(args))
-            raise InvalidArguments('Argument not a list.')
-        if not all(isinstance(s, str) for s in args):
-            mlog.debug('Element not a string:', str(args))
-            raise InvalidArguments('Arguments must be strings.')
         return f(*wrapped_args, **wrapped_kwargs)
     return T.cast('TV_func', wrapped)
 
@@ -365,6 +352,12 @@ class KwargInfo(T.Generic[_T]):
         added in.
     :param not_set_warning: A warning message that is logged if the kwarg is not
         set by the user.
+    :param feature_validator: A callable returning an iterable of FeatureNew | FeatureDeprecated objects.
+    :param extra_types:
+        A mapping of types to a callable that is passed that type and returns an
+        error message. These types are specifically *not* added to the general
+        error message
+    :param as_default: Extra values to treat as empty values. These are always considered to be broken.
     """
     def __init__(self, name: str,
                  types: T.Union[T.Type[_T], T.Tuple[T.Union[T.Type[_T], ContainerTypeInfo], ...], ContainerTypeInfo],
@@ -376,9 +369,12 @@ class KwargInfo(T.Generic[_T]):
                  deprecated: T.Optional[str] = None,
                  deprecated_message: T.Optional[str] = None,
                  deprecated_values: T.Optional[T.Dict[T.Union[_T, ContainerTypeInfo, type], T.Union[str, T.Tuple[str, str]]]] = None,
+                 feature_validator: T.Optional[T.Callable[[_T], T.Iterable[FeatureCheckBase]]] = None,
                  validator: T.Optional[T.Callable[[T.Any], T.Optional[str]]] = None,
                  convertor: T.Optional[T.Callable[[_T], object]] = None,
-                 not_set_warning: T.Optional[str] = None):
+                 not_set_warning: T.Optional[str] = None,
+                 extra_types: T.Optional[T.Mapping[T.Type, T.Callable[[object], str]]] = None,
+                 as_default: T.Optional[T.List[T.Tuple[object, T.Union[str, T.Tuple[str, str]]]]] = None):
         self.name = name
         self.types = types
         self.required = required
@@ -387,12 +383,15 @@ class KwargInfo(T.Generic[_T]):
         self.since = since
         self.since_message = since_message
         self.since_values = since_values
+        self.feature_validator = feature_validator
         self.deprecated = deprecated
         self.deprecated_message = deprecated_message
         self.deprecated_values = deprecated_values
         self.validator = validator
         self.convertor = convertor
         self.not_set_warning = not_set_warning
+        self.extra_types = extra_types if extra_types is not None else {}
+        self.as_default = as_default
 
     def evolve(self, *,
                name: T.Union[str, _NULL_T] = _NULL,
@@ -405,8 +404,12 @@ class KwargInfo(T.Generic[_T]):
                deprecated: T.Union[str, None, _NULL_T] = _NULL,
                deprecated_message: T.Union[str, None, _NULL_T] = _NULL,
                deprecated_values: T.Union[T.Dict[T.Union[_T, ContainerTypeInfo, type], T.Union[str, T.Tuple[str, str]]], None, _NULL_T] = _NULL,
+               feature_validator: T.Union[T.Callable[[_T], T.Iterable[FeatureCheckBase]], None, _NULL_T] = _NULL,
                validator: T.Union[T.Callable[[_T], T.Optional[str]], None, _NULL_T] = _NULL,
-               convertor: T.Union[T.Callable[[_T], TYPE_var], None, _NULL_T] = _NULL) -> 'KwargInfo':
+               convertor: T.Union[T.Callable[[_T], object], None, _NULL_T] = _NULL,
+               extra_types: T.Union[T.Mapping[T.Type, T.Callable[[object], str]], None, _NULL_T] = _NULL,
+               as_default: T.Union[T.List[T.Tuple[object, T.Union[str, T.Tuple[str, str]]]], None, _NULL_T] = _NULL
+               ) -> 'KwargInfo':
         """Create a shallow copy of this KwargInfo, with modifications.
 
         This allows us to create a new copy of a KwargInfo with modifications.
@@ -430,8 +433,11 @@ class KwargInfo(T.Generic[_T]):
             deprecated=deprecated if not isinstance(deprecated, _NULL_T) else self.deprecated,
             deprecated_message=deprecated_message if not isinstance(deprecated_message, _NULL_T) else self.deprecated_message,
             deprecated_values=deprecated_values if not isinstance(deprecated_values, _NULL_T) else self.deprecated_values,
+            feature_validator=feature_validator if not isinstance(feature_validator, _NULL_T) else self.feature_validator,
             validator=validator if not isinstance(validator, _NULL_T) else self.validator,
             convertor=convertor if not isinstance(convertor, _NULL_T) else self.convertor,
+            extra_types=extra_types if not isinstance(extra_types, _NULL_T) else self.extra_types,
+            as_default=as_default if not isinstance(as_default, _NULL_T) else self.as_default,
         )
 
 
@@ -506,7 +512,7 @@ def typed_kwargs(name: str, *types: KwargInfo, allow_unknown: bool = False) -> T
                         if n in value:
                             warning = f'value "{n}" in list'
                     elif isinstance(value, dict):
-                        if n in value.keys():
+                        if n in value:
                             warning = f'value "{n}" in dict keys'
                     elif n == value:
                         warning = f'value "{n}"'
@@ -534,16 +540,42 @@ def typed_kwargs(name: str, *types: KwargInfo, allow_unknown: bool = False) -> T
                     if info.deprecated:
                         feature_name = info.name + ' arg in ' + name
                         FeatureDeprecated.single_use(feature_name, info.deprecated, subproject, info.deprecated_message, location=node)
+                    if info.as_default:
+                        found = mesonlib.first(info.as_default, lambda x: value == x[0])
+                        if found is not None:
+                            msg = found[1]
+                            extra = ''
+                            if isinstance(msg, tuple):
+                                msg, extra = msg
+                            FeatureBroken.single_use(f"Using '{value}' as an empty value in {info.name}", msg, subproject, extra, node)
+                            value = copy.copy(info.default)
                     if info.listify:
                         kwargs[info.name] = value = mesonlib.listify(value)
                     if not check_value_type(types_tuple, value):
+                        extra_desc: T.List[str] = []
+                        if info.extra_types:
+                            if isinstance(value, list):
+                                for (t, cb), v in itertools.product(info.extra_types.items(), value):
+                                    if isinstance(v, t):
+                                        extra_desc.append(cb(v))
+                            else:
+                                for t, cb in info.extra_types.items():
+                                    if isinstance(value, t):
+                                        extra_desc.append(cb(value))
+
                         shouldbe = types_description(types_tuple)
+                        if extra_desc:
+                            shouldbe = '{}. {}'.format(shouldbe, '. '.join(extra_desc))
                         raise InvalidArguments(f'{name} keyword argument {info.name!r} was of type {raw_description(value)} but should have been {shouldbe}')
 
                     if info.validator is not None:
                         msg = info.validator(value)
                         if msg is not None:
                             raise InvalidArguments(f'{name} keyword argument "{info.name}" {msg}')
+
+                    if info.feature_validator is not None:
+                        for each in info.feature_validator(value):
+                            each.use(subproject, node)
 
                     if info.deprecated_values is not None:
                         emit_feature_change(info.deprecated_values, FeatureDeprecated)
@@ -585,7 +617,7 @@ class FeatureCheckBase(metaclass=abc.ABCMeta):
         self.extra_message = extra_message
 
     @staticmethod
-    def get_target_version(subproject: str) -> str:
+    def get_target_version(subproject: str) -> T.Union[str, mesonlib.NoProjectVersion]:
         # Don't do any checks if project() has not been parsed yet
         if subproject not in mesonlib.project_meson_versions:
             return ''
@@ -593,7 +625,7 @@ class FeatureCheckBase(metaclass=abc.ABCMeta):
 
     @staticmethod
     @abc.abstractmethod
-    def check_version(target_version: str, feature_version: str) -> bool:
+    def check_version(target_version: T.Union[str, mesonlib.NoProjectVersion], feature_version: str) -> bool:
         pass
 
     def use(self, subproject: 'SubProject', location: T.Optional['mparser.BaseNode'] = None) -> None:
@@ -642,15 +674,15 @@ class FeatureCheckBase(metaclass=abc.ABCMeta):
         if '\n' in warning_str:
             mlog.warning(warning_str)
 
-    def log_usage_warning(self, tv: str, location: T.Optional['mparser.BaseNode']) -> None:
+    def log_usage_warning(self, tv: T.Union[str, mesonlib.NoProjectVersion], location: T.Optional['mparser.BaseNode']) -> None:
         raise InterpreterException('log_usage_warning not implemented')
 
     @staticmethod
-    def get_warning_str_prefix(tv: str) -> str:
+    def get_warning_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
         raise InterpreterException('get_warning_str_prefix not implemented')
 
     @staticmethod
-    def get_notice_str_prefix(tv: str) -> str:
+    def get_notice_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
         raise InterpreterException('get_notice_str_prefix not implemented')
 
     def __call__(self, f: TV_func) -> TV_func:
@@ -679,20 +711,32 @@ class FeatureNew(FeatureCheckBase):
     feature_registry = {}
 
     @staticmethod
-    def check_version(target_version: str, feature_version: str) -> bool:
-        return mesonlib.version_compare_condition_with_min(target_version, feature_version)
+    def check_version(target_version: T.Union[str, mesonlib.NoProjectVersion], feature_version: str) -> bool:
+        if isinstance(target_version, str):
+            return mesonlib.version_compare_condition_with_min(target_version, feature_version)
+        else:
+            # Warn for anything newer than the current semver base slot.
+            major = coredata.version.split('.', maxsplit=1)[0]
+            return mesonlib.version_compare(feature_version, f'<{major}.0')
 
     @staticmethod
-    def get_warning_str_prefix(tv: str) -> str:
-        return f'Project specifies a minimum meson_version \'{tv}\' but uses features which were added in newer versions:'
+    def get_warning_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
+        if isinstance(tv, str):
+            return f'Project specifies a minimum meson_version \'{tv}\' but uses features which were added in newer versions:'
+        else:
+            return 'Project specifies no minimum version but uses features which were added in versions:'
 
     @staticmethod
-    def get_notice_str_prefix(tv: str) -> str:
+    def get_notice_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
         return ''
 
-    def log_usage_warning(self, tv: str, location: T.Optional['mparser.BaseNode']) -> None:
+    def log_usage_warning(self, tv: T.Union[str, mesonlib.NoProjectVersion], location: T.Optional['mparser.BaseNode']) -> None:
+        if isinstance(tv, str):
+            prefix = f'Project targets {tv!r}'
+        else:
+            prefix = 'Project does not target a minimum version'
         args = [
-            'Project targets', f"'{tv}'",
+            prefix,
             'but uses feature introduced in',
             f"'{self.feature_version}':",
             f'{self.feature_name}.',
@@ -711,21 +755,29 @@ class FeatureDeprecated(FeatureCheckBase):
     emit_notice = True
 
     @staticmethod
-    def check_version(target_version: str, feature_version: str) -> bool:
-        # For deprecation checks we need to return the inverse of FeatureNew checks
-        return not mesonlib.version_compare_condition_with_min(target_version, feature_version)
+    def check_version(target_version: T.Union[str, mesonlib.NoProjectVersion], feature_version: str) -> bool:
+        if isinstance(target_version, str):
+            # For deprecation checks we need to return the inverse of FeatureNew checks
+            return not mesonlib.version_compare_condition_with_min(target_version, feature_version)
+        else:
+            # Always warn for functionality deprecated in the current semver slot (i.e. the current version).
+            return False
 
     @staticmethod
-    def get_warning_str_prefix(tv: str) -> str:
+    def get_warning_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
         return 'Deprecated features used:'
 
     @staticmethod
-    def get_notice_str_prefix(tv: str) -> str:
+    def get_notice_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
         return 'Future-deprecated features used:'
 
-    def log_usage_warning(self, tv: str, location: T.Optional['mparser.BaseNode']) -> None:
+    def log_usage_warning(self, tv: T.Union[str, mesonlib.NoProjectVersion], location: T.Optional['mparser.BaseNode']) -> None:
+        if isinstance(tv, str):
+            prefix = f'Project targets {tv!r}'
+        else:
+            prefix = 'Project does not target a minimum version'
         args = [
-            'Project targets', f"'{tv}'",
+            prefix,
             'but uses feature deprecated since',
             f"'{self.feature_version}':",
             f'{self.feature_name}.',
@@ -745,19 +797,19 @@ class FeatureBroken(FeatureCheckBase):
     unconditional = True
 
     @staticmethod
-    def check_version(target_version: str, feature_version: str) -> bool:
+    def check_version(target_version: T.Union[str, mesonlib.NoProjectVersion], feature_version: str) -> bool:
         # always warn for broken stuff
         return False
 
     @staticmethod
-    def get_warning_str_prefix(tv: str) -> str:
+    def get_warning_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
         return 'Broken features used:'
 
     @staticmethod
-    def get_notice_str_prefix(tv: str) -> str:
+    def get_notice_str_prefix(tv: T.Union[str, mesonlib.NoProjectVersion]) -> str:
         return ''
 
-    def log_usage_warning(self, tv: str, location: T.Optional['mparser.BaseNode']) -> None:
+    def log_usage_warning(self, tv: T.Union[str, mesonlib.NoProjectVersion], location: T.Optional['mparser.BaseNode']) -> None:
         args = [
             'Project uses feature that was always broken,',
             'and is now deprecated since',

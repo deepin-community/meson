@@ -31,8 +31,12 @@ class DataSizes:
             p = '<'
         else:
             p = '>'
+        self.Char = p + 'c'
+        self.CharSize = 1
         self.Half = p + 'h'
         self.HalfSize = 2
+        self.Section = p + 'h'
+        self.SectionSize = 2
         self.Word = p + 'I'
         self.WordSize = 4
         self.Sword = p + 'i'
@@ -70,6 +74,24 @@ class DynamicEntry(DataSizes):
         else:
             ofile.write(struct.pack(self.Sword, self.d_tag))
             ofile.write(struct.pack(self.Word, self.val))
+
+class DynsymEntry(DataSizes):
+    def __init__(self, ifile: T.BinaryIO, ptrsize: int, is_le: bool) -> None:
+        super().__init__(ptrsize, is_le)
+        is_64 = ptrsize == 64
+        self.st_name = struct.unpack(self.Word, ifile.read(self.WordSize))[0]
+        if is_64:
+            self.st_info = struct.unpack(self.Char, ifile.read(self.CharSize))[0]
+            self.st_other = struct.unpack(self.Char, ifile.read(self.CharSize))[0]
+            self.st_shndx = struct.unpack(self.Section, ifile.read(self.SectionSize))[0]
+            self.st_value = struct.unpack(self.Addr, ifile.read(self.AddrSize))[0]
+            self.st_size = struct.unpack(self.XWord, ifile.read(self.XWordSize))[0]
+        else:
+            self.st_value = struct.unpack(self.Addr, ifile.read(self.AddrSize))[0]
+            self.st_size = struct.unpack(self.Word, ifile.read(self.WordSize))[0]
+            self.st_info = struct.unpack(self.Char, ifile.read(self.CharSize))[0]
+            self.st_other = struct.unpack(self.Char, ifile.read(self.CharSize))[0]
+            self.st_shndx = struct.unpack(self.Section, ifile.read(self.SectionSize))[0]
 
 class SectionHeader(DataSizes):
     def __init__(self, ifile: T.BinaryIO, ptrsize: int, is_le: bool) -> None:
@@ -115,6 +137,8 @@ class Elf(DataSizes):
         self.verbose = verbose
         self.sections: T.List[SectionHeader] = []
         self.dynamic: T.List[DynamicEntry] = []
+        self.dynsym: T.List[DynsymEntry] = []
+        self.dynsym_strings: T.List[str] = []
         self.open_bf(bfile)
         try:
             (self.ptrsize, self.is_le) = self.detect_elf_type()
@@ -122,6 +146,8 @@ class Elf(DataSizes):
             self.parse_header()
             self.parse_sections()
             self.parse_dynamic()
+            self.parse_dynsym()
+            self.parse_dynsym_strings()
         except (struct.error, RuntimeError):
             self.close_bf()
             raise
@@ -231,6 +257,23 @@ class Elf(DataSizes):
             self.dynamic.append(e)
             if e.d_tag == 0:
                 break
+
+    def parse_dynsym(self) -> None:
+        sec = self.find_section(b'.dynsym')
+        if sec is None:
+            return
+        self.bf.seek(sec.sh_offset)
+        for i in range(sec.sh_size // sec.sh_entsize):
+            e = DynsymEntry(self.bf, self.ptrsize, self.is_le)
+            self.dynsym.append(e)
+
+    def parse_dynsym_strings(self) -> None:
+        sec = self.find_section(b'.dynstr')
+        if sec is None:
+            return
+        for i in self.dynsym:
+            self.bf.seek(sec.sh_offset + i.st_name)
+            self.dynsym_strings.append(self.read_str().decode())
 
     @generate_list
     def get_section_names(self) -> T.Generator[str, None, None]:
@@ -353,12 +396,48 @@ class Elf(DataSizes):
             self.bf.write(new_rpath)
             self.bf.write(b'\0')
 
+    def clean_rpath_entry_string(self, entrynum: int) -> None:
+        # Get the rpath string
+        offset = self.get_entry_offset(entrynum)
+        self.bf.seek(offset)
+        rpath_string = self.read_str().decode()
+        reused_str = ''
+
+        # Inspect the dyn strings and check if our rpath string
+        # ends with one of them.
+        # This is to handle a subtle optimization of the linker
+        # where one of the dyn function name offset in the dynstr
+        # table might be set at the an offset of the rpath string.
+        # Example:
+        #
+        # rpath        offset = 1314 string = /usr/lib/foo
+        # dym function offset = 1322 string = foo
+        #
+        # In the following case, the dym function string offset is
+        # placed at the offset +10 of the rpath.
+        # To correctly clear the rpath entry AND keep normal
+        # functionality of this optimization (and the binary),
+        # parse the maximum string we can remove from the rpath entry.
+        #
+        # Since strings MUST be null terminated, we can always check
+        # if the rpath string ends with the dyn function string and
+        # calculate what we can actually remove accordingly.
+        for dynsym_string in self.dynsym_strings:
+            if rpath_string.endswith(dynsym_string):
+                if len(dynsym_string) > len(reused_str):
+                    reused_str = dynsym_string
+
+        # Seek back to start of string
+        self.bf.seek(offset)
+        self.bf.write(b'X' * (len(rpath_string) - len(reused_str)))
+
     def remove_rpath_entry(self, entrynum: int) -> None:
         sec = self.find_section(b'.dynamic')
         if sec is None:
             return None
         for (i, entry) in enumerate(self.dynamic):
             if entry.d_tag == entrynum:
+                self.clean_rpath_entry_string(entrynum)
                 rpentry = self.dynamic[i]
                 rpentry.d_tag = 0
                 self.dynamic = self.dynamic[:i] + self.dynamic[i + 1:] + [rpentry]
@@ -379,11 +458,14 @@ def fix_elf(fname: str, rpath_dirs_to_remove: T.Set[bytes], new_rpath: T.Optiona
             # note: e.get_rpath() and e.get_runpath() may be useful
             e.fix_rpath(fname, rpath_dirs_to_remove, new_rpath)
 
-def get_darwin_rpaths_to_remove(fname: str) -> T.List[str]:
+def get_darwin_rpaths(fname: str) -> OrderedSet[str]:
     p, out, _ = Popen_safe(['otool', '-l', fname], stderr=subprocess.DEVNULL)
     if p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, p.args, out)
-    result = []
+    # Need to deduplicate rpaths, as macOS's install_name_tool
+    # is *very* allergic to duplicate -delete_rpath arguments
+    # when calling depfixer on installation.
+    result: OrderedSet[str] = OrderedSet()
     current_cmd = 'FOOBAR'
     for line in out.split('\n'):
         line = line.strip()
@@ -394,46 +476,35 @@ def get_darwin_rpaths_to_remove(fname: str) -> T.List[str]:
             current_cmd = value
         if key == 'path' and current_cmd == 'LC_RPATH':
             rp = value.split('(', 1)[0].strip()
-            result.append(rp)
+            result.add(rp)
     return result
 
-def fix_darwin(fname: str, new_rpath: str, final_path: str, install_name_mappings: T.Dict[str, str]) -> None:
+def fix_darwin(fname: str, rpath_dirs_to_remove: T.Set[bytes], new_rpath: str, final_path: str, install_name_mappings: T.Dict[str, str]) -> None:
     try:
-        rpaths = get_darwin_rpaths_to_remove(fname)
+        old_rpaths = get_darwin_rpaths(fname)
     except subprocess.CalledProcessError:
         # Otool failed, which happens when invoked on a
         # non-executable target. Just return.
         return
+    new_rpaths: OrderedSet[str] = OrderedSet()
+    if new_rpath:
+        new_rpaths.update(new_rpath.split(':'))
+    # filter out build-only rpath entries, like in
+    # fix_rpathtype_entry
+    remove_rpaths = [x.decode('utf8') for x in rpath_dirs_to_remove]
+    for rpath_dir in old_rpaths:
+        if rpath_dir and rpath_dir not in remove_rpaths:
+            new_rpaths.add(rpath_dir)
     try:
         args = []
-        if rpaths:
-            # TODO: fix this properly, not totally clear how
-            #
-            # removing rpaths from binaries on macOS has tons of
-            # weird edge cases. For instance, if the user provided
-            # a '-Wl,-rpath' argument in LDFLAGS that happens to
-            # coincide with an rpath generated from a dependency,
-            # this would cause installation failures, as meson would
-            # generate install_name_tool calls with two identical
-            # '-delete_rpath' arguments, which install_name_tool
-            # fails on. Because meson itself ensures that it never
-            # adds duplicate rpaths, duplicate rpaths necessarily
-            # come from user variables. The idea of using OrderedSet
-            # is to remove *at most one* duplicate RPATH entry. This
-            # is not optimal, as it only respects the user's choice
-            # partially: if they provided a non-duplicate '-Wl,-rpath'
-            # argument, it gets removed, if they provided a duplicate
-            # one, it remains in the final binary. A potentially optimal
-            # solution would split all user '-Wl,-rpath' arguments from
-            # LDFLAGS, and later add them back with '-add_rpath'.
-            for rp in OrderedSet(rpaths):
-                args += ['-delete_rpath', rp]
-            subprocess.check_call(['install_name_tool', fname] + args,
-                                  stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-        args = []
-        if new_rpath:
-            args += ['-add_rpath', new_rpath]
+        # compute diff, translate it into -delete_rpath and -add_rpath
+        # calls
+        for path in new_rpaths:
+            if path not in old_rpaths:
+                args += ['-add_rpath', path]
+        for path in old_rpaths:
+            if path not in new_rpaths:
+                args += ['-delete_rpath', path]
         # Rewrite -install_name @rpath/libfoo.dylib to /path/to/libfoo.dylib
         if fname.endswith('dylib'):
             args += ['-id', final_path]
@@ -492,4 +563,4 @@ def fix_rpath(fname: str, rpath_dirs_to_remove: T.Set[bytes], new_rpath: T.Union
     if INSTALL_NAME_TOOL:
         if isinstance(new_rpath, bytes):
             new_rpath = new_rpath.decode('utf8')
-        fix_darwin(fname, new_rpath, final_path, install_name_mappings)
+        fix_darwin(fname, rpath_dirs_to_remove, new_rpath, final_path, install_name_mappings)

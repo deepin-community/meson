@@ -14,12 +14,12 @@ import mesonbuild.dependencies.factory
 import mesonbuild.envconfig
 import mesonbuild.environment
 import mesonbuild.coredata
+import mesonbuild.options
 import mesonbuild.modules.gnome
 from mesonbuild.interpreter import Interpreter
 from mesonbuild.ast import AstInterpreter
-from mesonbuild.mesonlib import (
-    MachineChoice, OptionKey
-)
+from mesonbuild.mesonlib import MachineChoice
+from mesonbuild.options import OptionKey
 from mesonbuild.compilers import (
     detect_c_compiler, detect_cpp_compiler
 )
@@ -138,9 +138,15 @@ class DataTests(unittest.TestCase):
             self.assertEqual(len(found_entries & options), 0)
             found_entries |= options
 
+        # TODO: put the module name back in the OptionKey
+        def remove_module_name(key: OptionKey) -> OptionKey:
+            if '.' in key.name:
+                return key.evolve(name=key.name.split('.', 1)[1])
+            return key
+
         self.assertEqual(found_entries, {
-            *(str(k.evolve(module=None)) for k in mesonbuild.coredata.BUILTIN_OPTIONS),
-            *(str(k.evolve(module=None)) for k in mesonbuild.coredata.BUILTIN_OPTIONS_PER_MACHINE),
+            *(str(remove_module_name(k)) for k in mesonbuild.options.BUILTIN_OPTIONS),
+            *(str(remove_module_name(k)) for k in mesonbuild.options.BUILTIN_OPTIONS_PER_MACHINE),
         })
 
         # Check that `buildtype` table inside `Core options` matches how
@@ -161,10 +167,10 @@ class DataTests(unittest.TestCase):
                 debug = False
             else:
                 raise RuntimeError(f'Invalid debug value {debug!r} in row:\n{m.group()}')
-            env.coredata.set_option(OptionKey('buildtype'), buildtype)
-            self.assertEqual(env.coredata.options[OptionKey('buildtype')].value, buildtype)
-            self.assertEqual(env.coredata.options[OptionKey('optimization')].value, opt)
-            self.assertEqual(env.coredata.options[OptionKey('debug')].value, debug)
+            env.coredata.optstore.set_option(OptionKey('buildtype'), buildtype)
+            self.assertEqual(env.coredata.optstore.get_value_for('buildtype'), buildtype)
+            self.assertEqual(env.coredata.optstore.get_value_for('optimization'), opt)
+            self.assertEqual(env.coredata.optstore.get_value_for('debug'), debug)
 
     def test_cpu_families_documented(self):
         with open("docs/markdown/Reference-tables.md", encoding='utf-8') as f:
@@ -177,7 +183,7 @@ class DataTests(unittest.TestCase):
         arches = [m.group(1) for m in re.finditer(r"^\| (\w+) +\|", content, re.MULTILINE)]
         # Drop the header
         arches = set(arches[1:])
-        self.assertEqual(arches, set(mesonbuild.environment.known_cpu_families))
+        self.assertEqual(arches, set(mesonbuild.envconfig.known_cpu_families))
 
     def test_markdown_files_in_sitemap(self):
         '''
@@ -201,7 +207,7 @@ class DataTests(unittest.TestCase):
             html = f.read().lower()
         self.assertIsNotNone(html)
         for f in Path('mesonbuild/modules').glob('*.py'):
-            if f.name in {'modtest.py', 'qt.py', '__init__.py'}:
+            if f.name.startswith('_') or f.name == 'modtest.py':
                 continue
             name = f'{f.stem}-module.html'
             name = name.replace('unstable_', '')
@@ -240,5 +246,5 @@ class DataTests(unittest.TestCase):
         del os.environ['MESON_RUNNING_IN_PROJECT_TESTS']
         env = get_fake_env()
         interp = Interpreter(FakeBuild(env))
-        astint = AstInterpreter('.', '', '')
+        astint = AstInterpreter('.', '', '', '', env)
         self.assertEqual(set(interp.funcs.keys()), set(astint.funcs.keys()))

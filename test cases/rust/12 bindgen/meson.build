@@ -1,4 +1,4 @@
-# SPDX-license-identifer: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 # Copyright © 2021-2024 Intel Corporation
 
 project(
@@ -15,7 +15,7 @@ endif
 cc_id = meson.get_compiler('c').get_id()
 compiler_specific_args = []
 if cc_id == 'gcc'
-  compiler_specific_args = ['-mtls-dialect=gnu2']
+  compiler_specific_args = ['-fipa-pta']
 elif cc_id == 'msvc'
   compiler_specific_args = ['/fp:fast']
 endif
@@ -66,20 +66,7 @@ rust_bin = executable(
 test('main', rust_bin)
 
 # Test a generated header
-gen_h = custom_target(
-  'gen.h',
-  command : [find_program('src/gen_header.py'), '@INPUT@', '@OUTPUT@'],
-  output : 'gen.h',
-  input : 'src/header.h'
-)
-
-gen2_h = custom_target(
-  'other.h',
-  command : [find_program('src/gen_header.py'), '@INPUT@', '@OUTPUT@'],
-  output : 'other.h',
-  input : 'include/other.h'
-)
-
+subdir('gen')
 gen_rs = rust.bindgen(
   input : [gen_h, gen2_h],
   output : 'gen.rs',
@@ -105,9 +92,9 @@ if prog_bindgen.version().version_compare('>= 0.65')
     input : 'src/header3.h',
     output : 'header3.rs',
     output_inline_wrapper : 'header3.c',
-    include_directories : 'include',
+    include_directories : inc,
   )
-  c_inline_wrapper = static_library('c_wrapper', gen3[1])
+  c_inline_wrapper = static_library('c_wrapper', gen3[1], include_directories: inc)
 
   f = configure_file(
     input : 'src/main3.rs',

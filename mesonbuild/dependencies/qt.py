@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2013-2017 The Meson development team
-# Copyright © 2021-2023 Intel Corporation
+# Copyright © 2021-2025 Intel Corporation
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import abc
 import re
 import os
+from pathlib import Path
 import typing as T
 
 from .base import DependencyException, DependencyMethods
@@ -21,10 +22,11 @@ from .. import mlog
 from .. import mesonlib
 
 if T.TYPE_CHECKING:
-    from ..compilers import Compiler
+    from ..compilers.compilers import Compiler
     from ..envconfig import MachineInfo
     from ..environment import Environment
     from ..dependencies import MissingCompiler
+    from .base import DependencyObjectKWs
 
 
 def _qt_get_private_includes(mod_inc_dir: str, module: str, mod_version: str) -> T.List[str]:
@@ -50,7 +52,7 @@ def _qt_get_private_includes(mod_inc_dir: str, module: str, mod_version: str) ->
             if len(dirname.split('.')) == 3:
                 private_dir = dirname
                 break
-    return [private_dir, os.path.join(private_dir, 'Qt' + module)]
+    return [private_dir, Path(private_dir, f'Qt{module}').as_posix()]
 
 
 def get_qmake_host_bins(qvars: T.Dict[str, str]) -> str:
@@ -95,8 +97,8 @@ def _get_modules_lib_suffix(version: str, info: 'MachineInfo', is_debug: bool) -
 
 
 class QtExtraFrameworkDependency(ExtraFrameworkDependency):
-    def __init__(self, name: str, env: 'Environment', kwargs: T.Dict[str, T.Any], qvars: T.Dict[str, str], language: T.Optional[str] = None):
-        super().__init__(name, env, kwargs, language=language)
+    def __init__(self, name: str, env: 'Environment', kwargs: DependencyObjectKWs, qvars: T.Dict[str, str]):
+        super().__init__(name, env, kwargs)
         self.mod_name = name[2:]
         self.qt_extra_include_directory = qvars['QT_INSTALL_HEADERS']
 
@@ -122,7 +124,7 @@ class _QtBase:
     libexecdir: T.Optional[str] = None
     version: str
 
-    def __init__(self, name: str, kwargs: T.Dict[str, T.Any]):
+    def __init__(self, name: str, kwargs: DependencyObjectKWs):
         self.name = name
         self.qtname = name.capitalize()
         self.qtver = name[-1]
@@ -131,20 +133,20 @@ class _QtBase:
         else:
             self.qtpkgname = self.qtname
 
-        self.private_headers = T.cast('bool', kwargs.get('private_headers', False))
+        self.private_headers = kwargs.get('private_headers', False)
 
-        self.requested_modules = mesonlib.stringlistify(mesonlib.extract_as_list(kwargs, 'modules'))
+        self.requested_modules = kwargs.get('modules', [])
         if not self.requested_modules:
             raise DependencyException('No ' + self.qtname + '  modules specified.')
 
-        self.qtmain = T.cast('bool', kwargs.get('main', False))
+        self.qtmain = kwargs.get('main', False)
         if not isinstance(self.qtmain, bool):
             raise DependencyException('"main" argument must be a boolean')
 
     def _link_with_qt_winmain(self, is_debug: bool, libdir: T.Union[str, T.List[str]]) -> bool:
         libdir = mesonlib.listify(libdir)  # TODO: shouldn't be necessary
         base_name = self.get_qt_winmain_base_name(is_debug)
-        qt_winmain = self.clib_compiler.find_library(base_name, self.env, libdir)
+        qt_winmain = self.clib_compiler.find_library(base_name, libdir)
         if qt_winmain:
             self.link_args.append(qt_winmain[0])
             return True
@@ -165,12 +167,15 @@ class _QtBase:
     def log_details(self) -> str:
         return f'modules: {", ".join(sorted(self.requested_modules))}'
 
+    def _get_common_defines(self) -> T.List[str]:
+        is_debug = self.env.coredata.optstore.get_value_for('debug')
+        return ['-DQT_DEBUG' if is_debug else '-DQT_NO_DEBUG']
 
 class QtPkgConfigDependency(_QtBase, PkgConfigDependency, metaclass=abc.ABCMeta):
 
     """Specialization of the PkgConfigDependency for Qt."""
 
-    def __init__(self, name: str, env: 'Environment', kwargs: T.Dict[str, T.Any]):
+    def __init__(self, name: str, env: 'Environment', kwargs: DependencyObjectKWs):
         _QtBase.__init__(self, name, kwargs)
 
         # Always use QtCore as the "main" dependency, since it has the extra
@@ -183,7 +188,7 @@ class QtPkgConfigDependency(_QtBase, PkgConfigDependency, metaclass=abc.ABCMeta)
             self.link_args = []
 
         for m in self.requested_modules:
-            mod = PkgConfigDependency(self.qtpkgname + m, self.env, kwargs, language=self.language)
+            mod = PkgConfigDependency(self.qtpkgname + m, self.env, kwargs)
             if not mod.found():
                 self.is_found = False
                 return
@@ -224,6 +229,8 @@ class QtPkgConfigDependency(_QtBase, PkgConfigDependency, metaclass=abc.ABCMeta)
 
         self.libexecdir = self.get_pkgconfig_host_libexecs(self)
 
+        self.compile_args += self._get_common_defines()
+
     @staticmethod
     @abc.abstractmethod
     def get_pkgconfig_host_bins(core: PkgConfigDependency) -> T.Optional[str]:
@@ -249,7 +256,7 @@ class QmakeQtDependency(_QtBase, ConfigToolDependency, metaclass=abc.ABCMeta):
     version: str
     version_arg = '-v'
 
-    def __init__(self, name: str, env: 'Environment', kwargs: T.Dict[str, T.Any]):
+    def __init__(self, name: str, env: 'Environment', kwargs: DependencyObjectKWs):
         _QtBase.__init__(self, name, kwargs)
         self.tool_name = f'qmake{self.qtver}'
         self.tools = [f'qmake{self.qtver}', f'qmake-{self.name}', 'qmake']
@@ -259,13 +266,15 @@ class QmakeQtDependency(_QtBase, ConfigToolDependency, metaclass=abc.ABCMeta):
         # is requested, add "">= 5, < 6", but if the user has ">= 5.6", don't
         # lose that.
         kwargs = kwargs.copy()
-        _vers = mesonlib.listify(kwargs.get('version', []))
+        _vers = kwargs.get('version', [])
         _vers.extend([f'>= {self.qtver}', f'< {int(self.qtver) + 1}'])
         kwargs['version'] = _vers
 
         ConfigToolDependency.__init__(self, name, env, kwargs)
         if not self.found():
             return
+
+        self.compile_args += self._get_common_defines()
 
         # Query library path, header path, and binary path
         stdo = self.get_config_value(['-query'], 'args')
@@ -296,14 +305,14 @@ class QmakeQtDependency(_QtBase, ConfigToolDependency, metaclass=abc.ABCMeta):
 
         # Use the buildtype by default, but look at the b_vscrt option if the
         # compiler supports it.
-        is_debug = self.env.coredata.get_option(mesonlib.OptionKey('buildtype')) == 'debug'
-        if mesonlib.OptionKey('b_vscrt') in self.env.coredata.options:
-            if self.env.coredata.options[mesonlib.OptionKey('b_vscrt')].value in {'mdd', 'mtd'}:
+        is_debug = self.env.coredata.optstore.get_value_for('buildtype') == 'debug'
+        if 'b_vscrt' in self.env.coredata.optstore:
+            if self.env.coredata.optstore.get_value_for('b_vscrt') in {'mdd', 'mtd'}:
                 is_debug = True
         modules_lib_suffix = _get_modules_lib_suffix(self.version, self.env.machines[self.for_machine], is_debug)
 
         for module in self.requested_modules:
-            mincdir = os.path.join(incdir, 'Qt' + module)
+            mincdir = Path(incdir, f'Qt{module}').as_posix()
             self.compile_args.append('-I' + mincdir)
 
             if module == 'QuickTest':
@@ -319,7 +328,7 @@ class QmakeQtDependency(_QtBase, ConfigToolDependency, metaclass=abc.ABCMeta):
                 for directory in priv_inc:
                     self.compile_args.append('-I' + directory)
             libfiles = self.clib_compiler.find_library(
-                self.qtpkgname + module + modules_lib_suffix, self.env,
+                self.qtpkgname + module + modules_lib_suffix,
                 mesonlib.listify(libdir)) # TODO: shouldn't be necessary
             if libfiles:
                 libfile = libfiles[0]
@@ -348,18 +357,19 @@ class QmakeQtDependency(_QtBase, ConfigToolDependency, metaclass=abc.ABCMeta):
     def get_private_includes(self, mod_inc_dir: str, module: str) -> T.List[str]:
         pass
 
-    def _framework_detect(self, qvars: T.Dict[str, str], modules: T.List[str], kwargs: T.Dict[str, T.Any]) -> None:
+    def _framework_detect(self, qvars: T.Dict[str, str], modules: T.List[str], kwargs: DependencyObjectKWs) -> None:
         libdir = qvars['QT_INSTALL_LIBS']
 
         # ExtraFrameworkDependency doesn't support any methods
         fw_kwargs = kwargs.copy()
-        fw_kwargs.pop('method', None)
+        fw_kwargs.pop('method')
         fw_kwargs['paths'] = [libdir]
+        fw_kwargs['language'] = self.language
 
         for m in modules:
             fname = 'Qt' + m
             mlog.debug('Looking for qt framework ' + fname)
-            fwdep = QtExtraFrameworkDependency(fname, self.env, fw_kwargs, qvars, language=self.language)
+            fwdep = QtExtraFrameworkDependency(fname, self.env, fw_kwargs, qvars)
             if fwdep.found():
                 self.compile_args.append('-F' + libdir)
                 self.compile_args += fwdep.get_compile_args(with_private_headers=self.private_headers,
@@ -442,7 +452,7 @@ class Qt5PkgConfigDependency(QtPkgConfigDependency):
 
 class Qt6PkgConfigDependency(Qt6WinMainMixin, QtPkgConfigDependency):
 
-    def __init__(self, name: str, env: 'Environment', kwargs: T.Dict[str, T.Any]):
+    def __init__(self, name: str, env: 'Environment', kwargs: DependencyObjectKWs):
         super().__init__(name, env, kwargs)
         if not self.libexecdir:
             mlog.debug(f'detected Qt6 {self.version} pkg-config dependency does not '
@@ -465,20 +475,20 @@ class Qt6PkgConfigDependency(Qt6WinMainMixin, QtPkgConfigDependency):
 packages['qt4'] = qt4_factory = DependencyFactory(
     'qt4',
     [DependencyMethods.PKGCONFIG, DependencyMethods.CONFIG_TOOL],
-    pkgconfig_class=Qt4PkgConfigDependency,
-    configtool_class=Qt4ConfigToolDependency,
+    pkgconfig=Qt4PkgConfigDependency,
+    configtool=Qt4ConfigToolDependency,
 )
 
 packages['qt5'] = qt5_factory = DependencyFactory(
     'qt5',
     [DependencyMethods.PKGCONFIG, DependencyMethods.CONFIG_TOOL],
-    pkgconfig_class=Qt5PkgConfigDependency,
-    configtool_class=Qt5ConfigToolDependency,
+    pkgconfig=Qt5PkgConfigDependency,
+    configtool=Qt5ConfigToolDependency,
 )
 
 packages['qt6'] = qt6_factory = DependencyFactory(
     'qt6',
     [DependencyMethods.PKGCONFIG, DependencyMethods.CONFIG_TOOL],
-    pkgconfig_class=Qt6PkgConfigDependency,
-    configtool_class=Qt6ConfigToolDependency,
+    pkgconfig=Qt6PkgConfigDependency,
+    configtool=Qt6ConfigToolDependency,
 )
