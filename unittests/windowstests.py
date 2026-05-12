@@ -17,8 +17,9 @@ import mesonbuild.coredata
 import mesonbuild.modules.gnome
 from mesonbuild.mesonlib import (
     MachineChoice, is_windows, is_cygwin, python_command, version_compare,
-    EnvironmentException, OptionKey
+    EnvironmentException
 )
+from mesonbuild.options import OptionKey
 from mesonbuild.compilers import (
     detect_c_compiler, detect_d_compiler, compiler_from_language,
 )
@@ -184,7 +185,7 @@ class WindowsTests(BasePlatformTests):
         if self.backend is not Backend.ninja:
             raise SkipTest('Test only applies when using the Ninja backend')
 
-        testdir = os.path.join(self.unit_test_dir, '117 genvslite')
+        testdir = os.path.join(self.unit_test_dir, '118 genvslite')
 
         env = get_fake_env(testdir, self.builddir, self.prefix)
         cc = detect_c_compiler(env, MachineChoice.HOST)

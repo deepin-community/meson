@@ -62,6 +62,10 @@ class RustModule(ExtensionModule):
     def __init__(self, interpreter: Interpreter) -> None:
         super().__init__(interpreter)
         self._bindgen_bin: T.Optional[T.Union[ExternalProgram, Executable, OverrideProgram]] = None
+        if 'rust' in interpreter.compilers.host:
+            self._bindgen_rust_target: T.Optional[str] = interpreter.compilers.host['rust'].version
+        else:
+            self._bindgen_rust_target = None
         self.methods.update({
             'test': self.test,
             'bindgen': self.bindgen,
@@ -86,7 +90,7 @@ class RustModule(ExtensionModule):
     def test(self, state: ModuleState, args: T.Tuple[str, BuildTarget], kwargs: FuncTest) -> ModuleReturnValue:
         """Generate a rust test target from a given rust target.
 
-        Rust puts it's unitests inside it's main source files, unlike most
+        Rust puts its unitests inside its main source files, unlike most
         languages that put them in external files. This means that normally
         you have to define two separate targets with basically the same
         arguments to get tests:
@@ -162,6 +166,9 @@ class RustModule(ExtensionModule):
         new_target_kwargs['dependencies'] = new_target_kwargs.get('dependencies', []) + kwargs['dependencies']
         new_target_kwargs['link_with'] = new_target_kwargs.get('link_with', []) + kwargs['link_with']
         del new_target_kwargs['rust_crate_type']
+        for kw in ['pic', 'prelink', 'rust_abi', 'version', 'soversion', 'darwin_versions']:
+            if kw in new_target_kwargs:
+                del new_target_kwargs[kw]
 
         lang_args = base_target.extra_args.copy()
         lang_args['rust'] = base_target.extra_args['rust'] + kwargs['rust_args'] + ['--test']
@@ -207,7 +214,7 @@ class RustModule(ExtensionModule):
         DEPENDENCIES_KW.evolve(since='1.0.0'),
     )
     def bindgen(self, state: ModuleState, args: T.List, kwargs: FuncBindgen) -> ModuleReturnValue:
-        """Wrapper around bindgen to simplify it's use.
+        """Wrapper around bindgen to simplify its use.
 
         The main thing this simplifies is the use of `include_directory`
         objects, instead of having to pass a plethora of `-I` arguments.
@@ -231,7 +238,7 @@ class RustModule(ExtensionModule):
             # bindgen always uses clang, so it's safe to hardcode -I here
             clang_args.extend([f'-I{x}' for x in i.to_string_list(
                 state.environment.get_source_dir(), state.environment.get_build_dir())])
-        if are_asserts_disabled(state.environment.coredata.options):
+        if are_asserts_disabled(state.environment.coredata.optstore):
             clang_args.append('-DNDEBUG')
 
         for de in kwargs['dependencies']:
@@ -247,6 +254,15 @@ class RustModule(ExtensionModule):
 
         if self._bindgen_bin is None:
             self._bindgen_bin = state.find_program('bindgen', wanted=kwargs['bindgen_version'])
+            if self._bindgen_rust_target is not None:
+                # ExternalCommand.command's type is bonkers
+                _, _, err = mesonlib.Popen_safe(
+                    T.cast('T.List[str]', self._bindgen_bin.get_command()) +
+                    ['--rust-target', self._bindgen_rust_target])
+                # Sometimes this is "invalid Rust target" and sometimes "invalid
+                # rust target"
+                if 'Got an invalid' in err:
+                    self._bindgen_rust_target = None
 
         name: str
         if isinstance(header, File):
@@ -269,7 +285,7 @@ class RustModule(ExtensionModule):
                 raise InterpreterException(f'Unknown file type extension for: {name}')
 
         # We only want include directories and defines, other things may not be valid
-        cargs = state.get_option('args', state.subproject, lang=language)
+        cargs = state.get_option(f'{language}_args', state.subproject)
         assert isinstance(cargs, list), 'for mypy'
         for a in itertools.chain(state.global_args.get(language, []), state.project_args.get(language, []), cargs):
             if a.startswith(('-I', '/I', '-D', '/D', '-U', '/U')):
@@ -280,7 +296,7 @@ class RustModule(ExtensionModule):
 
         # Add the C++ standard to the clang arguments. Attempt to translate VS
         # extension versions into the nearest standard version
-        std = state.get_option('std', lang=language)
+        std = state.get_option(f'{language}_std')
         assert isinstance(std, str), 'for mypy'
         if std.startswith('vc++'):
             if std.endswith('latest'):
@@ -314,9 +330,13 @@ class RustModule(ExtensionModule):
                 '@INPUT@', '--output',
                 os.path.join(state.environment.build_dir, '@OUTPUT0@')
             ] + \
-            kwargs['args'] + inline_wrapper_args + ['--'] + \
-            kwargs['c_args'] + clang_args + \
-            ['-MD', '-MQ', '@INPUT@', '-MF', '@DEPFILE@']
+            kwargs['args'] + inline_wrapper_args
+        if self._bindgen_rust_target and '--rust-target' not in cmd:
+            cmd.extend(['--rust-target', self._bindgen_rust_target])
+        cmd.append('--')
+        cmd.extend(kwargs['c_args'])
+        cmd.extend(clang_args)
+        cmd.extend(['-MD', '-MQ', '@INPUT@', '-MF', '@DEPFILE@'])
 
         target = CustomTarget(
             f'rustmod-bindgen-{name}'.replace('/', '_'),

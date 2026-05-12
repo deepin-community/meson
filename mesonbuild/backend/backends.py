@@ -24,11 +24,14 @@ from .. import dependencies
 from .. import programs
 from .. import mesonlib
 from .. import mlog
-from ..compilers import LANGUAGES_USING_LDFLAGS, detect
+from ..compilers import LANGUAGES_USING_LDFLAGS, detect, lang_suffixes
 from ..mesonlib import (
     File, MachineChoice, MesonException, OrderedSet,
-    ExecutableSerialisation, classify_unity_sources, OptionKey
+    ExecutableSerialisation, EnvironmentException,
+    classify_unity_sources, get_compiler_for_source
 )
+from ..options import OptionKey
+
 
 if T.TYPE_CHECKING:
     from .._typing import ImmutableListProtocol
@@ -39,13 +42,14 @@ if T.TYPE_CHECKING:
     from ..linkers.linkers import StaticLinker
     from ..mesonlib import FileMode, FileOrString
 
-    from typing_extensions import TypedDict
+    from typing_extensions import TypedDict, NotRequired
 
     _ALL_SOURCES_TYPE = T.List[T.Union[File, build.CustomTarget, build.CustomTargetIndex, build.GeneratedList]]
 
     class TargetIntrospectionData(TypedDict):
 
         language: str
+        machine: NotRequired[str]
         compiler: T.List[str]
         parameters: T.List[str]
         sources: T.List[str]
@@ -287,7 +291,7 @@ class Backend:
     # 'vslite_ctx' is only provided when
     # we expect this backend setup/generation to make use of previously captured
     # compile args (as is the case when using '--genvslite').
-    def generate(self, capture: bool = False, vslite_ctx: dict = None) -> T.Optional[dict]:
+    def generate(self, capture: bool = False, vslite_ctx: T.Optional[T.Dict] = None) -> T.Optional[T.Dict]:
         raise RuntimeError(f'generate is not implemented in {type(self).__name__}')
 
     def get_target_filename(self, t: T.Union[build.Target, build.CustomTargetIndex], *, warn_multi_output: bool = True) -> str:
@@ -570,11 +574,11 @@ class Backend:
 
         is_cross_built = not self.environment.machines.matches_build_machine(exe_for_machine)
         if is_cross_built and self.environment.need_exe_wrapper():
-            exe_wrapper = self.environment.get_exe_wrapper()
-            if not exe_wrapper or not exe_wrapper.found():
-                msg = 'An exe_wrapper is needed but was not found. Please define one ' \
+            if not self.environment.has_exe_wrapper():
+                msg = 'An exe_wrapper is needed for ' + exe_cmd[0] + ' but was not found. Please define one ' \
                       'in cross file and check the command and/or add it to PATH.'
                 raise MesonException(msg)
+            exe_wrapper = self.environment.get_exe_wrapper()
         else:
             if exe_cmd[0].endswith('.jar'):
                 exe_cmd = ['java', '-jar'] + exe_cmd
@@ -595,7 +599,7 @@ class Backend:
                              feed: T.Optional[str] = None,
                              force_serialize: bool = False,
                              env: T.Optional[mesonlib.EnvironmentVariables] = None,
-                             verbose: bool = False) -> T.Tuple[T.Sequence[T.Union[str, File, build.Target, programs.ExternalProgram]], str]:
+                             verbose: bool = False) -> T.Tuple[T.List[str], str]:
         '''
         Serialize an executable for running with a generator or a custom target
         '''
@@ -628,7 +632,7 @@ class Backend:
         # It's also overridden for a few conditions that can't be handled
         # inside a command line
 
-        can_use_env = not force_serialize
+        can_use_env = env.can_use_env and not force_serialize
         force_serialize = force_serialize or bool(reasons)
 
         if capture:
@@ -834,7 +838,7 @@ class Backend:
             fname = fname.replace(ch, '_')
         return hashed + fname
 
-    def object_filename_from_source(self, target: build.BuildTarget, source: 'FileOrString', targetdir: T.Optional[str] = None) -> str:
+    def object_filename_from_source(self, target: build.BuildTarget, compiler: Compiler, source: 'FileOrString', targetdir: T.Optional[str] = None) -> str:
         assert isinstance(source, mesonlib.File)
         if isinstance(target, build.CompileTarget):
             return target.sources_map[source]
@@ -865,7 +869,16 @@ class Backend:
                 gen_source = os.path.relpath(os.path.join(build_dir, rel_src),
                                              os.path.join(self.environment.get_source_dir(), target.get_subdir()))
         machine = self.environment.machines[target.for_machine]
-        ret = self.canonicalize_filename(gen_source) + '.' + machine.get_object_suffix()
+        object_suffix = machine.get_object_suffix()
+        # For the TASKING compiler, in case of LTO or prelinking the object suffix has to be .mil
+        if compiler.get_id() == 'tasking':
+            if target.get_option(OptionKey('b_lto')) or (isinstance(target, build.StaticLibrary) and target.prelink):
+                if not source.rsplit('.', 1)[1] in lang_suffixes['c']:
+                    if isinstance(target, build.StaticLibrary) and not target.prelink:
+                        raise EnvironmentException('Tried using MIL linking for a static library with a assembly file. This can only be done if the static library is prelinked or disable \'b_lto\'.')
+                else:
+                    object_suffix = 'mil'
+        ret = self.canonicalize_filename(gen_source) + '.' + object_suffix
         if targetdir is not None:
             return os.path.join(targetdir, ret)
         return ret
@@ -880,8 +893,7 @@ class Backend:
         for gensrc in extobj.genlist:
             for r in gensrc.get_outputs():
                 path = self.get_target_generated_dir(extobj.target, gensrc, r)
-                dirpart, fnamepart = os.path.split(path)
-                raw_sources.append(File(True, dirpart, fnamepart))
+                raw_sources.append(File.from_built_relative(path))
 
         # Filter out headers and all non-source files
         sources: T.List['FileOrString'] = []
@@ -922,7 +934,8 @@ class Backend:
                     sources.append(_src)
 
         for osrc in sources:
-            objname = self.object_filename_from_source(extobj.target, osrc, targetdir)
+            compiler = get_compiler_for_source(extobj.target.compilers.values(), osrc)
+            objname = self.object_filename_from_source(extobj.target, compiler, osrc, targetdir)
             objpath = os.path.join(proj_dir_to_build_root, objname)
             result.append(objpath)
 
@@ -963,7 +976,7 @@ class Backend:
     def target_uses_pch(self, target: build.BuildTarget) -> bool:
         try:
             return T.cast('bool', target.get_option(OptionKey('b_pch')))
-        except KeyError:
+        except (KeyError, AttributeError):
             return False
 
     @staticmethod
@@ -1081,6 +1094,15 @@ class Backend:
                 continue
             if compiler.get_language() == 'd':
                 arg = '-Wl,' + arg
+            elif compiler.get_linker_id() == 'nvlink' and arg.endswith('.a'):
+                # We need to pass static archives without -Xlinker= to nvcc,
+                # since they may contain relocatable device code. When passing
+                # the static archive to nvcc with -Xlinker=, we bypass the
+                # frontend which means we lose the opportunity to perform device
+                # linking. We only need to do this for static archives, since
+                # nvcc doesn't support device linking with dynamic libraries:
+                # https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#libraries
+                pass
             else:
                 arg = compiler.get_linker_lib_prefix() + arg
             args.append(arg)
@@ -1124,7 +1146,7 @@ class Backend:
 
         if p.is_file():
             p = p.parent
-        # Heuristic: replace *last* occurence of '/lib'
+        # Heuristic: replace *last* occurrence of '/lib'
         binpath = Path('/bin'.join(p.as_posix().rsplit('/lib', maxsplit=1)))
         for _ in binpath.glob('*.dll'):
             return str(binpath)
@@ -1161,7 +1183,7 @@ class Backend:
 
     def determine_windows_extra_paths(
             self, target: T.Union[build.BuildTarget, build.CustomTarget, build.CustomTargetIndex, programs.ExternalProgram, mesonlib.File, str],
-            extra_bdeps: T.Sequence[T.Union[build.BuildTarget, build.CustomTarget]]) -> T.List[str]:
+            extra_bdeps: T.Sequence[T.Union[build.BuildTarget, build.CustomTarget, build.CustomTargetIndex]]) -> T.List[str]:
         """On Windows there is no such thing as an rpath.
 
         We must determine all locations of DLLs that this exe
@@ -1221,7 +1243,7 @@ class Backend:
             exe_wrapper = self.environment.get_exe_wrapper()
             machine = self.environment.machines[exe.for_machine]
             if machine.is_windows() or machine.is_cygwin():
-                extra_bdeps: T.List[T.Union[build.BuildTarget, build.CustomTarget]] = []
+                extra_bdeps: T.List[T.Union[build.BuildTarget, build.CustomTarget, build.CustomTargetIndex]] = []
                 if isinstance(exe, build.CustomTarget):
                     extra_bdeps = list(exe.get_transitive_build_target_deps())
                 extra_paths = self.determine_windows_extra_paths(exe, extra_bdeps)
@@ -1250,17 +1272,23 @@ class Backend:
                     cmd_args.append(a)
                 elif isinstance(a, (build.Target, build.CustomTargetIndex)):
                     cmd_args.extend(self.construct_target_rel_paths(a, t.workdir))
+                elif isinstance(a, programs.ExternalProgram):
+                    cmd_args.extend(a.get_command())
                 else:
                     raise MesonException('Bad object in test command.')
 
             t_env = copy.deepcopy(t.env)
             if not machine.is_windows() and not machine.is_cygwin() and not machine.is_darwin():
-                ld_lib_path: T.Set[str] = set()
+                ld_lib_path_libs: T.Set[build.SharedLibrary] = set()
                 for d in depends:
                     if isinstance(d, build.BuildTarget):
                         for l in d.get_all_link_deps():
                             if isinstance(l, build.SharedLibrary):
-                                ld_lib_path.add(os.path.join(self.environment.get_build_dir(), l.get_subdir()))
+                                ld_lib_path_libs.add(l)
+
+                env_build_dir = self.environment.get_build_dir()
+                ld_lib_path: T.Set[str] = set(os.path.join(env_build_dir, l.get_subdir()) for l in ld_lib_path_libs)
+
                 if ld_lib_path:
                     t_env.prepend('LD_LIBRARY_PATH', list(ld_lib_path), ':')
 
@@ -1414,7 +1442,7 @@ class Backend:
                     continue
                 result[arg.get_id()] = arg
             for dep in t.depends:
-                assert isinstance(dep, (build.CustomTarget, build.BuildTarget))
+                assert isinstance(dep, (build.CustomTarget, build.BuildTarget, build.CustomTargetIndex))
                 result[dep.get_id()] = dep
         return result
 
@@ -1566,9 +1594,9 @@ class Backend:
                     dfilename = os.path.join(outdir, target.depfile)
                     i = i.replace('@DEPFILE@', dfilename)
                 if '@PRIVATE_DIR@' in i:
-                    if target.absolute_paths:
-                        pdir = self.get_target_private_dir_abs(target)
-                    else:
+                    pdir = self.get_target_private_dir_abs(target)
+                    os.makedirs(pdir, exist_ok=True)
+                    if not target.absolute_paths:
                         pdir = self.get_target_private_dir(target)
                     i = i.replace('@PRIVATE_DIR@', pdir)
             else:
@@ -1665,7 +1693,7 @@ class Backend:
         bindir = Path(prefix, self.environment.get_bindir())
         libdir = Path(prefix, self.environment.get_libdir())
         incdir = Path(prefix, self.environment.get_includedir())
-        _ldir = self.environment.coredata.get_option(mesonlib.OptionKey('localedir'))
+        _ldir = self.environment.coredata.get_option(OptionKey('localedir'))
         assert isinstance(_ldir, str), 'for mypy'
         localedir = Path(prefix, _ldir)
         dest_path = Path(prefix, outdir, Path(fname).name) if outdir else Path(prefix, fname)
@@ -1970,12 +1998,9 @@ class Backend:
         return []
 
     def get_devenv(self) -> mesonlib.EnvironmentVariables:
-        env = mesonlib.EnvironmentVariables()
         extra_paths = set()
         library_paths = set()
-        build_machine = self.environment.machines[MachineChoice.BUILD]
         host_machine = self.environment.machines[MachineChoice.HOST]
-        need_wine = not build_machine.is_windows() and host_machine.is_windows()
         for t in self.build.get_targets().values():
             in_default_dir = t.should_install() and not t.get_install_dir()[2]
             if t.for_machine != MachineChoice.HOST or not in_default_dir:
@@ -1995,24 +2020,41 @@ class Backend:
                 # LD_LIBRARY_PATH. This allows running system applications using
                 # that library.
                 library_paths.add(tdir)
-        if need_wine:
-            # Executable paths should be in both PATH and WINEPATH.
-            # - Having them in PATH makes bash completion find it,
-            #   and make running "foo.exe" find it when wine-binfmt is installed.
-            # - Having them in WINEPATH makes "wine foo.exe" find it.
-            library_paths.update(extra_paths)
-        if library_paths:
-            if need_wine:
-                env.prepend('WINEPATH', list(library_paths), separator=';')
-            elif host_machine.is_windows() or host_machine.is_cygwin():
-                extra_paths.update(library_paths)
-            elif host_machine.is_darwin():
-                env.prepend('DYLD_LIBRARY_PATH', list(library_paths))
-            else:
-                env.prepend('LD_LIBRARY_PATH', list(library_paths))
-        if extra_paths:
-            env.prepend('PATH', list(extra_paths))
-        return env
+        return self.environment.get_env_for_paths(library_paths, extra_paths)
+
+    def compiler_to_generator_args(self, target: build.BuildTarget,
+                                   compiler: 'Compiler', output: str = '@OUTPUT@',
+                                   depfile: T.Union[str, None] = '@DEPFILE@',
+                                   extras: T.Union[T.List[str], None] = None,
+                                   input: str = '@INPUT@') -> CompilerArgs:
+        '''
+        The VS and Xcode backends need the full set of arguments for making a
+        custom build rule. This is a convenience method to convert a Compiler
+        to its arguments, for later concatenation.
+        '''
+        # FIXME: There are many other args missing
+        commands = self.generate_basic_compiler_args(target, compiler)
+        if depfile:
+            commands += compiler.get_dependency_gen_args(output, depfile)
+        commands += compiler.get_output_args(output)
+        commands += self.get_source_dir_include_args(target, compiler)
+        commands += self.get_build_dir_include_args(target, compiler)
+        commands += compiler.get_compile_only_args()
+        # Add per-target compile args, f.ex, `c_args : ['-DFOO']`. We set these
+        # near the end since these are supposed to override everything else.
+        commands += self.escape_extra_args(target.get_extra_args(compiler.get_language()))
+        # Do not escape this one, it is interpreted by the build system
+        # (Xcode considers these as variables to expand at build time)
+        if extras is not None:
+            commands += extras
+        commands += [input]
+        return commands
+
+    def have_language(self, langname: str) -> bool:
+        for for_machine in MachineChoice:
+            if langname in self.environment.coredata.compilers[for_machine]:
+                return True
+        return False
 
     def compiler_to_generator(self, target: build.BuildTarget,
                               compiler: 'Compiler',
@@ -2027,16 +2069,7 @@ class Backend:
         exelist = compiler.get_exelist()
         exe = programs.ExternalProgram(exelist[0])
         args = exelist[1:]
-        # FIXME: There are many other args missing
-        commands = self.generate_basic_compiler_args(target, compiler)
-        commands += compiler.get_dependency_gen_args('@OUTPUT@', '@DEPFILE@')
-        commands += compiler.get_output_args('@OUTPUT@')
-        commands += compiler.get_compile_only_args() + ['@INPUT@']
-        commands += self.get_source_dir_include_args(target, compiler)
-        commands += self.get_build_dir_include_args(target, compiler)
-        # Add per-target compile args, f.ex, `c_args : ['-DFOO']`. We set these
-        # near the end since these are supposed to override everything else.
-        commands += self.escape_extra_args(target.get_extra_args(compiler.get_language()))
+        commands = self.compiler_to_generator_args(target, compiler)
         generator = build.Generator(exe, args + commands.to_native(),
                                     [output_templ], depfile='@PLAINNAME@.d',
                                     depends=depends)

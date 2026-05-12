@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2023 Intel Corporation
+# Copyright © 2023-2024 Intel Corporation
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ import re
 
 from .gnu import GnuLikeCompiler
 from .gnu import gnu_optimization_args
-from ...mesonlib import Popen_safe, OptionKey
+from ...mesonlib import Popen_safe
+from ...options import OptionKey
 
 if T.TYPE_CHECKING:
     from ...environment import Environment
@@ -75,8 +76,8 @@ class ElbrusCompiler(GnuLikeCompiler):
     def get_optimization_args(self, optimization_level: str) -> T.List[str]:
         return gnu_optimization_args[optimization_level]
 
-    def get_prelink_args(self, prelink_name: str, obj_list: T.List[str]) -> T.List[str]:
-        return ['-r', '-nodefaultlibs', '-nostartfiles', '-o', prelink_name] + obj_list
+    def get_prelink_args(self, prelink_name: str, obj_list: T.List[str]) -> T.Tuple[T.List[str], T.List[str]]:
+        return [prelink_name], ['-r', '-nodefaultlibs', '-nostartfiles', '-o', prelink_name] + obj_list
 
     def get_pch_suffix(self) -> str:
         # Actually it's not supported for now, but probably will be supported in future
@@ -84,10 +85,10 @@ class ElbrusCompiler(GnuLikeCompiler):
 
     def get_option_compile_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
         args: T.List[str] = []
-        std = options[OptionKey('std', lang=self.language, machine=self.for_machine)]
-        if std.value != 'none':
-            args.append('-std=' + std.value)
+        std = options.get_value(OptionKey(f'{self.language}_std', machine=self.for_machine))
+        if std != 'none':
+            args.append('-std=' + std)
         return args
 
-    def openmp_flags(self) -> T.List[str]:
+    def openmp_flags(self, env: Environment) -> T.List[str]:
         return ['-fopenmp']
